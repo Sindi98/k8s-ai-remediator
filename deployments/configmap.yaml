@@ -1,1 +1,0 @@
-{ apiVersion: v1, kind: ConfigMap, name: ai-remediator-config, namespace: ai-remediator, OLLAMA_BASE_URL: "http://ollama.ollama.svc.cluster.local:11434/api", OLLAMA_MODEL: "gemma3", DRY_RUN: "true", SCALE_MIN: "1", SCALE_MAX: "5", POLL_INTERVAL_SECONDS: "30" }
