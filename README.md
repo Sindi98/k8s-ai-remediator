@@ -1,5 +1,7 @@
 # k8s-ai-remediator
 
+> **[English version](README.en.md)**
+
 Agente AI in Go che osserva eventi Kubernetes di tipo `Warning` e applica remediation controllate usando un LLM locale (Ollama). L'agente costruisce prompt contestuali dagli eventi del cluster, riceve decisioni JSON strutturate e applica solo azioni presenti in una allowlist predefinita, con molteplici livelli di sicurezza.
 
 ---
