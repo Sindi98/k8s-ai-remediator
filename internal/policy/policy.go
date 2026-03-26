@@ -22,13 +22,35 @@ func MaybeBlockUnsafeImageUpdate(d model.Decision, allowImageUpdates bool, thres
 	if strings.TrimSpace(d.Parameters["image"]) == "" {
 		return fmt.Errorf("set_deployment_image blocked: parameters.image missing")
 	}
+	if err := ValidateOCIImage(d.Parameters["image"]); err != nil {
+		return fmt.Errorf("set_deployment_image blocked: %w", err)
+	}
 	return nil
 }
 
 var (
 	controlCharRe    = regexp.MustCompile(`[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]`)
 	injectionPattern = regexp.MustCompile(`(?i)(ignore previous instructions|ignore all instructions|disregard above|system:\s|you are now|forget everything|new instructions:)`)
+
+	// ociImageRe validates OCI-compatible image references:
+	// [registry/][namespace/]name[:tag][@sha256:digest]
+	ociImageRe = regexp.MustCompile(`^([a-zA-Z0-9][a-zA-Z0-9._-]*(:[0-9]+)?/)?([a-zA-Z0-9][a-zA-Z0-9._/-]*)(:[\w][\w.\-]{0,127})?(@sha256:[a-fA-F0-9]{64})?$`)
 )
+
+// ValidateOCIImage checks that the image string is a valid OCI image reference.
+func ValidateOCIImage(image string) error {
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return fmt.Errorf("image is empty")
+	}
+	if len(image) > 255 {
+		return fmt.Errorf("image reference exceeds 255 characters")
+	}
+	if !ociImageRe.MatchString(image) {
+		return fmt.Errorf("invalid OCI image reference: %s", image)
+	}
+	return nil
+}
 
 // SanitizeForPrompt removes characters and patterns that could be used for
 // prompt injection attacks in LLM inputs sourced from Kubernetes events.

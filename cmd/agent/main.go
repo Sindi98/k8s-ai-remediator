@@ -15,6 +15,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 
 	"github.com/tuo-user/k8s-ai-remediator/internal/config"
 	"github.com/tuo-user/k8s-ai-remediator/internal/kube"
@@ -221,7 +223,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	ollamaClient := ollama.NewClient(cfg.BaseURL, cfg.Model, cfg.OllamaRPS)
+	ollamaClient := ollama.NewClient(cfg.BaseURL, cfg.Model, cfg.OllamaRPS, cfg.OllamaMaxRetries, cfg.OllamaTLSSkipVerify)
 	m := metrics.New()
 
 	// Start metrics server in background
@@ -242,6 +244,46 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	runLoop(ctx, cs, ollamaClient, cfg, m)
+	run := func(ctx context.Context) {
+		runLoop(ctx, cs, ollamaClient, cfg, m)
+	}
+
+	if cfg.LeaderElection {
+		hostname, _ := os.Hostname()
+		lock := &resourcelock.LeaseLock{
+			LeaseMeta: metav1.ObjectMeta{
+				Name:      cfg.LeaseName,
+				Namespace: cfg.LeaseNamespace,
+			},
+			Client: cs.CoordinationV1(),
+			LockConfig: resourcelock.ResourceLockConfig{
+				Identity: hostname,
+			},
+		}
+
+		slog.Info("leader election enabled", "identity", hostname, "lease", cfg.LeaseName, "namespace", cfg.LeaseNamespace)
+
+		leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
+			Lock:            lock,
+			LeaseDuration:   15 * time.Second,
+			RenewDeadline:   10 * time.Second,
+			RetryPeriod:     2 * time.Second,
+			ReleaseOnCancel: true,
+			Callbacks: leaderelection.LeaderCallbacks{
+				OnStartedLeading: run,
+				OnStoppedLeading: func() {
+					slog.Info("lost leadership, stopping agent")
+				},
+				OnNewLeader: func(identity string) {
+					if identity != hostname {
+						slog.Info("new leader elected", "leader", identity)
+					}
+				},
+			},
+		})
+	} else {
+		run(ctx)
+	}
+
 	slog.Info("agent stopped")
 }

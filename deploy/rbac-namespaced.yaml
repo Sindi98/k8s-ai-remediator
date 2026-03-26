@@ -1,0 +1,77 @@
+## Namespace-scoped RBAC for ai-remediator
+##
+## Use this instead of ClusterRole/ClusterRoleBinding when you want to restrict
+## the agent to specific namespaces. Create one Role + RoleBinding per namespace.
+##
+## Usage:
+##   kubectl apply -f rbac-namespaced.yaml
+##   # Repeat for each additional namespace:
+##   kubectl -n <other-ns> apply -f rbac-namespaced.yaml
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ai-remediator
+  namespace: ai-remediator
+
+---
+## Role scoped to the target namespace (e.g. "incident-lab")
+## Replicate this for each namespace the agent should monitor.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ai-remediator
+  namespace: incident-lab
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log, events]
+    verbs: [get, list, watch, delete]
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch, update, patch]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ai-remediator
+  namespace: incident-lab
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ai-remediator
+subjects:
+  - kind: ServiceAccount
+    name: ai-remediator
+    namespace: ai-remediator
+
+---
+## Role in the agent's own namespace for leader election leases
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ai-remediator-leader-election
+  namespace: ai-remediator
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ai-remediator-leader-election
+  namespace: ai-remediator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ai-remediator-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: ai-remediator
+    namespace: ai-remediator
