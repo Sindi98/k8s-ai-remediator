@@ -6,10 +6,22 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/tuo-user/k8s-ai-remediator/internal/model"
 )
+
+func validDecisionJSON() []byte {
+	d := model.Decision{
+		Summary: "test", Severity: "low", ProbableCause: "test",
+		Confidence: 0.85, Action: model.ActionRestartDeployment,
+		Namespace: "default", ResourceKind: "Deployment", ResourceName: "web",
+		Parameters: map[string]string{}, Reason: "test",
+	}
+	b, _ := json.Marshal(d)
+	return b
+}
 
 func TestAllowedAction(t *testing.T) {
 	for _, a := range model.AllActions() {
@@ -23,19 +35,7 @@ func TestAllowedAction(t *testing.T) {
 }
 
 func TestDecide_ValidResponse(t *testing.T) {
-	decision := model.Decision{
-		Summary:       "Pod crash detected",
-		Severity:      "high",
-		ProbableCause: "OOM",
-		Confidence:    0.85,
-		Action:        model.ActionRestartDeployment,
-		Namespace:     "default",
-		ResourceKind:  "Deployment",
-		ResourceName:  "web",
-		Parameters:    map[string]string{},
-		Reason:        "Restart to recover from OOM",
-	}
-	decJSON, _ := json.Marshal(decision)
+	decJSON := validDecisionJSON()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := model.ChatResponse{}
@@ -44,7 +44,7 @@ func TestDecide_ValidResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "test-model", 100)
+	client := NewClient(srv.URL, "test-model", 100, 0, false)
 	got, err := client.Decide(context.Background(), "test prompt")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -73,7 +73,7 @@ func TestDecide_DisallowedAction(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "test-model", 100)
+	client := NewClient(srv.URL, "test-model", 100, 0, false)
 	_, err := client.Decide(context.Background(), "test prompt")
 	if err == nil {
 		t.Error("expected error for disallowed action")
@@ -83,20 +83,75 @@ func TestDecide_DisallowedAction(t *testing.T) {
 	}
 }
 
-func TestDecide_HTTPError(t *testing.T) {
+func TestDecide_HTTPError_4xx_NoRetry(t *testing.T) {
+	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("internal error"))
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("bad request"))
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "test-model", 100)
+	client := NewClient(srv.URL, "test-model", 100, 2, false)
 	_, err := client.Decide(context.Background(), "test prompt")
 	if err == nil {
-		t.Error("expected error for HTTP 500")
+		t.Error("expected error for HTTP 400")
 	}
-	if !strings.Contains(err.Error(), "ollama http 500") {
-		t.Errorf("expected http error, got: %v", err)
+	// 4xx errors should NOT be retried
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Errorf("expected 1 call (no retry for 4xx), got %d", calls)
+	}
+}
+
+func TestDecide_HTTPError_5xx_Retries(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		if n <= 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("internal error"))
+			return
+		}
+		// Third call succeeds
+		resp := model.ChatResponse{}
+		resp.Message.Content = string(validDecisionJSON())
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-model", 100, 3, false)
+	got, err := client.Decide(context.Background(), "test prompt")
+	if err != nil {
+		t.Fatalf("expected success after retries, got: %v", err)
+	}
+	if got.Action != model.ActionRestartDeployment {
+		t.Errorf("expected restart_deployment, got %s", got.Action)
+	}
+	if atomic.LoadInt32(&calls) != 3 {
+		t.Errorf("expected 3 calls (2 retries + 1 success), got %d", calls)
+	}
+}
+
+func TestDecide_HTTPError_5xx_ExhaustsRetries(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("unavailable"))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-model", 100, 1, false)
+	_, err := client.Decide(context.Background(), "test prompt")
+	if err == nil {
+		t.Error("expected error after exhausting retries")
+	}
+	if !strings.Contains(err.Error(), "failed after") {
+		t.Errorf("expected 'failed after' error, got: %v", err)
+	}
+	// 1 initial + 1 retry = 2 calls
+	if atomic.LoadInt32(&calls) != 2 {
+		t.Errorf("expected 2 calls, got %d", calls)
 	}
 }
 
@@ -107,7 +162,7 @@ func TestDecide_EmptyResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "test-model", 100)
+	client := NewClient(srv.URL, "test-model", 100, 0, false)
 	_, err := client.Decide(context.Background(), "test prompt")
 	if err == nil {
 		t.Error("expected error for empty response")
@@ -115,32 +170,31 @@ func TestDecide_EmptyResponse(t *testing.T) {
 }
 
 func TestDecide_RateLimiting(t *testing.T) {
-	calls := 0
-	decision := model.Decision{
-		Summary: "test", Severity: "low", ProbableCause: "test",
-		Confidence: 0.5, Action: model.ActionNoop, Namespace: "default",
-		ResourceKind: "Pod", ResourceName: "test",
-		Parameters: map[string]string{}, Reason: "test",
-	}
-	decJSON, _ := json.Marshal(decision)
-
+	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		atomic.AddInt32(&calls, 1)
 		resp := model.ChatResponse{}
-		resp.Message.Content = string(decJSON)
+		resp.Message.Content = string(validDecisionJSON())
 		json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
-	// High RPS so the test doesn't actually block
-	client := NewClient(srv.URL, "test-model", 1000)
+	client := NewClient(srv.URL, "test-model", 1000, 0, false)
 	for i := 0; i < 3; i++ {
 		_, err := client.Decide(context.Background(), "test")
 		if err != nil {
 			t.Fatalf("unexpected error on call %d: %v", i, err)
 		}
 	}
-	if calls != 3 {
+	if atomic.LoadInt32(&calls) != 3 {
 		t.Errorf("expected 3 calls, got %d", calls)
+	}
+}
+
+func TestDecide_TLSSkipVerify(t *testing.T) {
+	// Just verify the client can be created with TLS skip verify without panic
+	client := NewClient("https://localhost:99999", "test", 100, 0, true)
+	if client.http.Transport == nil {
+		t.Error("expected custom transport for TLS skip verify")
 	}
 }

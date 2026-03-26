@@ -84,6 +84,49 @@ func TestSanitizeForPrompt_PreservesNewlinesAndTabs(t *testing.T) {
 	}
 }
 
+func TestValidateOCIImage(t *testing.T) {
+	valid := []string{
+		"nginx",
+		"nginx:1.25",
+		"nginx:latest",
+		"library/nginx:1.25",
+		"docker.io/library/nginx:1.25",
+		"gcr.io/my-project/my-image:v1.0.0",
+		"registry.example.com:5000/my-image:latest",
+		"my-image@sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+		"ghcr.io/org/repo:v2.3.4-beta.1",
+	}
+	for _, img := range valid {
+		if err := ValidateOCIImage(img); err != nil {
+			t.Errorf("expected %q to be valid, got: %v", img, err)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"   ",
+		"-invalid:tag",
+		"image:tag:extra",
+		"image@notsha256:abc",
+	}
+	for _, img := range invalid {
+		if err := ValidateOCIImage(img); err == nil {
+			t.Errorf("expected %q to be invalid", img)
+		}
+	}
+}
+
+func TestMaybeBlockUnsafeImageUpdate_InvalidOCI(t *testing.T) {
+	d := model.Decision{
+		Action:     model.ActionSetDeploymentImage,
+		Confidence: 0.95,
+		Parameters: map[string]string{"image": "-invalid-image"},
+	}
+	if err := MaybeBlockUnsafeImageUpdate(d, true, 0.9); err == nil {
+		t.Error("expected block for invalid OCI image")
+	}
+}
+
 func TestBuildPrompt_ContainsFields(t *testing.T) {
 	p := BuildPrompt("ns1", "Pod", "my-pod", "Warning", "BackOff", "Container crashed", "extra info")
 	for _, expected := range []string{"ns1", "Pod", "my-pod", "Warning", "BackOff", "Container crashed", "extra info"} {

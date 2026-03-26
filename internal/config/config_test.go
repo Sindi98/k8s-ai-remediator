@@ -72,7 +72,8 @@ func TestGetfloat(t *testing.T) {
 func TestLoadFromEnv_Defaults(t *testing.T) {
 	for _, k := range []string{"OLLAMA_BASE_URL", "OLLAMA_MODEL", "DRY_RUN", "SCALE_MIN", "SCALE_MAX",
 		"POLL_INTERVAL_SECONDS", "ALLOW_IMAGE_UPDATES", "IMAGE_UPDATE_CONFIDENCE_THRESHOLD",
-		"POD_LOG_TAIL_LINES", "OLLAMA_RPS", "METRICS_ADDR"} {
+		"POD_LOG_TAIL_LINES", "OLLAMA_RPS", "OLLAMA_MAX_RETRIES", "OLLAMA_TLS_SKIP_VERIFY",
+		"METRICS_ADDR", "LEADER_ELECTION", "LEASE_NAME", "LEASE_NAMESPACE"} {
 		os.Unsetenv(k)
 	}
 
@@ -97,5 +98,20 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	}
 	if cfg.MetricsAddr != ":9090" {
 		t.Errorf("expected metricsAddr :9090, got %s", cfg.MetricsAddr)
+	}
+	if cfg.OllamaMaxRetries != 3 {
+		t.Errorf("expected ollamaMaxRetries 3, got %d", cfg.OllamaMaxRetries)
+	}
+	if cfg.OllamaTLSSkipVerify {
+		t.Error("expected ollamaTLSSkipVerify=false")
+	}
+	if cfg.LeaderElection {
+		t.Error("expected leaderElection=false")
+	}
+	if cfg.LeaseName != "ai-remediator-leader" {
+		t.Errorf("expected leaseName ai-remediator-leader, got %s", cfg.LeaseName)
+	}
+	if cfg.LeaseNamespace != "ai-remediator" {
+		t.Errorf("expected leaseNamespace ai-remediator, got %s", cfg.LeaseNamespace)
 	}
 }

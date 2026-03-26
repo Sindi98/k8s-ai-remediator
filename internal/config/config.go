@@ -18,7 +18,12 @@ type AgentConfig struct {
 	ImageUpdateThreshold float64
 	PodLogTailLines      int64
 	OllamaRPS            float64
+	OllamaMaxRetries     int
+	OllamaTLSSkipVerify  bool
 	MetricsAddr          string
+	LeaderElection       bool
+	LeaseName            string
+	LeaseNamespace       string
 }
 
 // LoadFromEnv reads agent configuration from environment variables.
@@ -34,7 +39,12 @@ func LoadFromEnv() AgentConfig {
 		ImageUpdateThreshold: Getfloat("IMAGE_UPDATE_CONFIDENCE_THRESHOLD", 0.92),
 		PodLogTailLines:      int64(Getint("POD_LOG_TAIL_LINES", 200)),
 		OllamaRPS:            Getfloat("OLLAMA_RPS", 2.0),
+		OllamaMaxRetries:     Getint("OLLAMA_MAX_RETRIES", 3),
+		OllamaTLSSkipVerify:  Getbool("OLLAMA_TLS_SKIP_VERIFY", false),
 		MetricsAddr:          Getenv("METRICS_ADDR", ":9090"),
+		LeaderElection:       Getbool("LEADER_ELECTION", false),
+		LeaseName:            Getenv("LEASE_NAME", "ai-remediator-leader"),
+		LeaseNamespace:       Getenv("LEASE_NAMESPACE", "ai-remediator"),
 	}
 }
 

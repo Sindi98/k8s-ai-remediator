@@ -3,10 +3,12 @@ package ollama
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -18,23 +20,34 @@ import (
 
 // Client communicates with the Ollama API and enforces rate limiting.
 type Client struct {
-	baseURL string
-	model   string
-	http    *http.Client
-	limiter *rate.Limiter
+	baseURL    string
+	model      string
+	http       *http.Client
+	limiter    *rate.Limiter
+	maxRetries int
 }
 
-// NewClient creates an Ollama client with the given rate limit (requests/sec).
-func NewClient(baseURL, mdl string, rps float64) *Client {
+// NewClient creates an Ollama client with rate limiting, TLS support, and retry config.
+func NewClient(baseURL, mdl string, rps float64, maxRetries int, tlsSkipVerify bool) *Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if tlsSkipVerify {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+
 	return &Client{
 		baseURL: baseURL,
 		model:   mdl,
-		http:    &http.Client{Timeout: 90 * time.Second},
-		limiter: rate.NewLimiter(rate.Limit(rps), 1),
+		http: &http.Client{
+			Timeout:   90 * time.Second,
+			Transport: transport,
+		},
+		limiter:    rate.NewLimiter(rate.Limit(rps), 1),
+		maxRetries: maxRetries,
 	}
 }
 
 // Decide sends the prompt to Ollama and returns a validated Decision.
+// Transient errors (network, 5xx) are retried with exponential backoff.
 func (c *Client) Decide(ctx context.Context, prompt string) (model.Decision, error) {
 	if err := c.limiter.Wait(ctx); err != nil {
 		return model.Decision{}, fmt.Errorf("ollama rate limiter: %w", err)
@@ -68,7 +81,39 @@ func (c *Client) Decide(ctx context.Context, prompt string) (model.Decision, err
 		return model.Decision{}, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.baseURL, "/")+"/chat", bytes.NewReader(b))
+	var lastErr error
+	attempts := c.maxRetries + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(math.Pow(2, float64(attempt))) * time.Second
+			slog.Warn("retrying ollama request", "attempt", attempt+1, "backoff", backoff)
+			select {
+			case <-ctx.Done():
+				return model.Decision{}, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+
+		d, err := c.doRequest(ctx, b)
+		if err != nil {
+			lastErr = err
+			if isRetryable(err) {
+				continue
+			}
+			return model.Decision{}, err
+		}
+		return d, nil
+	}
+
+	return model.Decision{}, fmt.Errorf("ollama request failed after %d attempts: %w", attempts, lastErr)
+}
+
+func (c *Client) doRequest(ctx context.Context, body []byte) (model.Decision, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.baseURL, "/")+"/chat", bytes.NewReader(body))
 	if err != nil {
 		return model.Decision{}, err
 	}
@@ -84,9 +129,13 @@ func (c *Client) Decide(ctx context.Context, prompt string) (model.Decision, err
 
 	slog.Info("ollama response received", "status", resp.StatusCode, "duration", duration.Round(time.Millisecond))
 
+	if resp.StatusCode >= 500 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return model.Decision{}, &retryableError{msg: fmt.Sprintf("ollama http %d: %s", resp.StatusCode, string(respBody))}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return model.Decision{}, fmt.Errorf("ollama http %d: %s", resp.StatusCode, string(body))
+		respBody, _ := io.ReadAll(resp.Body)
+		return model.Decision{}, fmt.Errorf("ollama http %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var out model.ChatResponse
@@ -111,8 +160,23 @@ func (c *Client) Decide(ctx context.Context, prompt string) (model.Decision, err
 	return d, nil
 }
 
-// Duration returns the duration of the last request (for metrics).
-// This is a convenience — callers can also measure externally.
+// retryableError marks errors that should trigger a retry.
+type retryableError struct {
+	msg string
+}
+
+func (e *retryableError) Error() string { return e.msg }
+
+func isRetryable(err error) bool {
+	if _, ok := err.(*retryableError); ok {
+		return true
+	}
+	// Network errors (connection refused, timeout, DNS) are retryable
+	msg := err.Error()
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "i/o timeout")
+}
 
 // AllowedAction returns true if the action is in the safe allowlist.
 func AllowedAction(a model.Action) bool {
