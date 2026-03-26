@@ -1,21 +1,26 @@
 # k8s-ai-remediator
 
-Agente AI in Go per osservare eventi Kubernetes di tipo `Warning` e tentare remediation controllate usando Ollama esposto nel cluster. [web:37][page:1]  
-L’agente usa l’endpoint Ollama `/api/chat` e richiede output JSON strutturati tramite `format`, in modo da ricevere decisioni vincolate a uno schema noto. [page:1][page:2][web:29][web:30]  
-La procedura seguente usa solo comandi `kubectl` per creare namespace, deployment, RBAC, ConfigMap e laboratorio di test, senza applicare YAML al cluster. [web:219][web:120][web:317][web:319]
+Agente AI in Go che osserva eventi Kubernetes di tipo `Warning` e applica remediation controllate usando un LLM locale (Ollama). L'agente costruisce prompt contestuali dagli eventi del cluster, riceve decisioni JSON strutturate e applica solo azioni presenti in una allowlist predefinita, con molteplici livelli di sicurezza.
 
 ---
 
 ## Indice
 
 - [Architettura](#architettura)
+- [Struttura del progetto](#struttura-del-progetto)
 - [Prerequisiti](#prerequisiti)
-- [Struttura locale](#struttura-locale)
-- [File locali](#file-locali)
-- [Installazione di Ollama](#installazione-di-ollama)
-- [Installazione dellagente](#installazione-dellagente)
-- [Configurazione runtime](#configurazione-runtime)
+- [Build](#build)
+- [Installazione su Kubernetes](#installazione-su-kubernetes)
+  - [1. Installazione di Ollama](#1-installazione-di-ollama)
+  - [2. Installazione dell'agente](#2-installazione-dellagente)
+- [Configurazione](#configurazione)
+- [Remediation supportate](#remediation-supportate)
+- [Osservabilita](#osservabilita)
+- [Sicurezza](#sicurezza)
+- [Alta disponibilita (Leader Election)](#alta-disponibilita-leader-election)
+- [RBAC namespace-scoped](#rbac-namespace-scoped)
 - [Laboratorio di test](#laboratorio-di-test)
+- [Sviluppo](#sviluppo)
 - [Comandi di verifica](#comandi-di-verifica)
 - [Reset ambiente](#reset-ambiente)
 
@@ -23,122 +28,144 @@ La procedura seguente usa solo comandi `kubectl` per creare namespace, deploymen
 
 ## Architettura
 
-Componenti principali:
+```
+                    +------------------+
+                    |   Kubernetes     |
+                    |   API Server     |
+                    +--------+---------+
+                             |
+                  Warning Events (poll ogni N sec)
+                             |
+                    +--------v---------+
+                    |  ai-remediator   |
+                    |  (Go agent)      |
+                    +--------+---------+
+                             |
+                  Prompt JSON strutturato
+                             |
+                    +--------v---------+
+                    |     Ollama       |
+                    |  (LLM locale)    |
+                    +--------+---------+
+                             |
+                  Decision JSON (action, confidence, params)
+                             |
+                    +--------v---------+
+                    |  ai-remediator   |
+                    |  Execution Engine|
+                    +------------------+
+                             |
+              Remediation (restart, delete, scale, ...)
+```
 
-1. **Ollama** nel namespace `ollama`. [page:1]
-2. **Agente Go** nel namespace `ai-remediator`. [web:312][web:319]
-3. **Laboratorio** nel namespace `incident-lab`. [web:219]
+**Flusso operativo:**
 
-Flusso operativo:
+1. Kubernetes genera un evento `Warning` (CrashLoopBackOff, ImagePullBackOff, ecc.)
+2. L'agente elenca gli eventi via API e filtra quelli di tipo Warning non ancora processati
+3. Per ogni evento costruisce un prompt con namespace, kind, name, reason, message e uno snapshot del Deployment associato
+4. Invia il prompt a Ollama con uno schema JSON che vincola la risposta
+5. Riceve una decisione strutturata con action, confidence, parameters
+6. Valida la decisione: allowlist, policy bounds, OCI image format, confidence threshold
+7. Esegue l'azione (o logga in dry-run)
 
-1. Kubernetes genera un evento `Warning`. [web:37]
-2. L’agente legge l’evento dalle API del cluster. [web:37]
-3. L’agente costruisce un prompt con `namespace`, `kind`, `name`, `reason` e `message`. [web:37]
-4. L’agente chiama Ollama su `http://ollama.ollama.svc.cluster.local:11434/api/chat`. [page:1]
-5. Ollama restituisce JSON strutturato conforme allo schema richiesto. [page:2][web:29][web:30]
-6. L’agente applica solo remediation presenti in una allowlist locale. [page:2]
+Quando l'evento riguarda un Pod, l'agente risale al Deployment tramite `ownerReferences` (Pod -> ReplicaSet -> Deployment).
 
-Quando l’evento riguarda un `Pod`, l’agente può risalire al `Deployment` passando da `Pod` a `ReplicaSet` e poi a `Deployment` tramite `ownerReferences`, che è il meccanismo standard di relazione tra risorse Kubernetes. [web:395]  
-Questo consente remediation come `restart_deployment` o `delete_and_recreate_pod` su workload gestiti da controller. [web:421][web:394][web:382]
+---
+
+## Struttura del progetto
+
+```
+k8s-ai-remediator/
+├── cmd/
+│   └── agent/
+│       ├── main.go              # Bootstrap, signal handling, leader election, event loop
+│       └── main_test.go         # Test di integrazione per executeDecision
+├── internal/
+│   ├── model/
+│   │   └── model.go            # Tipi condivisi: Action, Decision, ChatRequest/Response
+│   ├── config/
+│   │   ├── config.go           # AgentConfig, parsing variabili d'ambiente
+│   │   └── config_test.go
+│   ├── ollama/
+│   │   ├── client.go           # Client HTTP con rate limiting, retry, TLS
+│   │   └── client_test.go
+│   ├── kube/
+│   │   ├── kube.go             # Operazioni Kubernetes (resolve, remediate, logs, snapshot)
+│   │   └── kube_test.go
+│   ├── policy/
+│   │   ├── policy.go           # Allowlist, validazione OCI, sanitizzazione prompt
+│   │   └── policy_test.go
+│   └── metrics/
+│       ├── metrics.go          # Metriche Prometheus-compatible (zero dipendenze esterne)
+│       └── metrics_test.go
+├── deploy/
+│   └── rbac-namespaced.yaml    # RBAC namespace-scoped di esempio
+├── .github/
+│   └── workflows/
+│       └── ci.yml              # CI/CD: lint, test, build, Docker, security scan
+├── Dockerfile                   # Multi-stage build (distroless, non-root)
+├── go.mod
+└── go.sum
+```
+
+### Package interni
+
+| Package | Responsabilita |
+|---------|---------------|
+| `internal/model` | Tipi condivisi tra tutti i package: costanti Action, struct Decision, tipi Ollama API |
+| `internal/config` | `AgentConfig` con tutti i parametri e helper per parsing env var con default |
+| `internal/ollama` | Client HTTP per Ollama con rate limiting (`golang.org/x/time/rate`), retry con exponential backoff, supporto TLS |
+| `internal/kube` | Tutte le operazioni Kubernetes: risoluzione Pod->Deployment, restart, delete, scale, set image, log inspection, snapshot |
+| `internal/policy` | Allowlist delle azioni, validazione OCI image, blocco image update unsafe, sanitizzazione prompt anti-injection |
+| `internal/metrics` | Metriche in formato Prometheus text exposition, zero dipendenze esterne |
 
 ---
 
 ## Prerequisiti
 
-Requisiti locali:
-
-- Cluster Kubernetes funzionante. [web:219]
-- `kubectl` configurato sul cluster corretto. [web:219]
-- Docker disponibile localmente. [web:278]
-- Go installato localmente. [web:301]
-
-Questa guida assume un contesto locale o comunque un cluster dove puoi usare immagini buildate localmente per l’agente. [web:278]  
-Se l’immagine dell’agente esiste solo in locale, è corretto usare `imagePullPolicy: Never` per evitare pull remoti indesiderati. [web:278]
+- Cluster Kubernetes funzionante (minikube, kind, k3s, EKS, GKE, AKS, ...)
+- `kubectl` configurato sul cluster corretto
+- Docker per la build dell'immagine
+- Go 1.21+ per sviluppo locale (opzionale, la build avviene in Docker)
 
 ---
 
-## Struttura locale
+## Build
 
-```text
-k8s-ai-remediator/
-├── cmd/
-│   └── agent/
-│       └── main.go
-├── Dockerfile
-└── go.mod
-```
-
----
-
-## File locali
-
-### `go.mod`
-
-```go
-module github.com/tuo-user/k8s-ai-remediator
-
-go 1.26.1
-
-require (
-	k8s.io/api v0.34.1
-	k8s.io/apimachinery v0.34.1
-	k8s.io/client-go v0.34.1
-)
-```
-
-La direttiva `go` in `go.mod` definisce la versione minima richiesta dal progetto. [web:301]
-
-### `Dockerfile`
-
-```dockerfile
-FROM golang:1.26.1 AS build
-WORKDIR /src
-COPY . .
-RUN go mod tidy
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/agent ./cmd/agent
-
-FROM gcr.io/distroless/static:nonroot
-COPY --from=build /out/agent /agent
-ENTRYPOINT ["/agent"]
-```
-
-### `cmd/agent/main.go`
-
-Usa il file `main.go` aggiornato con queste caratteristiche:
-
-- chiamata a Ollama via `/api/chat`; [page:1]
-- structured outputs con `format` e JSON schema; [page:2][web:29][web:30]
-- remediation `noop`, `restart_deployment`, `delete_failed_pod`, `delete_and_recreate_pod`, `scale_deployment`, `inspect_pod_logs`, `set_deployment_image`, `mark_for_manual_fix`, `ask_human`; [page:2]
-- lettura corretta di `pods/log`; [web:322][web:499]
-- selezione automatica del container per i log nei pod multi-container; [web:499][web:491]
-- risoluzione `Pod -> ReplicaSet -> Deployment` tramite `ownerReferences`. [web:395]
-
----
-
-## Installazione di Ollama
-
-### 1. Crea il namespace
+### Build dell'immagine Docker
 
 ```bash
+docker build -t ai-remediator:0.2.0 .
+```
+
+Il Dockerfile usa un multi-stage build:
+- **Stage 1**: Go 1.26.1 compila un binary statico (`CGO_ENABLED=0`)
+- **Stage 2**: `gcr.io/distroless/static:nonroot` come base (nessuna shell, utente non-root)
+
+### Build locale (opzionale)
+
+```bash
+go mod tidy
+CGO_ENABLED=0 go build -o agent ./cmd/agent
+```
+
+---
+
+## Installazione su Kubernetes
+
+### 1. Installazione di Ollama
+
+```bash
+# Crea il namespace
 kubectl create namespace ollama
-```
 
-La creazione esplicita del namespace prima delle altre risorse è la procedura corretta con `kubectl create namespace`. [web:219]
-
-### 2. Crea il deployment
-
-```bash
+# Crea il deployment
 kubectl -n ollama create deployment ollama \
   --image=ollama/ollama:latest \
   --port=11434 \
   --replicas=1
-```
 
-`kubectl create deployment` supporta la creazione del deployment direttamente da CLI. [web:120]
-
-### 3. Configura host, risorse e storage per i modelli
-
-```bash
+# Configura host, risorse e storage
 kubectl -n ollama patch deployment ollama --type='json' -p='[
   {"op":"add","path":"/spec/template/spec/containers/0/env","value":[
     {"name":"OLLAMA_HOST","value":"0.0.0.0:11434"}
@@ -154,76 +181,37 @@ kubectl -n ollama patch deployment ollama --type='json' -p='[
     {"name":"ollama-data","mountPath":"/root/.ollama"}
   ]}
 ]'
-```
 
-L’uso di `emptyDir` rende lo storage dei modelli legato alla vita del pod, perché il volume esiste finché esiste il pod. [web:150][web:452]
-
-### 4. Esponi il service interno
-
-```bash
+# Esponi il service
 kubectl -n ollama expose deployment ollama \
   --name=ollama \
   --port=11434 \
   --target-port=11434 \
   --type=ClusterIP
-```
 
-### 5. Attendi il rollout
-
-```bash
+# Attendi il rollout e installa il modello
 kubectl -n ollama rollout status deployment/ollama --timeout=180s
-kubectl -n ollama get pods,svc
-```
-
-`kubectl rollout status` è il comando corretto per verificare il completamento della revisione corrente del deployment. [web:354]
-
-### 6. Installa il modello
-
-```bash
 kubectl -n ollama exec -it deploy/ollama -- ollama pull gemma3
 kubectl -n ollama exec -it deploy/ollama -- ollama list
 ```
 
-L’agente deve usare esattamente il nome del modello presente in `ollama list`, perché Ollama risponde con errore `model not found` quando il nome configurato non corrisponde a un modello installato. [web:620][web:622][web:621]
+> **Nota**: il valore di `OLLAMA_MODEL` nella ConfigMap deve coincidere esattamente con il nome mostrato da `ollama list`.
 
----
-
-## Installazione dell'agente
-
-### 1. Crea il namespace
+### 2. Installazione dell'agente
 
 ```bash
+# Crea il namespace
 kubectl create namespace ai-remediator
-```
 
-### 2. Build locale dell’immagine
-
-```bash
-go mod tidy
-docker build -t ai-remediator:0.1.1 .
-```
-
-### 3. Crea il service account
-
-```bash
+# Crea il service account
 kubectl create serviceaccount ai-remediator -n ai-remediator
-```
 
-`kubectl create serviceaccount` è il comando corretto per creare il service account nel namespace dell’agente. [web:312]
-
-### 4. Crea il ClusterRole di base
-
-```bash
+# Crea il ClusterRole
 kubectl create clusterrole ai-remediator \
   --verb=get,list,watch,delete \
   --resource=pods,pods/log,events,namespaces
-```
 
-La sottorisorsa `pods/log` va autorizzata esplicitamente, perché non è implicita nel permesso su `pods`. [web:322][web:499]
-
-### 5. Aggiungi le regole per `deployments` e `replicasets`
-
-```bash
+# Aggiungi le regole per deployments e replicasets
 kubectl patch clusterrole ai-remediator --type='json' -p='[
   {"op":"add","path":"/rules/-","value":{
     "apiGroups":["apps"],
@@ -231,23 +219,13 @@ kubectl patch clusterrole ai-remediator --type='json' -p='[
     "verbs":["get","list","watch","update","patch"]
   }}
 ]'
-```
 
-`kubectl patch` è il comando corretto per aggiornare una risorsa API in-place senza applicare manifest YAML. [web:475][web:477]
-
-### 6. Crea il ClusterRoleBinding
-
-```bash
+# Crea il ClusterRoleBinding
 kubectl create clusterrolebinding ai-remediator \
   --clusterrole=ai-remediator \
   --serviceaccount=ai-remediator:ai-remediator
-```
 
-Il binding tra `ClusterRole` e `ServiceAccount` avviene correttamente con `kubectl create clusterrolebinding`. [web:319][web:605]
-
-### 7. Crea la ConfigMap di runtime
-
-```bash
+# Crea la ConfigMap
 kubectl create configmap ai-remediator-config \
   -n ai-remediator \
   --from-literal=OLLAMA_BASE_URL=http://ollama.ollama.svc.cluster.local:11434/api \
@@ -258,145 +236,276 @@ kubectl create configmap ai-remediator-config \
   --from-literal=POLL_INTERVAL_SECONDS=30 \
   --from-literal=ALLOW_IMAGE_UPDATES=false \
   --from-literal=IMAGE_UPDATE_CONFIDENCE_THRESHOLD=0.92 \
-  --from-literal=POD_LOG_TAIL_LINES=200
-```
+  --from-literal=POD_LOG_TAIL_LINES=200 \
+  --from-literal=OLLAMA_RPS=2.0 \
+  --from-literal=OLLAMA_MAX_RETRIES=3 \
+  --from-literal=METRICS_ADDR=:9090
 
-`kubectl create configmap --from-literal` è la modalità corretta per creare la configurazione da linea di comando. [web:317]
-
-### 8. Crea il deployment dell’agente
-
-```bash
+# Crea il deployment
 kubectl -n ai-remediator create deployment ai-remediator \
-  --image=ai-remediator:0.1.1
-```
+  --image=ai-remediator:0.2.0
 
-### 9. Collega service account, ConfigMap e immagine locale
-
-```bash
+# Collega service account, ConfigMap e immagine locale
 kubectl -n ai-remediator patch deployment ai-remediator --type='json' -p='[
   {"op":"add","path":"/spec/template/spec/serviceAccountName","value":"ai-remediator"},
   {"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Never"},
   {"op":"add","path":"/spec/template/spec/containers/0/envFrom","value":[
     {"configMapRef":{"name":"ai-remediator-config"}}
+  ]},
+  {"op":"add","path":"/spec/template/spec/containers/0/ports","value":[
+    {"containerPort":9090,"name":"metrics"}
   ]}
+]'
+
+# Verifica il rollout
+kubectl -n ai-remediator rollout status deployment/ai-remediator --timeout=180s
+kubectl -n ai-remediator logs deploy/ai-remediator --tail=20
+```
+
+> **Nota**: usa `imagePullPolicy: Never` solo con immagini buildate localmente (minikube, kind). Per un registry remoto, rimuovi questa impostazione.
+
+---
+
+## Configurazione
+
+Tutte le variabili sono lette da environment (tipicamente via ConfigMap).
+
+### Variabili principali
+
+| Variabile | Default | Descrizione |
+|-----------|---------|-------------|
+| `OLLAMA_BASE_URL` | `http://ollama.ollama.svc.cluster.local:11434/api` | URL base dell'API Ollama |
+| `OLLAMA_MODEL` | `gemma3` | Nome del modello LLM (deve corrispondere a `ollama list`) |
+| `DRY_RUN` | `false` | Se `true`, logga le decisioni senza applicare remediation |
+| `POLL_INTERVAL_SECONDS` | `30` | Intervallo di polling degli eventi (secondi) |
+
+### Variabili di policy
+
+| Variabile | Default | Descrizione |
+|-----------|---------|-------------|
+| `SCALE_MIN` | `1` | Minimo numero di repliche consentite per `scale_deployment` |
+| `SCALE_MAX` | `5` | Massimo numero di repliche consentite |
+| `ALLOW_IMAGE_UPDATES` | `false` | Abilita l'azione `set_deployment_image` |
+| `IMAGE_UPDATE_CONFIDENCE_THRESHOLD` | `0.92` | Confidenza minima per aggiornare un'immagine |
+
+### Variabili Ollama (resilienza)
+
+| Variabile | Default | Descrizione |
+|-----------|---------|-------------|
+| `OLLAMA_RPS` | `2.0` | Max richieste al secondo verso Ollama (rate limiting) |
+| `OLLAMA_MAX_RETRIES` | `3` | Tentativi per errori transitori (5xx, rete) con backoff esponenziale |
+| `OLLAMA_TLS_SKIP_VERIFY` | `false` | Salta la verifica TLS (per certificati self-signed) |
+| `POD_LOG_TAIL_LINES` | `200` | Numero di righe di log lette per container |
+
+### Variabili di osservabilita
+
+| Variabile | Default | Descrizione |
+|-----------|---------|-------------|
+| `METRICS_ADDR` | `:9090` | Indirizzo di ascolto per `/metrics` e `/healthz` |
+
+### Variabili di alta disponibilita
+
+| Variabile | Default | Descrizione |
+|-----------|---------|-------------|
+| `LEADER_ELECTION` | `false` | Abilita la leader election per deploy multi-replica |
+| `LEASE_NAME` | `ai-remediator-leader` | Nome della risorsa Lease |
+| `LEASE_NAMESPACE` | `ai-remediator` | Namespace della risorsa Lease |
+
+---
+
+## Remediation supportate
+
+| Azione | Tipo | Descrizione |
+|--------|------|-------------|
+| `noop` | Passiva | Nessuna azione, la decisione viene solo loggata |
+| `ask_human` | Passiva | Segnala che serve intervento manuale |
+| `mark_for_manual_fix` | Passiva | Marca la risorsa come non risolvibile automaticamente |
+| `inspect_pod_logs` | Read-only | Legge i log correnti e precedenti del container con piu restart |
+| `restart_deployment` | Mutazione | Forza un rollout aggiornando l'annotazione del pod template |
+| `delete_failed_pod` | Mutazione | Elimina il pod, il controller lo ricrea |
+| `delete_and_recreate_pod` | Mutazione | Come sopra, usato quando il pod va ricreato da zero |
+| `scale_deployment` | Mutazione | Aggiorna `spec.replicas` entro i limiti `SCALE_MIN`/`SCALE_MAX` |
+| `set_deployment_image` | Mutazione | Aggiorna l'immagine del container (richiede `ALLOW_IMAGE_UPDATES=true`, confidenza sopra soglia, immagine OCI valida) |
+
+### Logica di selezione del container per i log
+
+Nei pod multi-container, `inspect_pod_logs` seleziona il container:
+1. Usa il container specificato nei parametri, se presente e valido
+2. Altrimenti sceglie il container con il maggior numero di restart
+3. Come fallback, usa il primo container nella spec
+
+---
+
+## Osservabilita
+
+### Endpoint HTTP
+
+L'agente espone due endpoint HTTP sulla porta configurata in `METRICS_ADDR` (default `:9090`):
+
+| Endpoint | Descrizione |
+|----------|-------------|
+| `/metrics` | Metriche in formato Prometheus text exposition |
+| `/healthz` | Health check (ritorna `200 OK`) |
+
+### Metriche esposte
+
+| Metrica | Tipo | Descrizione |
+|---------|------|-------------|
+| `remediator_events_processed_total` | Counter | Totale eventi Warning processati |
+| `remediator_events_skipped_total` | Gauge | Eventi saltati (dedup o non-Warning) |
+| `remediator_decisions_total{action}` | Counter | Decisioni per tipo di azione |
+| `remediator_decision_errors_total` | Counter | Errori nella chiamata a Ollama |
+| `remediator_execution_errors_total` | Counter | Errori nell'esecuzione della remediation |
+| `remediator_ollama_requests_total` | Counter | Totale richieste a Ollama |
+| `remediator_ollama_errors_total` | Counter | Errori Ollama |
+| `remediator_ollama_avg_latency_seconds` | Gauge | Latenza media delle richieste Ollama |
+| `remediator_ollama_rate_limited_total` | Counter | Richieste ritardate dal rate limiter |
+
+### Logging strutturato
+
+L'agente produce log in formato JSON (via `log/slog`) su stdout, compatibili con stack di logging Kubernetes (Loki, Fluentd, CloudWatch, ecc.):
+
+```json
+{"time":"2026-03-26T10:00:00Z","level":"INFO","msg":"decision","summary":"Pod crash","action":"restart_deployment","ns":"default","kind":"Deployment","name":"web","confidence":0.85}
+```
+
+### Configurare il Service per lo scraping Prometheus
+
+```bash
+kubectl -n ai-remediator expose deployment ai-remediator \
+  --name=ai-remediator-metrics \
+  --port=9090 \
+  --target-port=9090 \
+  --type=ClusterIP
+
+# Se usi Prometheus Operator, aggiungi un ServiceMonitor:
+# apiVersion: monitoring.coreos.com/v1
+# kind: ServiceMonitor
+# metadata:
+#   name: ai-remediator
+#   namespace: ai-remediator
+# spec:
+#   selector:
+#     matchLabels:
+#       app: ai-remediator
+#   endpoints:
+#   - port: metrics
+#     interval: 30s
+```
+
+---
+
+## Sicurezza
+
+### Livelli di protezione
+
+1. **Allowlist delle azioni**: solo le 9 azioni predefinite sono accettate; qualsiasi altra viene rifiutata
+2. **Dry-run mode**: con `DRY_RUN=true` nessuna modifica viene applicata al cluster
+3. **Policy bounds**: `scale_deployment` vincolato a `SCALE_MIN`/`SCALE_MAX`
+4. **Confidence threshold**: `set_deployment_image` bloccato sotto la soglia configurata
+5. **Validazione OCI**: le immagini dal LLM vengono validate contro il formato OCI standard
+6. **Sanitizzazione prompt**: i messaggi degli eventi Kubernetes vengono sanitizzati prima di essere inviati all'LLM (rimozione caratteri di controllo, pattern di prompt injection, troncamento)
+7. **Container distroless**: l'immagine non ha shell, file system minimo, utente non-root
+8. **Rate limiting**: previene il sovraccarico di Ollama durante storm di eventi
+
+### Protezione da prompt injection
+
+I campi `reason`, `message` e `extra` degli eventi Kubernetes sono sanitizzati prima di entrare nel prompt LLM:
+- Caratteri di controllo rimossi (tranne `\n` e `\t`)
+- Pattern di injection comuni redatti: "ignore previous instructions", "disregard above", "system:", "forget everything", "new instructions:"
+- Campi troncati a 2000 caratteri (500 per reason)
+
+---
+
+## Alta disponibilita (Leader Election)
+
+Per eseguire l'agente con piu repliche in sicurezza:
+
+```bash
+# Aggiungi alla ConfigMap
+kubectl -n ai-remediator create configmap ai-remediator-config \
+  ... \
+  --from-literal=LEADER_ELECTION=true \
+  --from-literal=LEASE_NAME=ai-remediator-leader \
+  --from-literal=LEASE_NAMESPACE=ai-remediator \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Scala a piu repliche
+kubectl -n ai-remediator scale deployment ai-remediator --replicas=2
+```
+
+Con leader election abilitata:
+- Solo la replica leader esegue il polling loop
+- Le altre repliche restano in attesa
+- Se il leader muore, un'altra replica prende il suo posto entro ~15 secondi
+- Il meccanismo usa `Lease` (risorsa nativa di Kubernetes `coordination.k8s.io`)
+
+Serve aggiungere i permessi per le Lease:
+
+```bash
+kubectl patch clusterrole ai-remediator --type='json' -p='[
+  {"op":"add","path":"/rules/-","value":{
+    "apiGroups":["coordination.k8s.io"],
+    "resources":["leases"],
+    "verbs":["get","create","update"]
+  }}
 ]'
 ```
 
-Usare `imagePullPolicy: Never` è corretto quando l’immagine dell’agente esiste solo localmente. [web:278]
-
-### 10. Verifica il rollout
-
-```bash
-kubectl -n ai-remediator rollout status deployment/ai-remediator --timeout=180s
-kubectl -n ai-remediator get pods
-kubectl -n ai-remediator logs deploy/ai-remediator --tail=50
-```
-
-### 11. Verifica i permessi effettivi del service account
-
-```bash
-kubectl auth can-i get pods/log \
-  --as=system:serviceaccount:ai-remediator:ai-remediator \
-  -n incident-lab
-
-kubectl auth can-i get pods/log \
-  --as=system:serviceaccount:ai-remediator:ai-remediator \
-  -n default
-```
-
 ---
 
-## Configurazione runtime
+## RBAC namespace-scoped
 
-Variabili usate dall’agente:
+Per limitare l'agente a namespace specifici (invece di cluster-wide), usa i manifest in `deploy/rbac-namespaced.yaml`:
 
-| Variabile | Valore consigliato |
-|---|---|
-| `OLLAMA_BASE_URL` | `http://ollama.ollama.svc.cluster.local:11434/api` [page:1] |
-| `OLLAMA_MODEL` | `gemma3` oppure il nome esatto mostrato da `ollama list` [web:620][web:621] |
-| `DRY_RUN` | `false` |
-| `SCALE_MIN` | `1` |
-| `SCALE_MAX` | `5` |
-| `POLL_INTERVAL_SECONDS` | `30` |
-| `ALLOW_IMAGE_UPDATES` | `false` |
-| `IMAGE_UPDATE_CONFIDENCE_THRESHOLD` | `0.92` |
-| `POD_LOG_TAIL_LINES` | `200` |
+```bash
+kubectl apply -f deploy/rbac-namespaced.yaml
+```
 
-Con `DRY_RUN=false`, l’agente prova ad applicare remediation reali invece di limitarsi a loggare la decisione. [page:2]  
-Il valore di `OLLAMA_MODEL` deve coincidere con il nome reale del modello installato in Ollama. [web:620][web:622]
+Questo crea:
+- `Role` + `RoleBinding` nel namespace target (es. `incident-lab`)
+- `Role` + `RoleBinding` per la leader election nel namespace dell'agente
+- `ServiceAccount` nel namespace dell'agente
 
----
+Per aggiungere altri namespace, duplica le risorse Role/RoleBinding:
 
-## Remediation implementate
+```bash
+# Crea Role per un nuovo namespace
+kubectl -n <nuovo-namespace> create role ai-remediator \
+  --verb=get,list,watch,delete \
+  --resource=pods,pods/log,events
 
-Le azioni supportate dall’agente sono:
+kubectl -n <nuovo-namespace> patch role ai-remediator --type='json' -p='[
+  {"op":"add","path":"/rules/-","value":{
+    "apiGroups":["apps"],
+    "resources":["deployments","replicasets"],
+    "verbs":["get","list","watch","update","patch"]
+  }}
+]'
 
-- `noop`
-- `restart_deployment`
-- `delete_failed_pod`
-- `delete_and_recreate_pod`
-- `scale_deployment`
-- `inspect_pod_logs`
-- `set_deployment_image`
-- `mark_for_manual_fix`
-- `ask_human`
-
-### `inspect_pod_logs`
-
-Legge i log del pod, inclusi i log `previous` del container selezionato, che sono particolarmente utili nei casi di `CrashLoopBackOff`. [web:499][web:496]
-
-### `delete_and_recreate_pod`
-
-Elimina il pod quando la risorsa è un pod gestito da controller, lasciando che Kubernetes lo ricrei automaticamente. [web:421][web:394]
-
-### `restart_deployment`
-
-Forza un nuovo rollout del deployment aggiornando il pod template, che è il principio operativo dietro il restart di un deployment. [web:382][web:386]
-
-### `scale_deployment`
-
-Aggiorna `spec.replicas` del deployment entro i limiti consentiti dalla policy locale. [page:2]
-
-### `set_deployment_image`
-
-Aggiorna l’immagine di un container del deployment solo quando la policy locale lo consente e la decisione include un’immagine concreta. [page:2]
-
-### `mark_for_manual_fix`
-
-Segnala che il caso richiede intervento umano, per esempio quando un `ImagePullBackOff` non è risolvibile in sicurezza partendo dal solo evento. [web:412][web:417]
+kubectl -n <nuovo-namespace> create rolebinding ai-remediator \
+  --role=ai-remediator \
+  --serviceaccount=ai-remediator:ai-remediator
+```
 
 ---
 
 ## Laboratorio di test
 
-Il laboratorio usa un `Deployment` con un pod che parte sano, ma va in errore quando compare un file in un volume `emptyDir`. [web:150][web:452]  
-Questa simulazione è utile perché `emptyDir` sopravvive ai restart del container nello stesso pod ma si azzera quando il pod viene ricreato, quindi `delete_and_recreate_pod` è una remediation verificabile. [web:150][web:452][web:421]
+Il laboratorio usa un Deployment con un pod che parte sano ma va in errore quando compare un file in un volume `emptyDir`. Dato che `emptyDir` si azzera quando il pod viene ricreato, `delete_and_recreate_pod` e una remediation verificabile.
 
-### 1. Crea il namespace di test
+### Setup
 
 ```bash
-kubectl delete namespace incident-lab --ignore-not-found
+# Crea il namespace
 kubectl create namespace incident-lab
-```
 
-### 2. Assicurati che l’immagine di test sia disponibile
-
-```bash
-docker pull busybox:1.36
-docker images | grep busybox
-```
-
-### 3. Crea il deployment del laboratorio
-
-```bash
+# Crea il deployment
 kubectl -n incident-lab create deployment healable-app \
   --image=busybox:1.36 \
   -- /bin/sh -c 'echo "started"; while true; do if [ -f /state/poison ]; then echo "poison detected"; exit 1; fi; sleep 2; done'
-```
 
-### 4. Aggiungi `emptyDir` e `imagePullPolicy`
-
-```bash
+# Aggiungi emptyDir
 kubectl -n incident-lab patch deployment healable-app --type='json' -p='[
   {"op":"add","path":"/spec/template/spec/volumes","value":[
     {"name":"state","emptyDir":{}}
@@ -406,58 +515,64 @@ kubectl -n incident-lab patch deployment healable-app --type='json' -p='[
   ]},
   {"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}
 ]'
-```
 
-### 5. Attendi il pod sano
-
-```bash
+# Attendi che il pod sia sano
 kubectl -n incident-lab rollout status deployment/healable-app --timeout=120s
-kubectl -n incident-lab get pods
 ```
 
-### 6. Recupera il nome del pod e del container
+### Innesco del guasto
 
 ```bash
-POD=$(kubectl -n incident-lab get pods -o jsonpath='{.items.metadata.name}')
-echo "$POD"
-
-kubectl -n incident-lab get pod "$POD" -o jsonpath='{.spec.containers[*].name}'; echo
+POD=$(kubectl -n incident-lab get pods -o jsonpath='{.items[0].metadata.name}')
+kubectl -n incident-lab exec "$POD" -c busybox -- sh -c 'touch /state/poison'
 ```
 
-Nei pod multi-container, `kubectl logs` e `kubectl exec` richiedono il nome corretto del container. [web:499][web:491][web:506]
+Il container trova il file poison, termina, e il pod entra in `CrashLoopBackOff`.
 
-### 7. Innesca il guasto
-
-```bash
-kubectl -n incident-lab exec "$POD" -c busybox -- sh -c 'touch /state/poison && ls -l /state'
-```
-
-Dopo pochi secondi il processo principale trova il file e termina, il container viene riavviato nello stesso pod e il pod tende a entrare in `CrashLoopBackOff`. [web:150][web:452]
-
-### 8. Osserva il laboratorio
-
-Terminale 1:
+### Osservazione
 
 ```bash
+# Terminale 1: osserva i pod
 kubectl -n incident-lab get pods -w
-```
 
-Terminale 2:
-
-```bash
-kubectl -n incident-lab get events --sort-by=.metadata.creationTimestamp | tail -n 20
+# Terminale 2: osserva i log dell'agente
 kubectl -n ai-remediator logs deploy/ai-remediator -f
+
+# Terminale 3: osserva gli eventi
+kubectl -n incident-lab get events --sort-by=.metadata.creationTimestamp | tail -20
 ```
 
-### 9. Verifica manuale della remediation corretta
+L'agente dovrebbe rilevare l'evento Warning, analizzarlo, e decidere una remediation (tipicamente `delete_and_recreate_pod` o `restart_deployment`). Il nuovo pod nasce con un `emptyDir` vuoto e torna sano.
+
+---
+
+## Sviluppo
+
+### Eseguire i test
 
 ```bash
-kubectl -n incident-lab delete pod "$POD"
-kubectl -n incident-lab get pods -w
+go test ./... -v -count=1
 ```
 
-Se il pod viene eliminato, il `Deployment` lo ricrea automaticamente per mantenere il numero desiderato di repliche. [web:421][web:394]  
-Nel laboratorio questo nuovo pod torna pulito perché nasce con un nuovo `emptyDir` senza il file `poison`. [web:150][web:452]
+I test usano:
+- `k8s.io/client-go/kubernetes/fake` per simulare il cluster Kubernetes
+- `net/http/httptest` per simulare le risposte di Ollama
+- Coprono: config, azioni, policy, sanitizzazione, retry, metriche, OCI validation
+
+### Linting
+
+```bash
+golangci-lint run ./...
+```
+
+### CI/CD
+
+La pipeline GitHub Actions (`.github/workflows/ci.yml`) esegue automaticamente:
+1. **Lint**: `golangci-lint`
+2. **Test**: con race detector e copertura
+3. **Build**: binary statico linux/amd64
+4. **Docker Build**: build dell'immagine container
+5. **Security**: scansione vulnerabilita con `govulncheck`
 
 ---
 
@@ -474,19 +589,30 @@ kubectl -n ollama exec -it deploy/ollama -- ollama list
 
 ```bash
 kubectl -n ai-remediator get pods
-kubectl -n ai-remediator get deployment ai-remediator -o jsonpath='{.spec.template.spec.containers.image}'; echo
-kubectl -n ai-remediator logs deploy/ai-remediator --tail=100
+kubectl -n ai-remediator logs deploy/ai-remediator --tail=50
 ```
 
-### Stato laboratorio
+### Metriche
 
 ```bash
-kubectl -n incident-lab get pods
-kubectl -n incident-lab describe pod "$POD"
-kubectl -n incident-lab logs "$POD" -c busybox --tail=50
+kubectl -n ai-remediator port-forward deploy/ai-remediator 9090:9090
+curl http://localhost:9090/metrics
+curl http://localhost:9090/healthz
 ```
 
-### Aggiornamento ConfigMap senza YAML applicato al cluster
+### Health check dei permessi
+
+```bash
+kubectl auth can-i get pods/log \
+  --as=system:serviceaccount:ai-remediator:ai-remediator \
+  -n incident-lab
+
+kubectl auth can-i update deployments \
+  --as=system:serviceaccount:ai-remediator:ai-remediator \
+  -n incident-lab
+```
+
+### Aggiornamento ConfigMap
 
 ```bash
 kubectl -n ai-remediator create configmap ai-remediator-config \
@@ -499,23 +625,20 @@ kubectl -n ai-remediator create configmap ai-remediator-config \
   --from-literal=ALLOW_IMAGE_UPDATES=false \
   --from-literal=IMAGE_UPDATE_CONFIDENCE_THRESHOLD=0.92 \
   --from-literal=POD_LOG_TAIL_LINES=200 \
+  --from-literal=OLLAMA_RPS=2.0 \
+  --from-literal=OLLAMA_MAX_RETRIES=3 \
+  --from-literal=METRICS_ADDR=:9090 \
   --dry-run=client -o yaml | kubectl apply -f -
-```
 
-### Restart dell’agente dopo aggiornamenti
-
-```bash
+# Restart per applicare le modifiche
 kubectl -n ai-remediator rollout restart deployment/ai-remediator
-kubectl -n ai-remediator rollout status deployment/ai-remediator --timeout=180s
 ```
-
-`kubectl rollout restart` è la procedura standard per forzare una nuova revisione del deployment. [web:386][web:383]
 
 ---
 
 ## Reset ambiente
 
-### Reset solo laboratorio
+### Solo laboratorio
 
 ```bash
 kubectl delete namespace incident-lab --ignore-not-found
@@ -529,59 +652,4 @@ kubectl delete namespace ai-remediator --ignore-not-found
 kubectl delete namespace ollama --ignore-not-found
 kubectl delete clusterrolebinding ai-remediator --ignore-not-found
 kubectl delete clusterrole ai-remediator --ignore-not-found
-```
-
----
-
-## Sequenza minima completa
-
-Per replicare rapidamente l’ambiente in un altro cluster:
-
-```bash
-kubectl create namespace ollama
-kubectl -n ollama create deployment ollama --image=ollama/ollama:latest --port=11434 --replicas=1
-kubectl -n ollama patch deployment ollama --type='json' -p='[
-  {"op":"add","path":"/spec/template/spec/containers/0/env","value":[{"name":"OLLAMA_HOST","value":"0.0.0.0:11434"}]},
-  {"op":"add","path":"/spec/template/spec/containers/0/resources","value":{"requests":{"cpu":"2","memory":"4Gi"},"limits":{"cpu":"4","memory":"8Gi"}}},
-  {"op":"add","path":"/spec/template/spec/volumes","value":[{"name":"ollama-data","emptyDir":{}}]},
-  {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts","value":[{"name":"ollama-data","mountPath":"/root/.ollama"}]}
-]'
-kubectl -n ollama expose deployment ollama --name=ollama --port=11434 --target-port=11434 --type=ClusterIP
-kubectl -n ollama rollout status deployment/ollama --timeout=180s
-kubectl -n ollama exec -it deploy/ollama -- ollama pull gemma3
-
-kubectl create namespace ai-remediator
-kubectl create serviceaccount ai-remediator -n ai-remediator
-kubectl create clusterrole ai-remediator --verb=get,list,watch,delete --resource=pods,pods/log,events,namespaces
-kubectl patch clusterrole ai-remediator --type='json' -p='[
-  {"op":"add","path":"/rules/-","value":{"apiGroups":["apps"],"resources":["deployments","replicasets"],"verbs":["get","list","watch","update","patch"]}}
-]'
-kubectl create clusterrolebinding ai-remediator --clusterrole=ai-remediator --serviceaccount=ai-remediator:ai-remediator
-kubectl create configmap ai-remediator-config -n ai-remediator \
-  --from-literal=OLLAMA_BASE_URL=http://ollama.ollama.svc.cluster.local:11434/api \
-  --from-literal=OLLAMA_MODEL=gemma3 \
-  --from-literal=DRY_RUN=false \
-  --from-literal=SCALE_MIN=1 \
-  --from-literal=SCALE_MAX=5 \
-  --from-literal=POLL_INTERVAL_SECONDS=30 \
-  --from-literal=ALLOW_IMAGE_UPDATES=false \
-  --from-literal=IMAGE_UPDATE_CONFIDENCE_THRESHOLD=0.92 \
-  --from-literal=POD_LOG_TAIL_LINES=200
-kubectl -n ai-remediator create deployment ai-remediator --image=ai-remediator:0.1.1
-kubectl -n ai-remediator patch deployment ai-remediator --type='json' -p='[
-  {"op":"add","path":"/spec/template/spec/serviceAccountName","value":"ai-remediator"},
-  {"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Never"},
-  {"op":"add","path":"/spec/template/spec/containers/0/envFrom","value":[{"configMapRef":{"name":"ai-remediator-config"}}]}
-]'
-kubectl -n ai-remediator rollout status deployment/ai-remediator --timeout=180s
-
-kubectl delete namespace incident-lab --ignore-not-found
-kubectl create namespace incident-lab
-kubectl -n incident-lab create deployment healable-app --image=busybox:1.36 -- /bin/sh -c 'echo "started"; while true; do if [ -f /state/poison ]; then echo "poison detected"; exit 1; fi; sleep 2; done'
-kubectl -n incident-lab patch deployment healable-app --type='json' -p='[
-  {"op":"add","path":"/spec/template/spec/volumes","value":[{"name":"state","emptyDir":{}}]},
-  {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts","value":[{"name":"state","mountPath":"/state"}]},
-  {"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}
-]'
-kubectl -n incident-lab rollout status deployment/healable-app --timeout=120s
 ```
