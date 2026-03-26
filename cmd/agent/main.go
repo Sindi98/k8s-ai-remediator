@@ -9,8 +9,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -231,7 +234,7 @@ func ollamaDecision(ctx context.Context, baseURL, model, prompt string) (Decisio
 	return d, nil
 }
 
-func resolveDeploymentFromPod(ctx context.Context, cs *kubernetes.Clientset, ns, podName string) (string, error) {
+func resolveDeploymentFromPod(ctx context.Context, cs kubernetes.Interface, ns, podName string) (string, error) {
 	pod, err := cs.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
 		return "", err
@@ -254,7 +257,7 @@ func resolveDeploymentFromPod(ctx context.Context, cs *kubernetes.Clientset, ns,
 	return "", fmt.Errorf("deployment owner not found")
 }
 
-func firstPodForDeployment(ctx context.Context, cs *kubernetes.Clientset, ns, deploymentName string) (string, error) {
+func firstPodForDeployment(ctx context.Context, cs kubernetes.Interface, ns, deploymentName string) (string, error) {
 	dep, err := cs.AppsV1().Deployments(ns).Get(ctx, deploymentName, metav1.GetOptions{})
 	if err != nil {
 		return "", err
@@ -281,7 +284,7 @@ func firstPodForDeployment(ctx context.Context, cs *kubernetes.Clientset, ns, de
 	return pods.Items[0].Name, nil
 }
 
-func restartDeployment(ctx context.Context, cs *kubernetes.Clientset, ns, name string, dryRun bool) error {
+func restartDeployment(ctx context.Context, cs kubernetes.Interface, ns, name string, dryRun bool) error {
 	if dryRun {
 		return nil
 	}
@@ -299,14 +302,14 @@ func restartDeployment(ctx context.Context, cs *kubernetes.Clientset, ns, name s
 	return err
 }
 
-func deletePod(ctx context.Context, cs *kubernetes.Clientset, ns, name string, dryRun bool) error {
+func deletePod(ctx context.Context, cs kubernetes.Interface, ns, name string, dryRun bool) error {
 	if dryRun {
 		return nil
 	}
 	return cs.CoreV1().Pods(ns).Delete(ctx, name, metav1.DeleteOptions{})
 }
 
-func scaleDeployment(ctx context.Context, cs *kubernetes.Clientset, ns, name string, replicas int32, minScale, maxScale int32, dryRun bool) error {
+func scaleDeployment(ctx context.Context, cs kubernetes.Interface, ns, name string, replicas int32, minScale, maxScale int32, dryRun bool) error {
 	if replicas < minScale || replicas > maxScale {
 		return fmt.Errorf("replicas outside policy")
 	}
@@ -324,7 +327,7 @@ func scaleDeployment(ctx context.Context, cs *kubernetes.Clientset, ns, name str
 	return err
 }
 
-func setDeploymentImage(ctx context.Context, cs *kubernetes.Clientset, ns, name, image, container string, dryRun bool) error {
+func setDeploymentImage(ctx context.Context, cs kubernetes.Interface, ns, name, image, container string, dryRun bool) error {
 	if strings.TrimSpace(image) == "" {
 		return fmt.Errorf("image parameter is required")
 	}
@@ -360,7 +363,7 @@ func setDeploymentImage(ctx context.Context, cs *kubernetes.Clientset, ns, name,
 	return err
 }
 
-func readPodLogs(ctx context.Context, cs *kubernetes.Clientset, ns, podName, container string, previous bool, tailLines int64) (string, error) {
+func readPodLogs(ctx context.Context, cs kubernetes.Interface, ns, podName, container string, previous bool, tailLines int64) (string, error) {
 	req := cs.CoreV1().Pods(ns).GetLogs(podName, &corev1.PodLogOptions{
 		Container: container,
 		Previous:  previous,
@@ -413,7 +416,7 @@ func chooseContainerForLogs(pod *corev1.Pod, preferred string) string {
 	return preferred
 }
 
-func inspectPodLogs(ctx context.Context, cs *kubernetes.Clientset, ns, kind, name string, params map[string]string, tailLines int64) error {
+func inspectPodLogs(ctx context.Context, cs kubernetes.Interface, ns, kind, name string, params map[string]string, tailLines int64) error {
 	podName := name
 
 	if strings.EqualFold(kind, "Deployment") {
@@ -465,7 +468,7 @@ func inspectPodLogs(ctx context.Context, cs *kubernetes.Clientset, ns, kind, nam
 	return nil
 }
 
-func resolveDeploymentTarget(ctx context.Context, cs *kubernetes.Clientset, ns, kind, name string) (string, error) {
+func resolveDeploymentTarget(ctx context.Context, cs kubernetes.Interface, ns, kind, name string) (string, error) {
 	if strings.EqualFold(kind, "Deployment") {
 		return name, nil
 	}
@@ -493,7 +496,7 @@ func maybeBlockUnsafeImageUpdate(d Decision, allowImageUpdates bool, threshold f
 
 func executeDecision(
 	ctx context.Context,
-	cs *kubernetes.Clientset,
+	cs kubernetes.Interface,
 	d Decision,
 	dryRun bool,
 	minScale, maxScale int32,
@@ -579,7 +582,7 @@ func deploymentToText(dep *appsv1.Deployment) string {
 	)
 }
 
-func deploymentSnapshot(ctx context.Context, cs *kubernetes.Clientset, ns, depName string) string {
+func deploymentSnapshot(ctx context.Context, cs kubernetes.Interface, ns, depName string) string {
 	dep, err := cs.AppsV1().Deployments(ns).Get(ctx, depName, metav1.GetOptions{})
 	if err != nil {
 		return ""
@@ -587,7 +590,34 @@ func deploymentSnapshot(ctx context.Context, cs *kubernetes.Clientset, ns, depNa
 	return deploymentToText(dep)
 }
 
+// sanitizeForPrompt removes characters and patterns that could be used for
+// prompt injection attacks in LLM inputs sourced from Kubernetes events.
+// It strips control characters, trims excessive length, and removes sequences
+// that attempt to override system instructions.
+func sanitizeForPrompt(s string, maxLen int) string {
+	// Remove control characters except newline and tab
+	re := regexp.MustCompile(`[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]`)
+	s = re.ReplaceAllString(s, "")
+
+	// Strip common prompt injection patterns (case-insensitive)
+	injectionPatterns := regexp.MustCompile(`(?i)(ignore previous instructions|ignore all instructions|disregard above|system:\s|you are now|forget everything|new instructions:)`)
+	s = injectionPatterns.ReplaceAllString(s, "[REDACTED]")
+
+	// Truncate to prevent excessively long inputs
+	if maxLen > 0 && len(s) > maxLen {
+		s = s[:maxLen] + "...[truncated]"
+	}
+
+	return strings.TrimSpace(s)
+}
+
 func buildPrompt(ns, kind, name, etype, reason, message, extra string) string {
+	// Sanitize all user-controllable fields to prevent prompt injection
+	const fieldMaxLen = 2000
+	reason = sanitizeForPrompt(reason, 500)
+	message = sanitizeForPrompt(message, fieldMaxLen)
+	extra = sanitizeForPrompt(extra, fieldMaxLen)
+
 	return fmt.Sprintf(`Analyze this Kubernetes incident and return only JSON.
 
 Event type: %s
@@ -611,42 +641,55 @@ Rules:
 		etype, reason, message, ns, kind, name, extra)
 }
 
-func main() {
-	baseURL := getenv("OLLAMA_BASE_URL", "http://ollama.ollama.svc.cluster.local:11434/api")
-	model := getenv("OLLAMA_MODEL", "gemma3")
-	dryRun := getbool("DRY_RUN", false)
-	minScale := int32(getint("SCALE_MIN", 1))
-	maxScale := int32(getint("SCALE_MAX", 5))
-	pollSec := getint("POLL_INTERVAL_SECONDS", 30)
-	allowImageUpdates := getbool("ALLOW_IMAGE_UPDATES", false)
-	imageUpdateThreshold := getfloat("IMAGE_UPDATE_CONFIDENCE_THRESHOLD", 0.92)
-	podLogTailLines := int64(getint("POD_LOG_TAIL_LINES", 200))
+// AgentConfig holds all configuration values for the remediation agent.
+type AgentConfig struct {
+	BaseURL              string
+	Model                string
+	DryRun               bool
+	MinScale             int32
+	MaxScale             int32
+	PollSec              int
+	AllowImageUpdates    bool
+	ImageUpdateThreshold float64
+	PodLogTailLines      int64
+}
 
-	cfg, err := rest.InClusterConfig()
-	if err != nil {
-		log.Fatal(err)
+// LoadConfigFromEnv reads agent configuration from environment variables.
+func LoadConfigFromEnv() AgentConfig {
+	return AgentConfig{
+		BaseURL:              getenv("OLLAMA_BASE_URL", "http://ollama.ollama.svc.cluster.local:11434/api"),
+		Model:                getenv("OLLAMA_MODEL", "gemma3"),
+		DryRun:               getbool("DRY_RUN", false),
+		MinScale:             int32(getint("SCALE_MIN", 1)),
+		MaxScale:             int32(getint("SCALE_MAX", 5)),
+		PollSec:              getint("POLL_INTERVAL_SECONDS", 30),
+		AllowImageUpdates:    getbool("ALLOW_IMAGE_UPDATES", false),
+		ImageUpdateThreshold: getfloat("IMAGE_UPDATE_CONFIDENCE_THRESHOLD", 0.92),
+		PodLogTailLines:      int64(getint("POD_LOG_TAIL_LINES", 200)),
 	}
+}
 
-	cs, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		log.Fatal(err)
-	}
-
+// runLoop executes the main event polling loop. It returns when the parent
+// context is cancelled (e.g. on SIGTERM), allowing for graceful shutdown.
+func runLoop(ctx context.Context, cs kubernetes.Interface, cfg AgentConfig) {
 	seen := map[string]bool{}
 	log.Printf(
 		"agent started model=%s baseURL=%s dryRun=%v allowImageUpdates=%v imageUpdateThreshold=%.2f podLogTailLines=%d",
-		model, baseURL, dryRun, allowImageUpdates, imageUpdateThreshold, podLogTailLines,
+		cfg.Model, cfg.BaseURL, cfg.DryRun, cfg.AllowImageUpdates, cfg.ImageUpdateThreshold, cfg.PodLogTailLines,
 	)
 
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ticker := time.NewTicker(time.Duration(cfg.PollSec) * time.Second)
+	defer ticker.Stop()
 
-		list, err := cs.CoreV1().Events("").List(ctx, metav1.ListOptions{})
+	// Run immediately on start, then on ticker
+	poll := func() {
+		pollCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
+
+		list, err := cs.CoreV1().Events("").List(pollCtx, metav1.ListOptions{})
 		if err != nil {
 			log.Printf("list events error: %v", err)
-			cancel()
-			time.Sleep(time.Duration(pollSec) * time.Second)
-			continue
+			return
 		}
 
 		for _, e := range list.Items {
@@ -662,11 +705,11 @@ func main() {
 
 			extra := ""
 			if strings.EqualFold(e.InvolvedObject.Kind, "Deployment") {
-				extra = deploymentSnapshot(ctx, cs, e.Namespace, e.InvolvedObject.Name)
+				extra = deploymentSnapshot(pollCtx, cs, e.Namespace, e.InvolvedObject.Name)
 			}
 			if strings.EqualFold(e.InvolvedObject.Kind, "Pod") {
-				if depName, err := resolveDeploymentFromPod(ctx, cs, e.Namespace, e.InvolvedObject.Name); err == nil {
-					extra = "Resolved owner deployment: " + depName + "\n" + deploymentSnapshot(ctx, cs, e.Namespace, depName)
+				if depName, err := resolveDeploymentFromPod(pollCtx, cs, e.Namespace, e.InvolvedObject.Name); err == nil {
+					extra = "Resolved owner deployment: " + depName + "\n" + deploymentSnapshot(pollCtx, cs, e.Namespace, depName)
 				}
 			}
 
@@ -680,7 +723,7 @@ func main() {
 				extra,
 			)
 
-			d, err := ollamaDecision(ctx, baseURL, model, prompt)
+			d, err := ollamaDecision(pollCtx, cfg.BaseURL, cfg.Model, prompt)
 			if err != nil {
 				log.Printf("ollama decision error for %s/%s: %v", e.Namespace, e.Name, err)
 				continue
@@ -705,21 +748,52 @@ func main() {
 			)
 
 			if err := executeDecision(
-				ctx,
+				pollCtx,
 				cs,
 				d,
-				dryRun,
-				minScale,
-				maxScale,
-				allowImageUpdates,
-				imageUpdateThreshold,
-				podLogTailLines,
+				cfg.DryRun,
+				cfg.MinScale,
+				cfg.MaxScale,
+				cfg.AllowImageUpdates,
+				cfg.ImageUpdateThreshold,
+				cfg.PodLogTailLines,
 			); err != nil {
 				log.Printf("execute decision error: %v", err)
 			}
 		}
-
-		cancel()
-		time.Sleep(time.Duration(pollSec) * time.Second)
 	}
+
+	// First poll immediately
+	poll()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("shutting down gracefully: %v", ctx.Err())
+			return
+		case <-ticker.C:
+			poll()
+		}
+	}
+}
+
+func main() {
+	cfg := LoadConfigFromEnv()
+
+	restCfg, err := rest.InClusterConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	cs, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Graceful shutdown: cancel context on SIGTERM/SIGINT
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	runLoop(ctx, cs, cfg)
+	log.Println("agent stopped")
 }
