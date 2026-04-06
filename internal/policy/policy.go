@@ -89,8 +89,9 @@ Rules:
 - For medium severity incidents, attempt remediation if a safe action is available (e.g. restart, delete_and_recreate_pod, inspect_pod_logs)
 - Use noop or ask_human only for low/info severity or when confidence is very low
 - Never propose shell commands
-- If the incident mentions CrashLoopBackOff, you may use inspect_pod_logs first, but if the pod is managed by a Deployment and the issue looks recoverable, prefer delete_and_recreate_pod or restart_deployment
-- If a pod is failed or stuck and deleting it is safe, consider delete_and_recreate_pod
+- If the incident mentions CrashLoopBackOff, you may use inspect_pod_logs first, but if the pod is managed by a Deployment and the issue looks recoverable, prefer restart_deployment over delete_and_recreate_pod (the specific pod name from the event may no longer exist)
+- Use delete_and_recreate_pod only for standalone pods not managed by a Deployment
+- If a pod is failed or stuck and managed by a Deployment, use restart_deployment
 - If the issue mentions ImagePullBackOff or ErrImagePull, do not invent an image name
 - Use set_deployment_image only if parameters.image contains a concrete image string
 - Use mark_for_manual_fix when the image problem cannot be resolved safely from the event alone
