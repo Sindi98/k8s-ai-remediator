@@ -173,8 +173,8 @@ kubectl -n ollama patch deployment ollama --type='json' -p='[
     {"name":"OLLAMA_HOST","value":"0.0.0.0:11434"}
   ]},
   {"op":"add","path":"/spec/template/spec/containers/0/resources","value":{
-    "requests":{"cpu":"2","memory":"4Gi"},
-    "limits":{"cpu":"4","memory":"8Gi"}
+    "requests":{"cpu":"4","memory":"12Gi"},
+    "limits":{"cpu":"8","memory":"16Gi"}
   }},
   {"op":"add","path":"/spec/template/spec/volumes","value":[
     {"name":"ollama-data","emptyDir":{}}
