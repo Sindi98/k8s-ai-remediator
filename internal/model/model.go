@@ -1,5 +1,51 @@
 package model
 
+import "strings"
+
+// Severity represents the severity level of an incident.
+type Severity string
+
+const (
+	SeverityCritical Severity = "critical"
+	SeverityHigh     Severity = "high"
+	SeverityMedium   Severity = "medium"
+	SeverityLow      Severity = "low"
+	SeverityInfo     Severity = "info"
+)
+
+// severityRank maps severity levels to numeric ranks for comparison.
+var severityRank = map[Severity]int{
+	SeverityCritical: 4,
+	SeverityHigh:     3,
+	SeverityMedium:   2,
+	SeverityLow:      1,
+	SeverityInfo:     0,
+}
+
+// ParseSeverity normalises a severity string to a known Severity value.
+// Unknown values default to SeverityLow.
+func ParseSeverity(s string) Severity {
+	switch Severity(strings.ToLower(strings.TrimSpace(s))) {
+	case SeverityCritical:
+		return SeverityCritical
+	case SeverityHigh:
+		return SeverityHigh
+	case SeverityMedium:
+		return SeverityMedium
+	case SeverityLow:
+		return SeverityLow
+	case SeverityInfo:
+		return SeverityInfo
+	default:
+		return SeverityLow
+	}
+}
+
+// MeetsMinimum returns true if s is at or above the given minimum severity.
+func (s Severity) MeetsMinimum(min Severity) bool {
+	return severityRank[s] >= severityRank[min]
+}
+
 // Action represents a remediation action the agent can take.
 type Action string
 

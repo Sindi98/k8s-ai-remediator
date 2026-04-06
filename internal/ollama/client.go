@@ -64,6 +64,8 @@ func (c *Client) Decide(ctx context.Context, prompt string) (model.Decision, err
 				Role: "system",
 				Content: "Return only valid JSON matching the schema. " +
 					"Allowed actions: noop,restart_deployment,delete_failed_pod,delete_and_recreate_pod,scale_deployment,inspect_pod_logs,set_deployment_image,mark_for_manual_fix,ask_human. " +
+					"Severity must be one of: critical, high, medium, low, info. " +
+					"For critical, high, and medium severity incidents, attempt remediation when a safe action is available. " +
 					"Never suggest shell commands. " +
 					"If the issue contains CrashLoopBackOff, you may use inspect_pod_logs first, but if the pod is managed by a Deployment and the issue looks recoverable, prefer delete_and_recreate_pod or restart_deployment. " +
 					"If the issue contains ImagePullBackOff or ErrImagePull, prefer mark_for_manual_fix unless a concrete safe replacement image is explicit. " +
@@ -205,7 +207,7 @@ func buildSchema() map[string]any {
 		"type": "object",
 		"properties": map[string]any{
 			"summary":        map[string]any{"type": "string"},
-			"severity":       map[string]any{"type": "string"},
+			"severity":       map[string]any{"type": "string", "enum": []string{"critical", "high", "medium", "low", "info"}},
 			"probable_cause": map[string]any{"type": "string"},
 			"confidence":     map[string]any{"type": "number"},
 			"action":         map[string]any{"type": "string", "enum": actions},

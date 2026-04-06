@@ -84,7 +84,10 @@ Object name: %s
 
 Rules:
 - Allowed actions: noop,restart_deployment,delete_failed_pod,delete_and_recreate_pod,scale_deployment,inspect_pod_logs,set_deployment_image,mark_for_manual_fix,ask_human
-- Prefer noop or ask_human if confidence is low
+- Severity must be one of: critical, high, medium, low, info
+- For critical and high severity incidents, take immediate remediation action when confident
+- For medium severity incidents, attempt remediation if a safe action is available (e.g. restart, delete_and_recreate_pod, inspect_pod_logs)
+- Use noop or ask_human only for low/info severity or when confidence is very low
 - Never propose shell commands
 - If the incident mentions CrashLoopBackOff, you may use inspect_pod_logs first, but if the pod is managed by a Deployment and the issue looks recoverable, prefer delete_and_recreate_pod or restart_deployment
 - If a pod is failed or stuck and deleting it is safe, consider delete_and_recreate_pod
