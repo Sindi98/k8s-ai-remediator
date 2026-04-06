@@ -24,6 +24,7 @@ type AgentConfig struct {
 	LeaderElection       bool
 	LeaseName            string
 	LeaseNamespace       string
+	MinSeverity          string
 }
 
 // LoadFromEnv reads agent configuration from environment variables.
@@ -45,6 +46,7 @@ func LoadFromEnv() AgentConfig {
 		LeaderElection:       Getbool("LEADER_ELECTION", false),
 		LeaseName:            Getenv("LEASE_NAME", "ai-remediator-leader"),
 		LeaseNamespace:       Getenv("LEASE_NAMESPACE", "ai-remediator"),
+		MinSeverity:          Getenv("MIN_SEVERITY", "medium"),
 	}
 }
 

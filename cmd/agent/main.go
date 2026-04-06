@@ -84,10 +84,13 @@ func executeDecision(
 func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder) {
 	seen := map[string]bool{}
 
+	minSev := model.ParseSeverity(cfg.MinSeverity)
+
 	slog.Info("agent started",
 		"model", cfg.Model,
 		"baseURL", cfg.BaseURL,
 		"dryRun", cfg.DryRun,
+		"minSeverity", string(minSev),
 		"allowImageUpdates", cfg.AllowImageUpdates,
 		"imageUpdateThreshold", cfg.ImageUpdateThreshold,
 		"podLogTailLines", cfg.PodLogTailLines,
@@ -170,8 +173,11 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 				d.Parameters = map[string]string{}
 			}
 
+			severity := model.ParseSeverity(d.Severity)
+
 			slog.Info("decision",
 				"summary", d.Summary,
+				"severity", string(severity),
 				"action", d.Action,
 				"ns", d.Namespace,
 				"kind", d.ResourceKind,
@@ -181,6 +187,16 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 				"reason", d.Reason,
 				"params", d.Parameters,
 			)
+
+			if !severity.MeetsMinimum(minSev) {
+				slog.Info("skipping decision below minimum severity",
+					"severity", string(severity),
+					"minSeverity", string(minSev),
+					"action", d.Action,
+				)
+				m.EventsSkipped.Add(1)
+				continue
+			}
 
 			if err := executeDecision(pollCtx, cs, d, cfg); err != nil {
 				m.ExecutionErrors.Add(1)
