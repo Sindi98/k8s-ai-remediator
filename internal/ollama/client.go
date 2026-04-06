@@ -67,7 +67,7 @@ func (c *Client) Decide(ctx context.Context, prompt string) (model.Decision, err
 					"Severity must be one of: critical, high, medium, low, info. " +
 					"For critical, high, and medium severity incidents, attempt remediation when a safe action is available. " +
 					"Never suggest shell commands. " +
-					"If the issue contains CrashLoopBackOff, you may use inspect_pod_logs first, but if the pod is managed by a Deployment and the issue looks recoverable, prefer delete_and_recreate_pod or restart_deployment. " +
+					"If the issue contains CrashLoopBackOff, you may use inspect_pod_logs first, but if the pod is managed by a Deployment and the issue looks recoverable, prefer restart_deployment (the pod name from the event may be stale). " +
 					"If the issue contains ImagePullBackOff or ErrImagePull, prefer mark_for_manual_fix unless a concrete safe replacement image is explicit. " +
 					"Use set_deployment_image only when parameters.image contains a concrete replacement image string.",
 			},
