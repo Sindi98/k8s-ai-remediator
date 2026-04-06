@@ -193,7 +193,7 @@ kubectl -n ollama expose deployment ollama \
 
 # Wait for rollout and install the model
 kubectl -n ollama rollout status deployment/ollama --timeout=180s
-kubectl -n ollama exec -it deploy/ollama -- ollama pull gemma3
+kubectl -n ollama exec -it deploy/ollama -- ollama pull qwen2.5:14b
 kubectl -n ollama exec -it deploy/ollama -- ollama list
 ```
 
@@ -231,7 +231,7 @@ kubectl create clusterrolebinding ai-remediator \
 kubectl create configmap ai-remediator-config \
   -n ai-remediator \
   --from-literal=OLLAMA_BASE_URL=http://ollama.ollama.svc.cluster.local:11434/api \
-  --from-literal=OLLAMA_MODEL=gemma3 \
+  --from-literal=OLLAMA_MODEL=qwen2.5:14b \
   --from-literal=DRY_RUN=false \
   --from-literal=SCALE_MIN=1 \
   --from-literal=SCALE_MAX=5 \
@@ -277,7 +277,7 @@ All variables are read from environment variables (typically via ConfigMap).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OLLAMA_BASE_URL` | `http://ollama.ollama.svc.cluster.local:11434/api` | Ollama API base URL |
-| `OLLAMA_MODEL` | `gemma3` | LLM model name (must match `ollama list`) |
+| `OLLAMA_MODEL` | `qwen2.5:14b` | LLM model name (must match `ollama list`) |
 | `DRY_RUN` | `false` | If `true`, logs decisions without applying remediation |
 | `POLL_INTERVAL_SECONDS` | `30` | Event polling interval (seconds) |
 
@@ -619,7 +619,7 @@ kubectl auth can-i update deployments \
 ```bash
 kubectl -n ai-remediator create configmap ai-remediator-config \
   --from-literal=OLLAMA_BASE_URL=http://ollama.ollama.svc.cluster.local:11434/api \
-  --from-literal=OLLAMA_MODEL=gemma3 \
+  --from-literal=OLLAMA_MODEL=qwen2.5:14b \
   --from-literal=DRY_RUN=false \
   --from-literal=SCALE_MIN=1 \
   --from-literal=SCALE_MAX=5 \
