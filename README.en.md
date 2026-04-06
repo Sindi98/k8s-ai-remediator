@@ -125,7 +125,7 @@ k8s-ai-remediator/
 
 ## Prerequisites
 
-- A running Kubernetes cluster (minikube, kind, k3s, EKS, GKE, AKS, ...)
+- A running Kubernetes cluster (Docker Desktop, minikube, kind, k3s, EKS, GKE, AKS, ...)
 - `kubectl` configured for the correct cluster
 - Docker for building the image
 - Go 1.21+ for local development (optional, the build happens in Docker)
@@ -199,7 +199,10 @@ kubectl -n ollama exec -it deploy/ollama -- ollama list
 
 > **Note**: The `OLLAMA_MODEL` value in the ConfigMap must exactly match the name shown by `ollama list`.
 >
-> **Ollama node requirements**: `qwen2.5:14b` requires at least **8GB of free RAM** for inference. If the pod stays in `Pending`, verify the node has enough resources with `kubectl describe node`. For local clusters (minikube/kind), start with at least 10GB of RAM (e.g. `minikube start --memory=10240 --cpus=4`).
+> **Ollama node requirements**: `qwen2.5:14b` requires at least **8GB of free RAM** for inference. If the pod stays in `Pending`, verify the node has enough resources with `kubectl describe node`. For local clusters:
+> - **Docker Desktop**: Settings → Resources → allocate at least **10GB of RAM** and **4 CPUs**, then Apply & Restart
+> - **minikube**: `minikube start --memory=10240 --cpus=4`
+> - **kind**: configure the resources of the underlying Docker container
 
 ### 2. Installing the Agent
 
