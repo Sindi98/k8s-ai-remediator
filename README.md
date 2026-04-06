@@ -173,8 +173,8 @@ kubectl -n ollama patch deployment ollama --type='json' -p='[
     {"name":"OLLAMA_HOST","value":"0.0.0.0:11434"}
   ]},
   {"op":"add","path":"/spec/template/spec/containers/0/resources","value":{
-    "requests":{"cpu":"2","memory":"4Gi"},
-    "limits":{"cpu":"4","memory":"8Gi"}
+    "requests":{"cpu":"4","memory":"12Gi"},
+    "limits":{"cpu":"8","memory":"16Gi"}
   }},
   {"op":"add","path":"/spec/template/spec/volumes","value":[
     {"name":"ollama-data","emptyDir":{}}
@@ -193,7 +193,7 @@ kubectl -n ollama expose deployment ollama \
 
 # Attendi il rollout e installa il modello
 kubectl -n ollama rollout status deployment/ollama --timeout=180s
-kubectl -n ollama exec -it deploy/ollama -- ollama pull gemma3
+kubectl -n ollama exec -it deploy/ollama -- ollama pull qwen2.5:14b
 kubectl -n ollama exec -it deploy/ollama -- ollama list
 ```
 
@@ -231,7 +231,7 @@ kubectl create clusterrolebinding ai-remediator \
 kubectl create configmap ai-remediator-config \
   -n ai-remediator \
   --from-literal=OLLAMA_BASE_URL=http://ollama.ollama.svc.cluster.local:11434/api \
-  --from-literal=OLLAMA_MODEL=gemma3 \
+  --from-literal=OLLAMA_MODEL=qwen2.5:14b \
   --from-literal=DRY_RUN=false \
   --from-literal=SCALE_MIN=1 \
   --from-literal=SCALE_MAX=5 \
@@ -277,7 +277,7 @@ Tutte le variabili sono lette da environment (tipicamente via ConfigMap).
 | Variabile | Default | Descrizione |
 |-----------|---------|-------------|
 | `OLLAMA_BASE_URL` | `http://ollama.ollama.svc.cluster.local:11434/api` | URL base dell'API Ollama |
-| `OLLAMA_MODEL` | `gemma3` | Nome del modello LLM (deve corrispondere a `ollama list`) |
+| `OLLAMA_MODEL` | `qwen2.5:14b` | Nome del modello LLM (deve corrispondere a `ollama list`) |
 | `DRY_RUN` | `false` | Se `true`, logga le decisioni senza applicare remediation |
 | `POLL_INTERVAL_SECONDS` | `30` | Intervallo di polling degli eventi (secondi) |
 
@@ -619,7 +619,7 @@ kubectl auth can-i update deployments \
 ```bash
 kubectl -n ai-remediator create configmap ai-remediator-config \
   --from-literal=OLLAMA_BASE_URL=http://ollama.ollama.svc.cluster.local:11434/api \
-  --from-literal=OLLAMA_MODEL=gemma3 \
+  --from-literal=OLLAMA_MODEL=qwen2.5:14b \
   --from-literal=DRY_RUN=false \
   --from-literal=SCALE_MIN=1 \
   --from-literal=SCALE_MAX=5 \
