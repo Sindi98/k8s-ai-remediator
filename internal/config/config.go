@@ -23,6 +23,12 @@ type AgentConfig struct {
 	// OllamaHTTPTimeoutSec caps the per-request HTTP timeout toward Ollama.
 	// Local LLMs can take > 90s on the first call, so the default is 180s.
 	OllamaHTTPTimeoutSec int
+	// PollContextTimeoutSec bounds the entire poll cycle (listing events
+	// plus all downstream Ollama calls for that iteration). Must be larger
+	// than OllamaHTTPTimeoutSec, otherwise the context expires mid-request
+	// and produces "context deadline exceeded" before the HTTP client can
+	// fail with its own timeout. Defaults to 300s.
+	PollContextTimeoutSec int
 	MetricsAddr          string
 	LeaderElection       bool
 	LeaseName            string
@@ -67,7 +73,8 @@ func LoadFromEnv() AgentConfig {
 		OllamaRPS:            Getfloat("OLLAMA_RPS", 2.0),
 		OllamaMaxRetries:     Getint("OLLAMA_MAX_RETRIES", 3),
 		OllamaTLSSkipVerify:  Getbool("OLLAMA_TLS_SKIP_VERIFY", false),
-		OllamaHTTPTimeoutSec: Getint("OLLAMA_HTTP_TIMEOUT_SECONDS", 180),
+		OllamaHTTPTimeoutSec:  Getint("OLLAMA_HTTP_TIMEOUT_SECONDS", 180),
+		PollContextTimeoutSec: Getint("POLL_CONTEXT_TIMEOUT_SECONDS", 300),
 		MetricsAddr:          Getenv("METRICS_ADDR", ":9090"),
 		LeaderElection:       Getbool("LEADER_ELECTION", false),
 		LeaseName:            Getenv("LEASE_NAME", "ai-remediator-leader"),

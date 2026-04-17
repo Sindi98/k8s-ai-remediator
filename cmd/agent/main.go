@@ -145,6 +145,8 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 		"maxEventsPerPoll", cfg.MaxEventsPerPoll,
 		"podLogTailLines", cfg.PodLogTailLines,
 		"ollamaRPS", cfg.OllamaRPS,
+		"ollamaHTTPTimeoutSec", cfg.OllamaHTTPTimeoutSec,
+		"pollContextTimeoutSec", cfg.PollContextTimeoutSec,
 		"metricsAddr", cfg.MetricsAddr,
 		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry",
 	)
@@ -153,7 +155,11 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 	defer ticker.Stop()
 
 	poll := func() {
-		pollCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		pollTimeout := time.Duration(cfg.PollContextTimeoutSec) * time.Second
+		if pollTimeout <= 0 {
+			pollTimeout = 5 * time.Minute
+		}
+		pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
 		defer cancel()
 
 		list, err := cs.CoreV1().Events("").List(pollCtx, metav1.ListOptions{})

@@ -335,6 +335,7 @@ All variables are read from environment variables (typically via ConfigMap).
 | `OLLAMA_MAX_RETRIES` | `3` | Retry attempts for transient errors (5xx, network) with exponential backoff |
 | `OLLAMA_TLS_SKIP_VERIFY` | `false` | Skip TLS verification (for self-signed certificates) |
 | `OLLAMA_HTTP_TIMEOUT_SECONDS` | `180` | HTTP timeout per request to Ollama (awaiting headers + body). Increase if you see `Client.Timeout exceeded while awaiting headers` with slow models (CPU, unloaded GPU, cold start) |
+| `POLL_CONTEXT_TIMEOUT_SECONDS` | `300` | Context timeout wrapping the entire poll cycle (event list + Ollama calls). Must stay larger than `OLLAMA_HTTP_TIMEOUT_SECONDS`, otherwise the context expires before the HTTP client and produces `context deadline exceeded` |
 | `POD_LOG_TAIL_LINES` | `200` | Number of log lines read per container |
 
 ### Observability Variables
