@@ -1,0 +1,51 @@
+# Scenario: OOMKilled CrashLoopBackOff (severita CRITICA)
+#
+# Il container tenta di allocare piu memoria del limite impostato. Il kernel
+# lo uccide con OOMKilled, kubelet lo riavvia, si ripete ciclicamente fino
+# al CrashLoopBackOff. Gli eventi Warning includono BackOff e OOMKilling.
+#
+# Impatto: il servizio e continuamente down (rolling crash). CRITICO perche
+# ogni restart fallisce immediatamente e non esiste self-recovery.
+# Remediation tipica dell'agente: inspect_pod_logs o ask_human (i limiti
+# di risorse non possono essere modificati in autonomia dall'agente).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memory-hog
+  namespace: incident-lab
+  labels:
+    app: memory-hog
+    scenario: critical
+    error-type: oom-killed
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: memory-hog
+  template:
+    metadata:
+      labels:
+        app: memory-hog
+        scenario: critical
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "allocating memory beyond limit";
+              # Legge 256MB da /dev/zero in memoria: eccede il limite di 32Mi
+              # e attiva l'OOMKiller del kernel.
+              head -c 268435456 /dev/zero | tr '\0' 'a' > /dev/null;
+              echo "should never reach here";
+              sleep 60
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "32Mi"

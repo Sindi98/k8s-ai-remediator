@@ -22,6 +22,7 @@ Agente AI in Go che osserva eventi Kubernetes di tipo `Warning` e applica remedi
 - [Alta disponibilita (Leader Election)](#alta-disponibilita-leader-election)
 - [RBAC namespace-scoped](#rbac-namespace-scoped)
 - [Laboratorio di test](#laboratorio-di-test)
+- [Scenari di errore](#scenari-di-errore)
 - [Sviluppo](#sviluppo)
 - [Comandi di verifica](#comandi-di-verifica)
 - [Reset ambiente](#reset-ambiente)
@@ -550,6 +551,93 @@ kubectl -n incident-lab get events --sort-by=.metadata.creationTimestamp | tail 
 ```
 
 L'agente dovrebbe rilevare l'evento Warning, analizzarlo, e decidere una remediation (tipicamente `delete_and_recreate_pod` o `restart_deployment`). Il nuovo pod nasce con un `emptyDir` vuoto e torna sano.
+
+---
+
+## Scenari di errore
+
+La directory `scenarios/` contiene manifest pronti per riprodurre guasti tipici
+a tre livelli di severita. Sono utili per validare il comportamento dell'agente
+in condizioni diverse e per stimolare decisioni dell'LLM coerenti con la policy.
+
+| Severita | Manifest | Reason evento | Comportamento atteso |
+|----------|----------|---------------|----------------------|
+| **Medio** | `scenarios/medium-imagepullbackoff.yaml` | `Failed`, `ErrImagePull`, `ImagePullBackOff` | `mark_for_manual_fix` / `ask_human` (o `set_deployment_image` se `ALLOW_IMAGE_UPDATES=true` e confidenza sopra soglia) |
+| **Critico** | `scenarios/critical-oomkilled.yaml` | `BackOff`, `OOMKilling` | `inspect_pod_logs` / `ask_human` |
+| **Grave** | `scenarios/severe-failedscheduling.yaml` | `FailedScheduling` | `mark_for_manual_fix` / `ask_human` |
+
+Tutti gli scenari presuppongono il namespace `incident-lab` gia creato (vedi
+[Laboratorio di test](#laboratorio-di-test)).
+
+### Scenario medio — ImagePullBackOff
+
+Un Deployment referenzia un tag immagine inesistente. Il kubelet non riesce a
+scaricare l'immagine e genera eventi Warning `Failed` / `ErrImagePull`.
+
+```bash
+kubectl apply -f scenarios/medium-imagepullbackoff.yaml
+kubectl -n incident-lab get pods -l scenario=medium -w
+```
+
+**Impatto**: il workload non parte ma i servizi gia attivi non sono coinvolti.
+**Perche medio**: errore localizzato, non degrada il cluster, tipicamente serve
+una correzione di configurazione (tag corretto) da parte di un umano.
+
+### Scenario critico — OOMKilled in CrashLoopBackOff
+
+Il container tenta di allocare piu memoria del `limits.memory`. Il kernel lo
+uccide con OOMKilled, kubelet lo riavvia, il ciclo si ripete generando eventi
+`BackOff` e `OOMKilling`.
+
+```bash
+kubectl apply -f scenarios/critical-oomkilled.yaml
+kubectl -n incident-lab get pods -l scenario=critical -w
+kubectl -n incident-lab describe pod -l scenario=critical | grep -E 'OOMKilled|Reason|Exit'
+```
+
+**Impatto**: il servizio e continuamente down, non esiste self-recovery perche
+il restart fallisce con lo stesso errore.
+**Perche critico**: crash loop permanente, ogni remediation "standard"
+(restart, delete) non risolve il problema; l'agente deve riconoscere che serve
+un intervento umano sui limiti di risorse.
+
+### Scenario grave — FailedScheduling
+
+Il pod richiede risorse che nessun nodo puo soddisfare (500 CPU, 500 Gi RAM).
+Lo scheduler emette ripetutamente `FailedScheduling` e il pod resta in
+`Pending` a tempo indeterminato.
+
+```bash
+kubectl apply -f scenarios/severe-failedscheduling.yaml
+kubectl -n incident-lab get pods -l scenario=severe
+kubectl -n incident-lab describe pod -l scenario=severe | grep -A3 Events
+```
+
+**Impatto**: blocco permanente del workload, il pod non partira MAI.
+**Perche grave**: nessuna azione dell'agente puo risolverlo (ne restart, ne
+delete, ne scale, ne set image). Richiede modifica del manifest, scale del
+cluster o cambio di profilo hardware.
+
+### Pulizia
+
+```bash
+kubectl delete -f scenarios/medium-imagepullbackoff.yaml --ignore-not-found
+kubectl delete -f scenarios/critical-oomkilled.yaml --ignore-not-found
+kubectl delete -f scenarios/severe-failedscheduling.yaml --ignore-not-found
+# oppure in blocco
+kubectl delete -f scenarios/ --ignore-not-found
+```
+
+### Cosa osservare nei log dell'agente
+
+Per ogni scenario puoi correlare severita percepita dall'LLM e azione scelta:
+
+```bash
+kubectl -n ai-remediator logs deploy/ai-remediator -f | grep -E 'decision|severity|action'
+```
+
+Le metriche Prometheus `remediator_decisions_total{action=...}` mostrano la
+distribuzione delle azioni selezionate sui tre scenari.
 
 ---
 

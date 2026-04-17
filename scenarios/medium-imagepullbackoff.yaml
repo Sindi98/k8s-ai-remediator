@@ -1,0 +1,42 @@
+# Scenario: ImagePullBackOff (severita MEDIA)
+#
+# Il Deployment referenzia un tag immagine inesistente. Il kubelet non riesce
+# a scaricare l'immagine e il pod resta in ImagePullBackOff generando eventi
+# Warning di reason Failed / ErrImagePull.
+#
+# Impatto: il workload non parte ma non impatta servizi gia in esecuzione.
+# Remediation tipica dell'agente: mark_for_manual_fix o ask_human (il tag
+# corretto non e inferibile). Con ALLOW_IMAGE_UPDATES=true e confidence
+# sopra soglia l'LLM puo proporre set_deployment_image.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broken-image
+  namespace: incident-lab
+  labels:
+    app: broken-image
+    scenario: medium
+    error-type: image-pull-backoff
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: broken-image
+  template:
+    metadata:
+      labels:
+        app: broken-image
+        scenario: medium
+    spec:
+      containers:
+        - name: app
+          image: busybox:this-tag-does-not-exist-abcd1234
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "sleep 3600"]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
