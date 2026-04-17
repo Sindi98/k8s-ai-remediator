@@ -135,15 +135,37 @@ k8s-ai-remediator/
 
 ## Build
 
-### Build dell'immagine Docker
+### Build e push sul registry locale
+
+L'immagine viene sempre pubblicata su un registry locale raggiungibile
+tramite `host.docker.internal:5050` (il container `registry` mappa la porta
+host 5050 sulla 5000 interna). Usare `host.docker.internal` al posto di
+`localhost` fa si che lo stesso tag funzioni sia per il `docker push` dall'host
+sia per il pull del kubelet dentro al cluster, evitando `ErrImageNeverPull`
+su runtime diversi da Docker (containerd, CRI-O) o su cluster multi-node.
 
 ```bash
-docker build -t ai-remediator:0.2.0 .
+# Avvia il registry locale (una volta sola)
+docker run -d --restart=always -p 5050:5000 --name registry registry:2
+
+# Build e push
+REGISTRY=host.docker.internal:5050
+IMAGE=$REGISTRY/ai-remediator:0.2.0
+docker build -t "$IMAGE" .
+docker push "$IMAGE"
 ```
 
 Il Dockerfile usa un multi-stage build:
 - **Stage 1**: Go 1.26.1 compila un binary statico (`CGO_ENABLED=0`)
 - **Stage 2**: `gcr.io/distroless/static:nonroot` come base (nessuna shell, utente non-root)
+
+> **Nota su Linux**: `host.docker.internal` e disponibile di default con
+> Docker Desktop su macOS/Windows e nelle versioni recenti su Linux. Se non
+> risolve, aggiungi `--add-host=host.docker.internal:host-gateway` al
+> comando docker oppure usa l'IP del gateway del bridge Docker.
+> Su kind puoi in alternativa connettere il registry alla network kind
+> (`docker network connect kind registry`) e usare `kind-registry:5000`.
+> Su minikube: `minikube addons enable registry` o `host.minikube.internal:5050`.
 
 ### Build locale (opzionale)
 
@@ -249,14 +271,14 @@ kubectl create configmap ai-remediator-config \
   --from-literal=OLLAMA_MAX_RETRIES=3 \
   --from-literal=METRICS_ADDR=:9090
 
-# Crea il deployment
+# Crea il deployment usando l'immagine del registry locale
 kubectl -n ai-remediator create deployment ai-remediator \
-  --image=ai-remediator:0.2.0
+  --image=host.docker.internal:5050/ai-remediator:0.2.0
 
-# Collega service account, ConfigMap e immagine locale
+# Collega service account, ConfigMap e porta metrics
 kubectl -n ai-remediator patch deployment ai-remediator --type='json' -p='[
   {"op":"add","path":"/spec/template/spec/serviceAccountName","value":"ai-remediator"},
-  {"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Never"},
+  {"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"},
   {"op":"add","path":"/spec/template/spec/containers/0/envFrom","value":[
     {"configMapRef":{"name":"ai-remediator-config"}}
   ]},
@@ -270,7 +292,10 @@ kubectl -n ai-remediator rollout status deployment/ai-remediator --timeout=180s
 kubectl -n ai-remediator logs deploy/ai-remediator --tail=20
 ```
 
-> **Nota**: usa `imagePullPolicy: Never` solo con immagini buildate localmente (minikube, kind). Per un registry remoto, rimuovi questa impostazione.
+> **Nota**: `host.docker.internal:5050` presuppone che il kubelet possa
+> risolvere `host.docker.internal` verso il gateway dell'host (default su
+> Docker Desktop). Su kind/minikube adatta l'hostname come descritto nella
+> sezione [Build](#build).
 
 ---
 
