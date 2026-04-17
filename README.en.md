@@ -137,17 +137,19 @@ k8s-ai-remediator/
 
 ### Build and push to the local registry
 
-The image is always published to a local registry listening on
-`localhost:5050` (the `registry` container maps host port 5050 to the
-internal port 5000). This avoids `ErrImageNeverPull` issues on clusters
-with a non-Docker runtime (containerd, CRI-O) or multi-node setups.
+The image is always published to a local registry reachable via
+`host.docker.internal:5050` (the `registry` container maps host port 5050
+to the internal port 5000). Using `host.docker.internal` instead of
+`localhost` lets the same tag work both for `docker push` from the host and
+for kubelet pulls from inside the cluster, avoiding `ErrImageNeverPull`
+on non-Docker runtimes (containerd, CRI-O) or multi-node setups.
 
 ```bash
 # Start the local registry (once)
 docker run -d --restart=always -p 5050:5000 --name registry registry:2
 
 # Build and push
-REGISTRY=localhost:5050
+REGISTRY=host.docker.internal:5050
 IMAGE=$REGISTRY/ai-remediator:0.2.0
 docker build -t "$IMAGE" .
 docker push "$IMAGE"
@@ -157,11 +159,13 @@ The Dockerfile uses a multi-stage build:
 - **Stage 1**: Go 1.26.1 compiles a static binary (`CGO_ENABLED=0`)
 - **Stage 2**: `gcr.io/distroless/static:nonroot` as the base image (no shell, non-root user)
 
-> **Non-Docker-Desktop clusters**: on kind, connect the `registry` container
-> to the kind network (`docker network connect kind registry`) and use
-> `localhost:5050` or `kind-registry:5000` in manifests. On minikube enable
-> the addon: `minikube addons enable registry` or use
-> `host.minikube.internal:5050`.
+> **Linux note**: `host.docker.internal` is available by default with
+> Docker Desktop on macOS/Windows and recent Linux versions. If it does not
+> resolve, add `--add-host=host.docker.internal:host-gateway` to the docker
+> command, or use the Docker bridge gateway IP.
+> On kind you can alternatively connect the registry to the kind network
+> (`docker network connect kind registry`) and use `kind-registry:5000`.
+> On minikube: `minikube addons enable registry` or `host.minikube.internal:5050`.
 
 ### Local Build (optional)
 
@@ -269,7 +273,7 @@ kubectl create configmap ai-remediator-config \
 
 # Create the deployment using the image from the local registry
 kubectl -n ai-remediator create deployment ai-remediator \
-  --image=localhost:5050/ai-remediator:0.2.0
+  --image=host.docker.internal:5050/ai-remediator:0.2.0
 
 # Attach service account, ConfigMap, and metrics port
 kubectl -n ai-remediator patch deployment ai-remediator --type='json' -p='[
@@ -288,9 +292,10 @@ kubectl -n ai-remediator rollout status deployment/ai-remediator --timeout=180s
 kubectl -n ai-remediator logs deploy/ai-remediator --tail=20
 ```
 
-> **Note**: `localhost:5050` assumes the kubelet can reach the registry via
-> the host network (typical with Docker Desktop). On kind/minikube adapt
-> the hostname as described in the [Build](#build) section.
+> **Note**: `host.docker.internal:5050` assumes the kubelet can resolve
+> `host.docker.internal` to the host gateway (default on Docker Desktop).
+> On kind/minikube adapt the hostname as described in the [Build](#build)
+> section.
 
 ---
 
