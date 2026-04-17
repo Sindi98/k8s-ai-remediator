@@ -140,6 +140,28 @@ func TestExecuteDecision_ScaleDeployment(t *testing.T) {
 	}
 }
 
+func TestExecuteDecision_RestartDeployment_PodGoneUsesParamName(t *testing.T) {
+	// Regression: the LLM often reports kind=Pod with a pod name that no
+	// longer exists (stale event or rolled-over ReplicaSet). When params
+	// carry deployment_name we must use it instead of failing the pod lookup.
+	cs := newFakeCluster(t)
+	ctx := context.Background()
+
+	d := model.Decision{
+		Action: model.ActionRestartDeployment, Namespace: "default",
+		ResourceKind: "Pod", ResourceName: "web-gone-5c8d8c8ffc-28wp6",
+		Parameters: map[string]string{"deployment_name": "web"},
+	}
+	if err := executeDecision(ctx, cs, d, defaultCfg()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "web", metav1.GetOptions{})
+	if _, ok := dep.Spec.Template.Annotations["ai-remediator/restarted-at"]; !ok {
+		t.Error("expected restart annotation on deployment resolved via params")
+	}
+}
+
 func TestExecuteDecision_UnsupportedAction(t *testing.T) {
 	cs := newFakeCluster(t)
 	d := model.Decision{Action: model.Action("unknown_action"), Namespace: "default"}

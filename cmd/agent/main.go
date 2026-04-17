@@ -41,7 +41,7 @@ func executeDecision(
 		return nil
 
 	case model.ActionRestartDeployment:
-		depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName)
+		depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName, d.Parameters)
 		if err != nil {
 			return err
 		}
@@ -54,7 +54,7 @@ func executeDecision(
 		return fmt.Errorf("%s requires resource_kind=Pod", d.Action)
 
 	case model.ActionScaleDeployment:
-		depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName)
+		depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName, d.Parameters)
 		if err != nil {
 			return err
 		}
@@ -68,7 +68,7 @@ func executeDecision(
 		return kube.InspectPodLogs(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName, d.Parameters, cfg.PodLogTailLines)
 
 	case model.ActionSetDeploymentImage:
-		depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName)
+		depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName, d.Parameters)
 		if err != nil {
 			return err
 		}

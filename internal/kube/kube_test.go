@@ -93,19 +93,52 @@ func TestResolveDeploymentTarget(t *testing.T) {
 	cs := newFakeCluster(t)
 	ctx := context.Background()
 
-	name, err := ResolveDeploymentTarget(ctx, cs, "default", "Deployment", "web")
+	name, err := ResolveDeploymentTarget(ctx, cs, "default", "Deployment", "web", nil)
 	if err != nil || name != "web" {
 		t.Errorf("expected web, got %s, err=%v", name, err)
 	}
 
-	name, err = ResolveDeploymentTarget(ctx, cs, "default", "Pod", "web-abc-123")
+	name, err = ResolveDeploymentTarget(ctx, cs, "default", "Pod", "web-abc-123", nil)
 	if err != nil || name != "web" {
 		t.Errorf("expected web, got %s, err=%v", name, err)
 	}
 
-	_, err = ResolveDeploymentTarget(ctx, cs, "default", "Service", "svc")
+	_, err = ResolveDeploymentTarget(ctx, cs, "default", "Service", "svc", nil)
 	if err == nil {
 		t.Error("expected error for unsupported kind")
+	}
+}
+
+func TestResolveDeploymentTarget_DeploymentNameParam(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	ctx := context.Background()
+
+	// Pod does not exist, but params carry the deployment name: must succeed.
+	name, err := ResolveDeploymentTarget(ctx, cs, "default", "Pod", "stale-pod-xyz",
+		map[string]string{"deployment_name": "flaky-probe"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "flaky-probe" {
+		t.Errorf("expected flaky-probe, got %q", name)
+	}
+
+	// "deployment" alias is also accepted.
+	name, err = ResolveDeploymentTarget(ctx, cs, "default", "Pod", "stale-pod-xyz",
+		map[string]string{"deployment": "api"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "api" {
+		t.Errorf("expected api, got %q", name)
+	}
+
+	// Empty value must not short-circuit; falls back to kind/name resolution.
+	cs = newFakeCluster(t)
+	name, err = ResolveDeploymentTarget(ctx, cs, "default", "Pod", "web-abc-123",
+		map[string]string{"deployment_name": "  "})
+	if err != nil || name != "web" {
+		t.Errorf("expected web via ownerRefs, got %q err=%v", name, err)
 	}
 }
 

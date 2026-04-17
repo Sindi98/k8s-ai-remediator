@@ -67,8 +67,18 @@ func FirstPodForDeployment(ctx context.Context, cs kubernetes.Interface, ns, dep
 	return pods.Items[0].Name, nil
 }
 
-// ResolveDeploymentTarget resolves a deployment name from either a Deployment or Pod resource.
-func ResolveDeploymentTarget(ctx context.Context, cs kubernetes.Interface, ns, kind, name string) (string, error) {
+// ResolveDeploymentTarget resolves a deployment name from either a Deployment
+// or Pod resource. If params contains "deployment_name" (or "deployment") it
+// takes precedence, covering the case where the pod referenced by the event
+// no longer exists by the time the decision is executed.
+func ResolveDeploymentTarget(ctx context.Context, cs kubernetes.Interface, ns, kind, name string, params map[string]string) (string, error) {
+	if params != nil {
+		for _, key := range []string{"deployment_name", "deployment"} {
+			if v := strings.TrimSpace(params[key]); v != "" {
+				return v, nil
+			}
+		}
+	}
 	if strings.EqualFold(kind, "Deployment") {
 		return name, nil
 	}
