@@ -95,6 +95,8 @@ Rules:
 - If the issue mentions ImagePullBackOff or ErrImagePull, do not invent an image name
 - Use set_deployment_image only if parameters.image contains a concrete image string
 - Use mark_for_manual_fix when the image problem cannot be resolved safely from the event alone
-- If using inspect_pod_logs on a multi-container pod, include parameters.container when possible`,
+- If using inspect_pod_logs on a multi-container pod, include parameters.container when possible
+- Readiness or liveness probe failures (reason Unhealthy) without a crash indicate a probe misconfiguration or a flaky dependency: a deployment restart will not fix them, so prefer inspect_pod_logs and classify as low severity unless the pod has also restarted many times
+- When the action targets a Deployment, set parameters.deployment_name so the agent can act even if the specific pod no longer exists`,
 		etype, reason, message, ns, kind, name, extra)
 }
