@@ -52,6 +52,21 @@ func MaybeBlockRestartOnProbeFailure(d model.Decision, eventReason string) error
 	return fmt.Errorf("restart_deployment blocked: event reason=Unhealthy; restart does not fix probe misconfigurations, use patch_probe or inspect_pod_logs")
 }
 
+// MaybeBlockRestartOnOOMKilled rejects restart_deployment when the extra
+// context attached to the decision indicates that the pod was OOMKilled (or
+// exited with 137). Restarting would just recreate a pod that hits the same
+// memory limit. The LLM is expected to pick patch_resources instead.
+func MaybeBlockRestartOnOOMKilled(d model.Decision, extra string) error {
+	if d.Action != model.ActionRestartDeployment {
+		return nil
+	}
+	low := strings.ToLower(extra)
+	if !strings.Contains(low, "oomkilled") && !strings.Contains(low, "exit=137") {
+		return nil
+	}
+	return fmt.Errorf("restart_deployment blocked: pod status shows OOMKilled; restart does not fix memory pressure, use patch_resources")
+}
+
 // MaybeBlockUnsafePatch enforces the global feature flag and the confidence
 // threshold for the three patch_* actions. The per-Deployment opt-in
 // annotation is checked separately inside the kube package because it
@@ -150,6 +165,7 @@ Rules:
 - When the action targets a Deployment, set parameters.deployment_name so the agent can act even if the specific pod no longer exists
 - patch_probe tunes probe timing only. Required parameters: deployment_name, container, probe (readiness|liveness), and at least one of initial_delay_seconds, period_seconds, failure_threshold, success_threshold, timeout_seconds. Do not rewrite the probe handler (exec/httpGet/tcpSocket)
 - patch_resources adjusts CPU/memory requests and limits. Required parameters: deployment_name, container, and at least one of cpu_request, memory_request, cpu_limit, memory_limit. Use Kubernetes quantity strings (e.g. "250m", "512Mi"). Prefer this for OOMKilled signals
+- HARD RULE: if the pod status shows lastTerminated reason=OOMKilled or exit=137, or the event reason is BackOff on a Deployment whose snapshot reports Allow-patch scopes containing "resources" or "*", PICK patch_resources DIRECTLY (restart_deployment is useless: the new pod will hit the same memory limit). Read the current memory_limit from the container spec (if any) and propose a higher value as a plain quantity string, e.g. memory_limit="256Mi" when the current is 32Mi. If the pod status shows lastTerminated reason=Error and the exit code is not 137, patch_resources is not appropriate; prefer inspect_pod_logs first
 - patch_registry rewrites only the registry host of the container image, keeping the path and tag. Required parameters: deployment_name, container, new_registry (e.g. "host.docker.internal:5050"). Prefer this for ErrImagePull/ErrImageNeverPull caused by a wrong registry prefix
 - patch_* actions require a high-confidence read of the event (>= 0.85) and an opt-in annotation on the target Deployment; if either is unlikely, prefer mark_for_manual_fix`,
 		etype, reason, message, ns, kind, name, extra)
