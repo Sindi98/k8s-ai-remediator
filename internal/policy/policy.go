@@ -67,6 +67,20 @@ func MaybeBlockRestartOnOOMKilled(d model.Decision, extra string) error {
 	return fmt.Errorf("restart_deployment blocked: pod status shows OOMKilled; restart does not fix memory pressure, use patch_resources")
 }
 
+// MaybeBlockWrongActionOnFailedScheduling rejects scale_deployment and
+// restart_deployment when the event reason is FailedScheduling. Neither can
+// solve a single-pod resource request larger than any node; patch_resources
+// (or mark_for_manual_fix) is the correct path.
+func MaybeBlockWrongActionOnFailedScheduling(d model.Decision, eventReason string) error {
+	if d.Action != model.ActionScaleDeployment && d.Action != model.ActionRestartDeployment {
+		return nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(eventReason), "FailedScheduling") {
+		return nil
+	}
+	return fmt.Errorf("%s blocked: event reason=FailedScheduling; scale/restart cannot satisfy impossible resource requests, use patch_resources", d.Action)
+}
+
 // MaybeBlockUnsafePatch enforces the global feature flag and the confidence
 // threshold for the three patch_* actions. The per-Deployment opt-in
 // annotation is checked separately inside the kube package because it
@@ -166,6 +180,7 @@ Rules:
 - patch_probe tunes probe timing only. Required parameters: deployment_name, container, probe (readiness|liveness), and at least one of initial_delay_seconds, period_seconds, failure_threshold, success_threshold, timeout_seconds. Do not rewrite the probe handler (exec/httpGet/tcpSocket)
 - patch_resources adjusts CPU/memory requests and limits. Required parameters: deployment_name, container, and at least one of cpu_request, memory_request, cpu_limit, memory_limit. Use Kubernetes quantity strings (e.g. "250m", "512Mi"). Prefer this for OOMKilled signals
 - HARD RULE: if the pod status shows lastTerminated reason=OOMKilled or exit=137, or the event reason is BackOff on a Deployment whose snapshot reports Allow-patch scopes containing "resources" or "*", PICK patch_resources DIRECTLY (restart_deployment is useless: the new pod will hit the same memory limit). Read the current memory_limit from the container spec (if any) and propose a higher value as a plain quantity string, e.g. memory_limit="256Mi" when the current is 32Mi. If the pod status shows lastTerminated reason=Error and the exit code is not 137, patch_resources is not appropriate; prefer inspect_pod_logs first
+- HARD RULE: if the event reason is FailedScheduling (pod stuck Pending with "Insufficient cpu/memory" or similar), NEVER pick scale_deployment or restart_deployment: they cannot solve a single-pod resource request bigger than any node. If the Deployment snapshot reports Allow-patch scopes containing "resources" or "*", PICK patch_resources DIRECTLY with reasonable node-sized values (cpu_request around 100m, memory_request around 64-128Mi). Without the opt-in, pick mark_for_manual_fix
 - patch_registry rewrites only the registry host of the container image, keeping the path and tag. Required parameters: deployment_name, container, new_registry (e.g. "host.docker.internal:5050"). Prefer this for ErrImagePull/ErrImageNeverPull caused by a wrong registry prefix
 - patch_* actions require a high-confidence read of the event (>= 0.85) and an opt-in annotation on the target Deployment; if either is unlikely, prefer mark_for_manual_fix`,
 		etype, reason, message, ns, kind, name, extra)

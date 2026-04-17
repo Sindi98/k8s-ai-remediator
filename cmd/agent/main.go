@@ -40,6 +40,9 @@ func executeDecision(
 	if err := policy.MaybeBlockRestartOnOOMKilled(d, extra); err != nil {
 		return err
 	}
+	if err := policy.MaybeBlockWrongActionOnFailedScheduling(d, eventReason); err != nil {
+		return err
+	}
 	if err := policy.MaybeBlockUnsafeImageUpdate(d, cfg.AllowImageUpdates, cfg.ImageUpdateThreshold); err != nil {
 		return err
 	}
