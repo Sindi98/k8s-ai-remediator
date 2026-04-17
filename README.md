@@ -255,20 +255,30 @@ kubectl create clusterrolebinding ai-remediator \
   --clusterrole=ai-remediator \
   --serviceaccount=ai-remediator:ai-remediator
 
-# Crea la ConfigMap
+# Crea la ConfigMap (set completo: auto-fix per probe, resources, registry,
+# timeouts estesi per modelli locali lenti, dedup TTL)
 kubectl create configmap ai-remediator-config \
   -n ai-remediator \
   --from-literal=OLLAMA_BASE_URL=http://ollama.ollama.svc.cluster.local:11434/api \
   --from-literal=OLLAMA_MODEL=qwen2.5:14b \
   --from-literal=DRY_RUN=false \
+  --from-literal=POLL_INTERVAL_SECONDS=30 \
+  --from-literal=MIN_SEVERITY=medium \
   --from-literal=SCALE_MIN=1 \
   --from-literal=SCALE_MAX=5 \
-  --from-literal=POLL_INTERVAL_SECONDS=30 \
-  --from-literal=ALLOW_IMAGE_UPDATES=false \
+  --from-literal=ALLOW_IMAGE_UPDATES=true \
   --from-literal=IMAGE_UPDATE_CONFIDENCE_THRESHOLD=0.92 \
+  --from-literal=ALLOW_PATCH_PROBE=true \
+  --from-literal=ALLOW_PATCH_RESOURCES=true \
+  --from-literal=ALLOW_PATCH_REGISTRY=true \
+  --from-literal=PATCH_CONFIDENCE_THRESHOLD=0.85 \
   --from-literal=POD_LOG_TAIL_LINES=200 \
   --from-literal=OLLAMA_RPS=2.0 \
   --from-literal=OLLAMA_MAX_RETRIES=3 \
+  --from-literal=OLLAMA_HTTP_TIMEOUT_SECONDS=360 \
+  --from-literal=POLL_CONTEXT_TIMEOUT_SECONDS=480 \
+  --from-literal=DEDUPE_TTL_SECONDS=300 \
+  --from-literal=MAX_EVENTS_PER_POLL=10 \
   --from-literal=METRICS_ADDR=:9090
 
 # Crea il deployment usando l'immagine del registry locale
@@ -627,12 +637,19 @@ La directory `scenarios/` contiene manifest pronti per riprodurre guasti tipici
 a quattro livelli di severita. Sono utili per validare il comportamento dell'agente
 in condizioni diverse e per stimolare decisioni dell'LLM coerenti con la policy.
 
-| Severita | Manifest | Reason evento | Comportamento atteso |
-|----------|----------|---------------|----------------------|
-| **Basso** | `scenarios/low-readiness-flaky.yaml` | `Unhealthy` | `noop` / `inspect_pod_logs` |
-| **Medio** | `scenarios/medium-imagepullbackoff.yaml` | `Failed`, `ErrImagePull`, `ImagePullBackOff` | `mark_for_manual_fix` / `ask_human` (o `set_deployment_image` se `ALLOW_IMAGE_UPDATES=true` e confidenza sopra soglia) |
-| **Critico** | `scenarios/critical-oomkilled.yaml` | `BackOff`, `OOMKilling` | `inspect_pod_logs` / `ask_human` |
-| **Grave** | `scenarios/severe-failedscheduling.yaml` | `FailedScheduling` | `mark_for_manual_fix` / `ask_human` |
+Con tutti i flag attivi (`ALLOW_PATCH_PROBE=true`, `ALLOW_PATCH_RESOURCES=true`,
+`ALLOW_PATCH_REGISTRY=true`, `ALLOW_IMAGE_UPDATES=true`) **3 scenari su 4** si
+risolvono in autonomia; sul quarto l'agente si astiene correttamente.
+
+| Severita | Manifest | Reason evento | Opt-in sul Deployment | Action attesa | Esito |
+|----------|----------|---------------|------------------------|----------------|-------|
+| **Basso** | `scenarios/low-readiness-flaky.yaml` | `Unhealthy` | `allow-patch: probe` (gia presente) | `patch_probe` | auto-fix |
+| **Medio** | `scenarios/medium-imagepullbackoff.yaml` | `ErrImagePull` / `ImagePullBackOff` | — (usa `ALLOW_IMAGE_UPDATES`) | `set_deployment_image` | auto-fix (se il registry raggiunge il tag) |
+| **Critico** | `scenarios/critical-oomkilled.yaml` | `BackOff` + stato `OOMKilled` | `allow-patch: resources` (gia presente) | `patch_resources` | auto-fix |
+| **Grave** | `scenarios/severe-failedscheduling.yaml` | `FailedScheduling` | `allow-patch: resources` (opzionale) | `patch_resources` o `mark_for_manual_fix` | auto-fix condizionale o astensione |
+
+Dettaglio dei valori prodotti dall'agente (reference con qwen2.5:14b):
+vedi [`scenarios/README.md`](scenarios/README.md).
 
 Tutti gli scenari presuppongono il namespace `incident-lab` gia creato (vedi
 [Laboratorio di test](#laboratorio-di-test)).
@@ -801,14 +818,23 @@ kubectl -n ai-remediator create configmap ai-remediator-config \
   --from-literal=OLLAMA_BASE_URL=http://ollama.ollama.svc.cluster.local:11434/api \
   --from-literal=OLLAMA_MODEL=qwen2.5:14b \
   --from-literal=DRY_RUN=false \
+  --from-literal=POLL_INTERVAL_SECONDS=30 \
+  --from-literal=MIN_SEVERITY=medium \
   --from-literal=SCALE_MIN=1 \
   --from-literal=SCALE_MAX=5 \
-  --from-literal=POLL_INTERVAL_SECONDS=30 \
-  --from-literal=ALLOW_IMAGE_UPDATES=false \
+  --from-literal=ALLOW_IMAGE_UPDATES=true \
   --from-literal=IMAGE_UPDATE_CONFIDENCE_THRESHOLD=0.92 \
+  --from-literal=ALLOW_PATCH_PROBE=true \
+  --from-literal=ALLOW_PATCH_RESOURCES=true \
+  --from-literal=ALLOW_PATCH_REGISTRY=true \
+  --from-literal=PATCH_CONFIDENCE_THRESHOLD=0.85 \
   --from-literal=POD_LOG_TAIL_LINES=200 \
   --from-literal=OLLAMA_RPS=2.0 \
   --from-literal=OLLAMA_MAX_RETRIES=3 \
+  --from-literal=OLLAMA_HTTP_TIMEOUT_SECONDS=360 \
+  --from-literal=POLL_CONTEXT_TIMEOUT_SECONDS=480 \
+  --from-literal=DEDUPE_TTL_SECONDS=300 \
+  --from-literal=MAX_EVENTS_PER_POLL=10 \
   --from-literal=METRICS_ADDR=:9090 \
   --dry-run=client -o yaml | kubectl apply -f -
 
