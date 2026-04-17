@@ -44,7 +44,7 @@ func TestDecide_ValidResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "test-model", 100, 0, false)
+	client := NewClient(srv.URL, "test-model", 100, 0, false, 0)
 	got, err := client.Decide(context.Background(), "test prompt")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -73,7 +73,7 @@ func TestDecide_DisallowedAction(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "test-model", 100, 0, false)
+	client := NewClient(srv.URL, "test-model", 100, 0, false, 0)
 	_, err := client.Decide(context.Background(), "test prompt")
 	if err == nil {
 		t.Error("expected error for disallowed action")
@@ -92,7 +92,7 @@ func TestDecide_HTTPError_4xx_NoRetry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "test-model", 100, 2, false)
+	client := NewClient(srv.URL, "test-model", 100, 2, false, 0)
 	_, err := client.Decide(context.Background(), "test prompt")
 	if err == nil {
 		t.Error("expected error for HTTP 400")
@@ -119,7 +119,7 @@ func TestDecide_HTTPError_5xx_Retries(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "test-model", 100, 3, false)
+	client := NewClient(srv.URL, "test-model", 100, 3, false, 0)
 	got, err := client.Decide(context.Background(), "test prompt")
 	if err != nil {
 		t.Fatalf("expected success after retries, got: %v", err)
@@ -141,7 +141,7 @@ func TestDecide_HTTPError_5xx_ExhaustsRetries(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "test-model", 100, 1, false)
+	client := NewClient(srv.URL, "test-model", 100, 1, false, 0)
 	_, err := client.Decide(context.Background(), "test prompt")
 	if err == nil {
 		t.Error("expected error after exhausting retries")
@@ -162,7 +162,7 @@ func TestDecide_EmptyResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "test-model", 100, 0, false)
+	client := NewClient(srv.URL, "test-model", 100, 0, false, 0)
 	_, err := client.Decide(context.Background(), "test prompt")
 	if err == nil {
 		t.Error("expected error for empty response")
@@ -179,7 +179,7 @@ func TestDecide_RateLimiting(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "test-model", 1000, 0, false)
+	client := NewClient(srv.URL, "test-model", 1000, 0, false, 0)
 	for i := 0; i < 3; i++ {
 		_, err := client.Decide(context.Background(), "test")
 		if err != nil {
@@ -193,7 +193,7 @@ func TestDecide_RateLimiting(t *testing.T) {
 
 func TestDecide_TLSSkipVerify(t *testing.T) {
 	// Just verify the client can be created with TLS skip verify without panic
-	client := NewClient("https://localhost:99999", "test", 100, 0, true)
+	client := NewClient("https://localhost:99999", "test", 100, 0, true, 0)
 	if client.http.Transport == nil {
 		t.Error("expected custom transport for TLS skip verify")
 	}

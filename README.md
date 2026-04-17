@@ -334,6 +334,7 @@ Tutte le variabili sono lette da environment (tipicamente via ConfigMap).
 | `OLLAMA_RPS` | `2.0` | Max richieste al secondo verso Ollama (rate limiting) |
 | `OLLAMA_MAX_RETRIES` | `3` | Tentativi per errori transitori (5xx, rete) con backoff esponenziale |
 | `OLLAMA_TLS_SKIP_VERIFY` | `false` | Salta la verifica TLS (per certificati self-signed) |
+| `OLLAMA_HTTP_TIMEOUT_SECONDS` | `180` | Timeout HTTP per ogni richiesta a Ollama (attesa headers + body). Aumenta se vedi `Client.Timeout exceeded while awaiting headers` con modelli lenti (CPU, GPU scarica, cold start) |
 | `POD_LOG_TAIL_LINES` | `200` | Numero di righe di log lette per container |
 
 ### Variabili di osservabilita

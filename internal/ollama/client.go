@@ -28,17 +28,24 @@ type Client struct {
 }
 
 // NewClient creates an Ollama client with rate limiting, TLS support, and retry config.
-func NewClient(baseURL, mdl string, rps float64, maxRetries int, tlsSkipVerify bool) *Client {
+// httpTimeoutSec caps the per-request HTTP timeout (awaiting headers + body). Local
+// LLMs can occasionally take well over a minute; defaults to 180s when 0 is passed.
+func NewClient(baseURL, mdl string, rps float64, maxRetries int, tlsSkipVerify bool, httpTimeoutSec int) *Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if tlsSkipVerify {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+
+	timeout := time.Duration(httpTimeoutSec) * time.Second
+	if timeout <= 0 {
+		timeout = 180 * time.Second
 	}
 
 	return &Client{
 		baseURL: baseURL,
 		model:   mdl,
 		http: &http.Client{
-			Timeout:   90 * time.Second,
+			Timeout:   timeout,
 			Transport: transport,
 		},
 		limiter:    rate.NewLimiter(rate.Limit(rps), 1),
@@ -62,14 +69,11 @@ func (c *Client) Decide(ctx context.Context, prompt string) (model.Decision, err
 		Messages: []model.Message{
 			{
 				Role: "system",
-				Content: "Return only valid JSON matching the schema. " +
-					"Allowed actions: noop,restart_deployment,delete_failed_pod,delete_and_recreate_pod,scale_deployment,inspect_pod_logs,set_deployment_image,mark_for_manual_fix,ask_human. " +
+				Content: "You are a Kubernetes remediation agent. Return only valid JSON matching the schema. " +
+					"Allowed actions: noop,restart_deployment,delete_failed_pod,delete_and_recreate_pod,scale_deployment,inspect_pod_logs,set_deployment_image,patch_probe,patch_resources,patch_registry,mark_for_manual_fix,ask_human. " +
 					"Severity must be one of: critical, high, medium, low, info. " +
-					"For critical, high, and medium severity incidents, attempt remediation when a safe action is available. " +
 					"Never suggest shell commands. " +
-					"If the issue contains CrashLoopBackOff, you may use inspect_pod_logs first, but if the pod is managed by a Deployment and the issue looks recoverable, prefer restart_deployment (the pod name from the event may be stale). " +
-					"If the issue contains ImagePullBackOff or ErrImagePull, prefer mark_for_manual_fix unless a concrete safe replacement image is explicit. " +
-					"Use set_deployment_image only when parameters.image contains a concrete replacement image string.",
+					"The user message contains detailed rules for when to pick each action; follow them strictly, including any HARD RULE.",
 			},
 			{Role: "user", Content: prompt},
 		},
