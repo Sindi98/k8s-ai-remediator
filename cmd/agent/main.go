@@ -31,7 +31,11 @@ func executeDecision(
 	cs kubernetes.Interface,
 	d model.Decision,
 	cfg config.AgentConfig,
+	eventReason string,
 ) error {
+	if err := policy.MaybeBlockRestartOnProbeFailure(d, eventReason); err != nil {
+		return err
+	}
 	if err := policy.MaybeBlockUnsafeImageUpdate(d, cfg.AllowImageUpdates, cfg.ImageUpdateThreshold); err != nil {
 		return err
 	}
@@ -269,7 +273,7 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 				continue
 			}
 
-			if err := executeDecision(pollCtx, cs, d, cfg); err != nil {
+			if err := executeDecision(pollCtx, cs, d, cfg, e.Reason); err != nil {
 				m.ExecutionErrors.Add(1)
 				slog.Error("execute decision failed", "action", d.Action, "error", err)
 			}

@@ -37,6 +37,21 @@ type PatchFlags struct {
 	Threshold      float64
 }
 
+// MaybeBlockRestartOnProbeFailure rejects restart_deployment when the source
+// event was a probe failure (reason Unhealthy). Restarting a Deployment does
+// not fix a misconfigured probe; the LLM is steered toward patch_probe or
+// inspect_pod_logs instead. Mirrors the HARD RULE in the prompt so a
+// disobedient LLM cannot waste a restart loop.
+func MaybeBlockRestartOnProbeFailure(d model.Decision, eventReason string) error {
+	if d.Action != model.ActionRestartDeployment {
+		return nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(eventReason), "Unhealthy") {
+		return nil
+	}
+	return fmt.Errorf("restart_deployment blocked: event reason=Unhealthy; restart does not fix probe misconfigurations, use patch_probe or inspect_pod_logs")
+}
+
 // MaybeBlockUnsafePatch enforces the global feature flag and the confidence
 // threshold for the three patch_* actions. The per-Deployment opt-in
 // annotation is checked separately inside the kube package because it
@@ -130,11 +145,11 @@ Rules:
 - Use set_deployment_image only if parameters.image contains a concrete image string
 - Use mark_for_manual_fix when the image problem cannot be resolved safely from the event alone
 - If using inspect_pod_logs on a multi-container pod, include parameters.container when possible
-- Readiness or liveness probe failures (reason Unhealthy) without a crash indicate a probe misconfiguration or a flaky dependency: prefer patch_probe when the event clearly points to a timing issue (initialDelay too low, timeout too short), otherwise inspect_pod_logs; do not use restart_deployment for probe-only failures
+- HARD RULE: if the event reason is Unhealthy (readiness or liveness probe failure) and the pod is not crashing, NEVER pick restart_deployment. A rolling restart spawns a new pod that immediately hits the same probe misconfiguration. Pick patch_probe when the Deployment carries the opt-in annotation, else inspect_pod_logs, else mark_for_manual_fix. Increasing failure_threshold (e.g. 5) or period_seconds (e.g. 15) is the typical fix for flaky probes that cycle between ready and not-ready
 - When the action targets a Deployment, set parameters.deployment_name so the agent can act even if the specific pod no longer exists
 - patch_probe tunes probe timing only. Required parameters: deployment_name, container, probe (readiness|liveness), and at least one of initial_delay_seconds, period_seconds, failure_threshold, success_threshold, timeout_seconds. Do not rewrite the probe handler (exec/httpGet/tcpSocket)
 - patch_resources adjusts CPU/memory requests and limits. Required parameters: deployment_name, container, and at least one of cpu_request, memory_request, cpu_limit, memory_limit. Use Kubernetes quantity strings (e.g. "250m", "512Mi"). Prefer this for OOMKilled signals
 - patch_registry rewrites only the registry host of the container image, keeping the path and tag. Required parameters: deployment_name, container, new_registry (e.g. "host.docker.internal:5050"). Prefer this for ErrImagePull/ErrImageNeverPull caused by a wrong registry prefix
-- patch_* actions require a high-confidence read of the event (>= 0.92) and an opt-in annotation on the target Deployment; if either is unlikely, prefer mark_for_manual_fix`,
+- patch_* actions require a high-confidence read of the event (>= 0.85) and an opt-in annotation on the target Deployment; if either is unlikely, prefer mark_for_manual_fix`,
 		etype, reason, message, ns, kind, name, extra)
 }

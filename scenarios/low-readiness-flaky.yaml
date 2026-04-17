@@ -20,6 +20,10 @@ metadata:
     app: flaky-probe
     scenario: low
     error-type: readiness-probe-flaky
+  annotations:
+    # Opt-in per le azioni patch_* (vedi README "Controlled Deployment patches").
+    # Richiede anche ALLOW_PATCH_PROBE=true nella ConfigMap dell'agente.
+    ai-remediator/allow-patch: "probe"
 spec:
   replicas: 1
   selector:

@@ -80,7 +80,7 @@ func TestExecuteDecision_Noop(t *testing.T) {
 
 	for _, action := range []model.Action{model.ActionNoop, model.ActionAskHuman, model.ActionMarkForManualFix} {
 		d := model.Decision{Action: action, Namespace: "default", ResourceKind: "Pod", ResourceName: "web-abc-123"}
-		if err := executeDecision(ctx, cs, d, cfg); err != nil {
+		if err := executeDecision(ctx, cs, d, cfg, ""); err != nil {
 			t.Errorf("action %s should succeed: %v", action, err)
 		}
 	}
@@ -94,7 +94,7 @@ func TestExecuteDecision_RestartDeployment(t *testing.T) {
 		Action: model.ActionRestartDeployment, Namespace: "default",
 		ResourceKind: "Deployment", ResourceName: "web",
 	}
-	if err := executeDecision(ctx, cs, d, defaultCfg()); err != nil {
+	if err := executeDecision(ctx, cs, d, defaultCfg(), ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -112,7 +112,7 @@ func TestExecuteDecision_DeletePod(t *testing.T) {
 		Action: model.ActionDeleteFailedPod, Namespace: "default",
 		ResourceKind: "Pod", ResourceName: "web-abc-123",
 	}
-	if err := executeDecision(ctx, cs, d, defaultCfg()); err != nil {
+	if err := executeDecision(ctx, cs, d, defaultCfg(), ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -131,7 +131,7 @@ func TestExecuteDecision_ScaleDeployment(t *testing.T) {
 		ResourceKind: "Deployment", ResourceName: "web",
 		Parameters: map[string]string{"replicas": "4"},
 	}
-	if err := executeDecision(ctx, cs, d, defaultCfg()); err != nil {
+	if err := executeDecision(ctx, cs, d, defaultCfg(), ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -153,7 +153,7 @@ func TestExecuteDecision_RestartDeployment_PodGoneUsesParamName(t *testing.T) {
 		ResourceKind: "Pod", ResourceName: "web-gone-5c8d8c8ffc-28wp6",
 		Parameters: map[string]string{"deployment_name": "web"},
 	}
-	if err := executeDecision(ctx, cs, d, defaultCfg()); err != nil {
+	if err := executeDecision(ctx, cs, d, defaultCfg(), ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -163,10 +163,26 @@ func TestExecuteDecision_RestartDeployment_PodGoneUsesParamName(t *testing.T) {
 	}
 }
 
+func TestExecuteDecision_BlocksRestartForUnhealthy(t *testing.T) {
+	cs := newFakeCluster(t)
+	d := model.Decision{
+		Action: model.ActionRestartDeployment, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "web",
+	}
+	err := executeDecision(context.Background(), cs, d, defaultCfg(), "Unhealthy")
+	if err == nil {
+		t.Error("restart_deployment on event reason=Unhealthy should be blocked")
+	}
+	// Sanity: other reasons still allow restart_deployment.
+	if err := executeDecision(context.Background(), cs, d, defaultCfg(), "BackOff"); err != nil {
+		t.Errorf("restart_deployment on BackOff should pass, got %v", err)
+	}
+}
+
 func TestExecuteDecision_UnsupportedAction(t *testing.T) {
 	cs := newFakeCluster(t)
 	d := model.Decision{Action: model.Action("unknown_action"), Namespace: "default"}
-	if err := executeDecision(context.Background(), cs, d, defaultCfg()); err == nil {
+	if err := executeDecision(context.Background(), cs, d, defaultCfg(), ""); err == nil {
 		t.Error("expected error for unsupported action")
 	}
 }
@@ -218,7 +234,7 @@ func TestExecuteDecision_PatchProbe_FlagOffBlocked(t *testing.T) {
 			"initial_delay_seconds": "10",
 		},
 	}
-	if err := executeDecision(context.Background(), cs, d, defaultCfg()); err == nil {
+	if err := executeDecision(context.Background(), cs, d, defaultCfg(), ""); err == nil {
 		t.Error("patch_probe should be blocked when ALLOW_PATCH_PROBE is off")
 	}
 }
@@ -233,7 +249,7 @@ func TestExecuteDecision_PatchProbe_BelowThresholdBlocked(t *testing.T) {
 			"initial_delay_seconds": "10",
 		},
 	}
-	if err := executeDecision(context.Background(), cs, d, patchFlagsCfg()); err == nil {
+	if err := executeDecision(context.Background(), cs, d, patchFlagsCfg(), ""); err == nil {
 		t.Error("patch_probe should be blocked below confidence threshold")
 	}
 }
@@ -249,7 +265,7 @@ func TestExecuteDecision_PatchProbe_AnnotationRequired(t *testing.T) {
 			"initial_delay_seconds": "10",
 		},
 	}
-	if err := executeDecision(context.Background(), cs, d, patchFlagsCfg()); err == nil {
+	if err := executeDecision(context.Background(), cs, d, patchFlagsCfg(), ""); err == nil {
 		t.Error("patch_probe should require opt-in annotation")
 	}
 }
@@ -266,7 +282,7 @@ func TestExecuteDecision_PatchProbe_HappyPath(t *testing.T) {
 			"timeout_seconds":       "5",
 		},
 	}
-	if err := executeDecision(ctx, cs, d, patchFlagsCfg()); err != nil {
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg(), ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "app", metav1.GetOptions{})
@@ -288,7 +304,7 @@ func TestExecuteDecision_PatchResources_HappyPath(t *testing.T) {
 			"memory_limit":   "128Mi",
 		},
 	}
-	if err := executeDecision(ctx, cs, d, patchFlagsCfg()); err != nil {
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg(), ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -304,7 +320,7 @@ func TestExecuteDecision_PatchRegistry_HappyPath(t *testing.T) {
 			"new_registry": "host.docker.internal:5050",
 		},
 	}
-	if err := executeDecision(ctx, cs, d, patchFlagsCfg()); err != nil {
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg(), ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "app", metav1.GetOptions{})

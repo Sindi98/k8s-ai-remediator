@@ -45,7 +45,7 @@ type AgentConfig struct {
 	// Requires the "registry" entry in the allow-patch annotation.
 	AllowPatchRegistry bool
 	// PatchConfidenceThreshold gates the three patch_* actions on the
-	// LLM confidence field. Defaults to 0.92.
+	// LLM confidence field. Defaults to 0.85.
 	PatchConfidenceThreshold float64
 }
 
@@ -74,7 +74,7 @@ func LoadFromEnv() AgentConfig {
 		AllowPatchProbe:          Getbool("ALLOW_PATCH_PROBE", false),
 		AllowPatchResources:      Getbool("ALLOW_PATCH_RESOURCES", false),
 		AllowPatchRegistry:       Getbool("ALLOW_PATCH_REGISTRY", false),
-		PatchConfidenceThreshold: Getfloat("PATCH_CONFIDENCE_THRESHOLD", 0.92),
+		PatchConfidenceThreshold: Getfloat("PATCH_CONFIDENCE_THRESHOLD", 0.85),
 	}
 }
 
