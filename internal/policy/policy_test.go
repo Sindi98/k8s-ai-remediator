@@ -134,6 +134,31 @@ func TestMaybeBlockRestartOnProbeFailure(t *testing.T) {
 	}
 }
 
+func TestMaybeBlockWrongActionOnFailedScheduling(t *testing.T) {
+	cases := []struct {
+		action    model.Action
+		reason    string
+		wantBlock bool
+	}{
+		{model.ActionScaleDeployment, "FailedScheduling", true},
+		{model.ActionRestartDeployment, "FailedScheduling", true},
+		{model.ActionScaleDeployment, "Unhealthy", false},
+		{model.ActionPatchResources, "FailedScheduling", false},
+		{model.ActionInspectPodLogs, "FailedScheduling", false},
+		{model.ActionScaleDeployment, "", false},
+	}
+	for _, c := range cases {
+		d := model.Decision{Action: c.action}
+		err := MaybeBlockWrongActionOnFailedScheduling(d, c.reason)
+		if c.wantBlock && err == nil {
+			t.Errorf("%s on reason=%q should be blocked", c.action, c.reason)
+		}
+		if !c.wantBlock && err != nil {
+			t.Errorf("%s on reason=%q should pass, got %v", c.action, c.reason, err)
+		}
+	}
+}
+
 func TestMaybeBlockUnsafePatch(t *testing.T) {
 	enabled := PatchFlags{AllowProbe: true, AllowResources: true, AllowRegistry: true, Threshold: 0.9}
 	disabled := PatchFlags{Threshold: 0.9}
