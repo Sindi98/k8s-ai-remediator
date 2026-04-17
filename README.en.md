@@ -557,17 +557,35 @@ The agent should detect the Warning event, analyze it, and decide on a remediati
 ## Error Scenarios
 
 The `scenarios/` directory contains ready-to-apply manifests that reproduce
-typical failures at three severity levels. They validate the agent's behavior
+typical failures at four severity levels. They validate the agent's behavior
 under different conditions and exercise the LLM's policy-aware decisions.
 
 | Severity | Manifest | Event reason | Expected behavior |
 |----------|----------|--------------|-------------------|
+| **Low** | `scenarios/low-readiness-flaky.yaml` | `Unhealthy` | `noop` / `inspect_pod_logs` |
 | **Medium** | `scenarios/medium-imagepullbackoff.yaml` | `Failed`, `ErrImagePull`, `ImagePullBackOff` | `mark_for_manual_fix` / `ask_human` (or `set_deployment_image` if `ALLOW_IMAGE_UPDATES=true` and confidence over threshold) |
 | **Critical** | `scenarios/critical-oomkilled.yaml` | `BackOff`, `OOMKilling` | `inspect_pod_logs` / `ask_human` |
 | **Severe** | `scenarios/severe-failedscheduling.yaml` | `FailedScheduling` | `mark_for_manual_fix` / `ask_human` |
 
 All scenarios assume the `incident-lab` namespace already exists (see
 [Test Lab](#test-lab)).
+
+### Low scenario — flaky readiness probe
+
+The container runs fine, but the readiness probe fails intermittently (cycles
+of 20s ready / 10s not ready). Each failure emits an `Unhealthy` Warning event.
+
+```bash
+kubectl apply -f scenarios/low-readiness-flaky.yaml
+kubectl -n incident-lab get pods -l scenario=low -w
+kubectl -n incident-lab get events --field-selector reason=Unhealthy --sort-by=.metadata.creationTimestamp | tail
+```
+
+**Impact**: only noise in logs/events and occasional removal from endpoints.
+No crashes, no restarts.
+**Why low**: weak signal that may indicate an over-strict probe or flakiness
+worth investigating without urgency. An invasive remediation (restart, delete)
+would be overkill.
 
 ### Medium scenario — ImagePullBackOff
 
@@ -621,6 +639,7 @@ profile change.
 ### Cleanup
 
 ```bash
+kubectl delete -f scenarios/low-readiness-flaky.yaml --ignore-not-found
 kubectl delete -f scenarios/medium-imagepullbackoff.yaml --ignore-not-found
 kubectl delete -f scenarios/critical-oomkilled.yaml --ignore-not-found
 kubectl delete -f scenarios/severe-failedscheduling.yaml --ignore-not-found
