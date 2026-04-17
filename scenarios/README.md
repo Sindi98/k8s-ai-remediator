@@ -1,7 +1,9 @@
 # Scenari di errore
 
-Manifest Kubernetes che riproducono guasti controllati a tre livelli di severita
-per validare il comportamento dell'agente `ai-remediator`.
+> **[English version](README.en.md)**
+
+Manifest Kubernetes che riproducono guasti controllati a quattro livelli di
+severita per validare il comportamento dell'agente `ai-remediator`.
 
 | File | Severita | Reason degli eventi | Remediation attesa |
 |------|----------|---------------------|--------------------|
