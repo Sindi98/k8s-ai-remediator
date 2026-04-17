@@ -137,9 +137,16 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 		"minSeverity", string(minSev),
 		"allowImageUpdates", cfg.AllowImageUpdates,
 		"imageUpdateThreshold", cfg.ImageUpdateThreshold,
+		"allowPatchProbe", cfg.AllowPatchProbe,
+		"allowPatchResources", cfg.AllowPatchResources,
+		"allowPatchRegistry", cfg.AllowPatchRegistry,
+		"patchConfidenceThreshold", cfg.PatchConfidenceThreshold,
+		"dedupeTTLSec", cfg.DedupeTTLSec,
+		"maxEventsPerPoll", cfg.MaxEventsPerPoll,
 		"podLogTailLines", cfg.PodLogTailLines,
 		"ollamaRPS", cfg.OllamaRPS,
 		"metricsAddr", cfg.MetricsAddr,
+		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry",
 	)
 
 	ticker := time.NewTicker(time.Duration(cfg.PollSec) * time.Second)
