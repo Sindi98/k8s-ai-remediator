@@ -540,7 +540,48 @@ func TestDeploymentToText(t *testing.T) {
 	if !strings.Contains(got, "name=web") || !strings.Contains(got, "replicas=3") || !strings.Contains(got, "app=nginx:1.25") {
 		t.Errorf("unexpected output: %s", got)
 	}
+	if !strings.Contains(got, "Allow-patch scopes") {
+		t.Errorf("expected allow-patch scopes line, got %s", got)
+	}
 	if DeploymentToText(nil) != "" {
 		t.Error("nil deployment should return empty string")
+	}
+}
+
+func TestDeploymentToText_IncludesProbeAndAnnotation(t *testing.T) {
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "flaky",
+			Annotations: map[string]string{AllowPatchAnnotation: "probe,resources"},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(1),
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name: "app", Image: "busybox:1.36",
+						ReadinessProbe: &corev1.Probe{
+							InitialDelaySeconds: 5,
+							PeriodSeconds:       5,
+							FailureThreshold:    2,
+							TimeoutSeconds:      2,
+							SuccessThreshold:    1,
+						},
+					}},
+				},
+			},
+		},
+	}
+	got := DeploymentToText(dep)
+	for _, want := range []string{
+		"probe,resources",
+		"app readinessProbe",
+		"failureThreshold=2",
+		"period=5",
+		"timeout=2",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, got)
+		}
 	}
 }
