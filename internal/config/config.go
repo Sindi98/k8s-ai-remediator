@@ -20,6 +20,9 @@ type AgentConfig struct {
 	OllamaRPS            float64
 	OllamaMaxRetries     int
 	OllamaTLSSkipVerify  bool
+	// OllamaHTTPTimeoutSec caps the per-request HTTP timeout toward Ollama.
+	// Local LLMs can take > 90s on the first call, so the default is 180s.
+	OllamaHTTPTimeoutSec int
 	MetricsAddr          string
 	LeaderElection       bool
 	LeaseName            string
@@ -64,6 +67,7 @@ func LoadFromEnv() AgentConfig {
 		OllamaRPS:            Getfloat("OLLAMA_RPS", 2.0),
 		OllamaMaxRetries:     Getint("OLLAMA_MAX_RETRIES", 3),
 		OllamaTLSSkipVerify:  Getbool("OLLAMA_TLS_SKIP_VERIFY", false),
+		OllamaHTTPTimeoutSec: Getint("OLLAMA_HTTP_TIMEOUT_SECONDS", 180),
 		MetricsAddr:          Getenv("METRICS_ADDR", ":9090"),
 		LeaderElection:       Getbool("LEADER_ELECTION", false),
 		LeaseName:            Getenv("LEASE_NAME", "ai-remediator-leader"),
