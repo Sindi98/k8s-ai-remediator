@@ -652,3 +652,34 @@ func DeploymentSnapshot(ctx context.Context, cs kubernetes.Interface, ns, depNam
 	}
 	return DeploymentToText(dep)
 }
+
+// PodStatusSummary returns a short textual description of the pod's current
+// container states and last termination reasons. It surfaces OOMKilled and
+// exit codes so the LLM can distinguish between probe timing issues,
+// resource pressure and genuine application crashes. Empty string if the
+// pod cannot be read.
+func PodStatusSummary(ctx context.Context, cs kubernetes.Interface, ns, podName string) string {
+	pod, err := cs.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		return ""
+	}
+
+	lines := []string{fmt.Sprintf("Pod %s phase=%s restartPolicy=%s", pod.Name, pod.Status.Phase, pod.Spec.RestartPolicy)}
+	for _, cs := range pod.Status.ContainerStatuses {
+		parts := []string{fmt.Sprintf("container=%s restarts=%d ready=%t", cs.Name, cs.RestartCount, cs.Ready)}
+		if cs.State.Waiting != nil {
+			parts = append(parts, fmt.Sprintf("state=Waiting reason=%s", cs.State.Waiting.Reason))
+		}
+		if cs.State.Terminated != nil {
+			parts = append(parts, fmt.Sprintf("state=Terminated reason=%s exit=%d", cs.State.Terminated.Reason, cs.State.Terminated.ExitCode))
+		}
+		if cs.State.Running != nil {
+			parts = append(parts, "state=Running")
+		}
+		if cs.LastTerminationState.Terminated != nil {
+			parts = append(parts, fmt.Sprintf("lastTerminated reason=%s exit=%d", cs.LastTerminationState.Terminated.Reason, cs.LastTerminationState.Terminated.ExitCode))
+		}
+		lines = append(lines, strings.Join(parts, " "))
+	}
+	return strings.Join(lines, "\n")
+}

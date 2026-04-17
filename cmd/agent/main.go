@@ -32,8 +32,12 @@ func executeDecision(
 	d model.Decision,
 	cfg config.AgentConfig,
 	eventReason string,
+	extra string,
 ) error {
 	if err := policy.MaybeBlockRestartOnProbeFailure(d, eventReason); err != nil {
+		return err
+	}
+	if err := policy.MaybeBlockRestartOnOOMKilled(d, extra); err != nil {
 		return err
 	}
 	if err := policy.MaybeBlockUnsafeImageUpdate(d, cfg.AllowImageUpdates, cfg.ImageUpdateThreshold); err != nil {
@@ -212,6 +216,14 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 					dedupKind = "Deployment"
 					dedupName = depName
 				}
+				// Add pod-level state (OOMKilled, exit codes) so the LLM can
+				// tell a resource-pressure crash from a probe misconfiguration.
+				if ps := kube.PodStatusSummary(pollCtx, cs, e.Namespace, e.InvolvedObject.Name); ps != "" {
+					if extra != "" {
+						extra += "\n"
+					}
+					extra += ps
+				}
 			}
 
 			signal := e.Namespace + "|" + dedupKind + "|" + dedupName + "|" + e.Reason
@@ -293,7 +305,7 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 				continue
 			}
 
-			if err := executeDecision(pollCtx, cs, d, cfg, e.Reason); err != nil {
+			if err := executeDecision(pollCtx, cs, d, cfg, e.Reason, extra); err != nil {
 				m.ExecutionErrors.Add(1)
 				slog.Error("execute decision failed", "action", d.Action, "error", err)
 			}
