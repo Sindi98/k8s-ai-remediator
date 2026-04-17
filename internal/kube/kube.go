@@ -41,6 +41,23 @@ func DeploymentAllowsPatch(dep *appsv1.Deployment, scope string) bool {
 	return false
 }
 
+// InferDeploymentFromPodName derives the parent Deployment name from the
+// Kubernetes naming convention `{deployment}-{replicaset-hash}-{pod-hash}`,
+// used as a fallback when the pod itself has already been deleted and
+// ownerReferences cannot be followed. The candidate is returned only if
+// a Deployment with that name still exists in the namespace.
+func InferDeploymentFromPodName(ctx context.Context, cs kubernetes.Interface, ns, podName string) (string, bool) {
+	parts := strings.Split(podName, "-")
+	if len(parts) < 3 {
+		return "", false
+	}
+	candidate := strings.Join(parts[:len(parts)-2], "-")
+	if _, err := cs.AppsV1().Deployments(ns).Get(ctx, candidate, metav1.GetOptions{}); err != nil {
+		return "", false
+	}
+	return candidate, true
+}
+
 // ResolveDeploymentFromPod traverses ownerReferences to find the parent Deployment.
 func ResolveDeploymentFromPod(ctx context.Context, cs kubernetes.Interface, ns, podName string) (string, error) {
 	pod, err := cs.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})

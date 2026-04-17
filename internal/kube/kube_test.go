@@ -71,6 +71,36 @@ func TestResolveDeploymentFromPod(t *testing.T) {
 	}
 }
 
+func TestInferDeploymentFromPodName(t *testing.T) {
+	cs := newFakeCluster(t) // has deployment "web"
+	ctx := context.Background()
+
+	// Standard Kubernetes pod name: {deployment}-{rs-hash}-{pod-hash}
+	name, ok := InferDeploymentFromPodName(ctx, cs, "default", "web-5c8d8c8ffc-28wp6")
+	if !ok || name != "web" {
+		t.Errorf("expected web, got %q ok=%v", name, ok)
+	}
+
+	// Deployment name with dashes
+	csMulti := fake.NewSimpleClientset(&appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-flaky-app", Namespace: "default"},
+	})
+	name, ok = InferDeploymentFromPodName(ctx, csMulti, "default", "my-flaky-app-7c9d8cd456-rw2vp")
+	if !ok || name != "my-flaky-app" {
+		t.Errorf("expected my-flaky-app, got %q ok=%v", name, ok)
+	}
+
+	// Candidate deployment does not exist -> not ok
+	if name, ok := InferDeploymentFromPodName(ctx, cs, "default", "nonexistent-abc-123"); ok {
+		t.Errorf("expected not-ok for missing deployment, got %q", name)
+	}
+
+	// Pod name without enough segments (no owner hash pattern) -> not ok
+	if _, ok := InferDeploymentFromPodName(ctx, cs, "default", "lonelypod"); ok {
+		t.Error("expected not-ok for pod name without controller suffix")
+	}
+}
+
 func TestResolveDeploymentFromPod_NotFound(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	_, err := ResolveDeploymentFromPod(context.Background(), cs, "default", "nonexistent")

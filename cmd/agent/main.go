@@ -191,6 +191,13 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 					extra = "Resolved owner deployment: " + depName + "\n" + kube.DeploymentSnapshot(pollCtx, cs, e.Namespace, depName)
 					dedupKind = "Deployment"
 					dedupName = depName
+				} else if depName, ok := kube.InferDeploymentFromPodName(pollCtx, cs, e.Namespace, e.InvolvedObject.Name); ok {
+					// Pod is gone; rely on the naming convention so stale
+					// events from rolled-over ReplicaSets still collapse into
+					// a single dedup key.
+					extra = "Inferred owner deployment from pod name: " + depName + "\n" + kube.DeploymentSnapshot(pollCtx, cs, e.Namespace, depName)
+					dedupKind = "Deployment"
+					dedupName = depName
 				}
 			}
 
