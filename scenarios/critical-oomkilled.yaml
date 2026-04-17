@@ -34,18 +34,20 @@ spec:
     spec:
       containers:
         - name: app
-          image: busybox:1.36
+          image: polinux/stress:latest
           imagePullPolicy: IfNotPresent
-          command:
-            - /bin/sh
-            - -c
-            - |
-              echo "allocating memory beyond limit";
-              # Legge 256MB da /dev/zero in memoria: eccede il limite di 32Mi
-              # e attiva l'OOMKiller del kernel.
-              head -c 268435456 /dev/zero | tr '\0' 'a' > /dev/null;
-              echo "should never reach here";
-              sleep 60
+          command: ["stress"]
+          # Allocates 256MB of VM (held), instantly exceeding the 32Mi limit
+          # below and triggering OOMKilled -> CrashLoopBackOff.
+          args:
+            - "--vm"
+            - "1"
+            - "--vm-bytes"
+            - "256M"
+            - "--vm-hang"
+            - "0"
+            - "--timeout"
+            - "3600s"
           resources:
             requests:
               cpu: "10m"
