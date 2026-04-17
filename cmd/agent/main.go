@@ -84,6 +84,11 @@ func executeDecision(
 func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder) {
 	seen := map[string]bool{}
 
+	// Signal dedup: suppresses identical (ns|kind|name|reason) within a TTL.
+	// Protects Ollama from bursts (e.g. flaky probes emitting many Unhealthy events).
+	signalSeen := map[string]time.Time{}
+	dedupeTTL := time.Duration(cfg.DedupeTTLSec) * time.Second
+
 	minSev := model.ParseSeverity(cfg.MinSeverity)
 
 	slog.Info("agent started",
@@ -111,6 +116,14 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 			return
 		}
 
+		now := time.Now()
+		for sig, ts := range signalSeen {
+			if now.Sub(ts) >= dedupeTTL {
+				delete(signalSeen, sig)
+			}
+		}
+
+		processed := 0
 		for _, e := range list.Items {
 			key := e.Namespace + "/" + e.Name + "/" + e.ResourceVersion
 			if seen[key] {
@@ -124,17 +137,40 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 				continue
 			}
 
-			m.EventsProcessed.Add(1)
-
+			// Resolve a stable dedup target: for pods owned by a Deployment,
+			// collapse all pod generations onto the deployment so flaky
+			// workloads emitting the same reason across multiple pods count
+			// as one signal.
 			extra := ""
+			dedupKind := e.InvolvedObject.Kind
+			dedupName := e.InvolvedObject.Name
 			if strings.EqualFold(e.InvolvedObject.Kind, "Deployment") {
 				extra = kube.DeploymentSnapshot(pollCtx, cs, e.Namespace, e.InvolvedObject.Name)
 			}
 			if strings.EqualFold(e.InvolvedObject.Kind, "Pod") {
 				if depName, err := kube.ResolveDeploymentFromPod(pollCtx, cs, e.Namespace, e.InvolvedObject.Name); err == nil {
 					extra = "Resolved owner deployment: " + depName + "\n" + kube.DeploymentSnapshot(pollCtx, cs, e.Namespace, depName)
+					dedupKind = "Deployment"
+					dedupName = depName
 				}
 			}
+
+			signal := e.Namespace + "|" + dedupKind + "|" + dedupName + "|" + e.Reason
+			if ts, ok := signalSeen[signal]; ok && now.Sub(ts) < dedupeTTL {
+				m.EventsSkipped.Add(1)
+				continue
+			}
+
+			if cfg.MaxEventsPerPoll > 0 && processed >= cfg.MaxEventsPerPoll {
+				slog.Info("max events per poll reached; remaining events deferred",
+					"cap", cfg.MaxEventsPerPoll)
+				m.EventsSkipped.Add(1)
+				continue
+			}
+
+			signalSeen[signal] = now
+			processed++
+			m.EventsProcessed.Add(1)
 
 			prompt := policy.BuildPrompt(
 				e.Namespace,

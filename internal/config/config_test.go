@@ -73,7 +73,8 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	for _, k := range []string{"OLLAMA_BASE_URL", "OLLAMA_MODEL", "DRY_RUN", "SCALE_MIN", "SCALE_MAX",
 		"POLL_INTERVAL_SECONDS", "ALLOW_IMAGE_UPDATES", "IMAGE_UPDATE_CONFIDENCE_THRESHOLD",
 		"POD_LOG_TAIL_LINES", "OLLAMA_RPS", "OLLAMA_MAX_RETRIES", "OLLAMA_TLS_SKIP_VERIFY",
-		"METRICS_ADDR", "LEADER_ELECTION", "LEASE_NAME", "LEASE_NAMESPACE"} {
+		"METRICS_ADDR", "LEADER_ELECTION", "LEASE_NAME", "LEASE_NAMESPACE",
+		"DEDUPE_TTL_SECONDS", "MAX_EVENTS_PER_POLL"} {
 		os.Unsetenv(k)
 	}
 
@@ -113,5 +114,11 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	}
 	if cfg.LeaseNamespace != "ai-remediator" {
 		t.Errorf("expected leaseNamespace ai-remediator, got %s", cfg.LeaseNamespace)
+	}
+	if cfg.DedupeTTLSec != 300 {
+		t.Errorf("expected dedupeTTLSec 300, got %d", cfg.DedupeTTLSec)
+	}
+	if cfg.MaxEventsPerPoll != 10 {
+		t.Errorf("expected maxEventsPerPoll 10, got %d", cfg.MaxEventsPerPoll)
 	}
 }

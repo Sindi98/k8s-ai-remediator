@@ -25,6 +25,13 @@ type AgentConfig struct {
 	LeaseName            string
 	LeaseNamespace       string
 	MinSeverity          string
+	// DedupeTTLSec suppresses repeated decisions for the same
+	// (namespace, kind, name, reason) signal within the given window.
+	// Prevents event storms (e.g. flaky readiness probes) from saturating Ollama.
+	DedupeTTLSec int
+	// MaxEventsPerPoll caps how many Warning events trigger an Ollama
+	// call per poll cycle; excess events are skipped and picked up next poll.
+	MaxEventsPerPoll int
 }
 
 // LoadFromEnv reads agent configuration from environment variables.
@@ -47,6 +54,8 @@ func LoadFromEnv() AgentConfig {
 		LeaseName:            Getenv("LEASE_NAME", "ai-remediator-leader"),
 		LeaseNamespace:       Getenv("LEASE_NAMESPACE", "ai-remediator"),
 		MinSeverity:          Getenv("MIN_SEVERITY", "medium"),
+		DedupeTTLSec:         Getint("DEDUPE_TTL_SECONDS", 300),
+		MaxEventsPerPoll:     Getint("MAX_EVENTS_PER_POLL", 10),
 	}
 }
 

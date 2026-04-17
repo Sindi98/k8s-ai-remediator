@@ -311,6 +311,8 @@ Tutte le variabili sono lette da environment (tipicamente via ConfigMap).
 | `OLLAMA_MODEL` | `qwen2.5:14b` | Nome del modello LLM (deve corrispondere a `ollama list`) |
 | `DRY_RUN` | `false` | Se `true`, logga le decisioni senza applicare remediation |
 | `POLL_INTERVAL_SECONDS` | `30` | Intervallo di polling degli eventi (secondi) |
+| `DEDUPE_TTL_SECONDS` | `300` | TTL di deduplicazione per `(ns, kind, name, reason)`: eventi identici entro la finestra non generano una nuova chiamata LLM |
+| `MAX_EVENTS_PER_POLL` | `10` | Numero massimo di eventi che attivano una chiamata LLM per ciclo di polling; gli eccessi sono rinviati al polling successivo |
 
 ### Variabili di policy
 
