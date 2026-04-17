@@ -557,17 +557,36 @@ L'agente dovrebbe rilevare l'evento Warning, analizzarlo, e decidere una remedia
 ## Scenari di errore
 
 La directory `scenarios/` contiene manifest pronti per riprodurre guasti tipici
-a tre livelli di severita. Sono utili per validare il comportamento dell'agente
+a quattro livelli di severita. Sono utili per validare il comportamento dell'agente
 in condizioni diverse e per stimolare decisioni dell'LLM coerenti con la policy.
 
 | Severita | Manifest | Reason evento | Comportamento atteso |
 |----------|----------|---------------|----------------------|
+| **Basso** | `scenarios/low-readiness-flaky.yaml` | `Unhealthy` | `noop` / `inspect_pod_logs` |
 | **Medio** | `scenarios/medium-imagepullbackoff.yaml` | `Failed`, `ErrImagePull`, `ImagePullBackOff` | `mark_for_manual_fix` / `ask_human` (o `set_deployment_image` se `ALLOW_IMAGE_UPDATES=true` e confidenza sopra soglia) |
 | **Critico** | `scenarios/critical-oomkilled.yaml` | `BackOff`, `OOMKilling` | `inspect_pod_logs` / `ask_human` |
 | **Grave** | `scenarios/severe-failedscheduling.yaml` | `FailedScheduling` | `mark_for_manual_fix` / `ask_human` |
 
 Tutti gli scenari presuppongono il namespace `incident-lab` gia creato (vedi
 [Laboratorio di test](#laboratorio-di-test)).
+
+### Scenario basso — Readiness probe flaky
+
+Il container gira correttamente ma la readiness probe fallisce in modo
+intermittente (cicli 20s ready / 10s non-ready). Ogni fallimento produce un
+evento Warning `Unhealthy`.
+
+```bash
+kubectl apply -f scenarios/low-readiness-flaky.yaml
+kubectl -n incident-lab get pods -l scenario=low -w
+kubectl -n incident-lab get events --field-selector reason=Unhealthy --sort-by=.metadata.creationTimestamp | tail
+```
+
+**Impatto**: solo rumore nei log/eventi e occasionale rimozione dagli endpoints.
+Nessun crash, nessun restart.
+**Perche basso**: segnale debole che puo indicare una probe troppo stringente
+o flakiness da investigare senza urgenza. Una remediation invasiva (restart,
+delete) sarebbe una reazione eccessiva.
 
 ### Scenario medio — ImagePullBackOff
 
@@ -621,6 +640,7 @@ cluster o cambio di profilo hardware.
 ### Pulizia
 
 ```bash
+kubectl delete -f scenarios/low-readiness-flaky.yaml --ignore-not-found
 kubectl delete -f scenarios/medium-imagepullbackoff.yaml --ignore-not-found
 kubectl delete -f scenarios/critical-oomkilled.yaml --ignore-not-found
 kubectl delete -f scenarios/severe-failedscheduling.yaml --ignore-not-found
