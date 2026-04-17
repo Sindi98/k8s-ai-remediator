@@ -137,9 +137,16 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 		"minSeverity", string(minSev),
 		"allowImageUpdates", cfg.AllowImageUpdates,
 		"imageUpdateThreshold", cfg.ImageUpdateThreshold,
+		"allowPatchProbe", cfg.AllowPatchProbe,
+		"allowPatchResources", cfg.AllowPatchResources,
+		"allowPatchRegistry", cfg.AllowPatchRegistry,
+		"patchConfidenceThreshold", cfg.PatchConfidenceThreshold,
+		"dedupeTTLSec", cfg.DedupeTTLSec,
+		"maxEventsPerPoll", cfg.MaxEventsPerPoll,
 		"podLogTailLines", cfg.PodLogTailLines,
 		"ollamaRPS", cfg.OllamaRPS,
 		"metricsAddr", cfg.MetricsAddr,
+		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry",
 	)
 
 	ticker := time.NewTicker(time.Duration(cfg.PollSec) * time.Second)
@@ -189,6 +196,13 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 			if strings.EqualFold(e.InvolvedObject.Kind, "Pod") {
 				if depName, err := kube.ResolveDeploymentFromPod(pollCtx, cs, e.Namespace, e.InvolvedObject.Name); err == nil {
 					extra = "Resolved owner deployment: " + depName + "\n" + kube.DeploymentSnapshot(pollCtx, cs, e.Namespace, depName)
+					dedupKind = "Deployment"
+					dedupName = depName
+				} else if depName, ok := kube.InferDeploymentFromPodName(pollCtx, cs, e.Namespace, e.InvolvedObject.Name); ok {
+					// Pod is gone; rely on the naming convention so stale
+					// events from rolled-over ReplicaSets still collapse into
+					// a single dedup key.
+					extra = "Inferred owner deployment from pod name: " + depName + "\n" + kube.DeploymentSnapshot(pollCtx, cs, e.Namespace, depName)
 					dedupKind = "Deployment"
 					dedupName = depName
 				}
