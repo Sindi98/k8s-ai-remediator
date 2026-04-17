@@ -190,6 +190,9 @@ func AllowedAction(a model.Action) bool {
 		model.ActionScaleDeployment,
 		model.ActionInspectPodLogs,
 		model.ActionSetDeploymentImage,
+		model.ActionPatchProbe,
+		model.ActionPatchResources,
+		model.ActionPatchRegistry,
 		model.ActionMarkForManualFix,
 		model.ActionAskHuman:
 		return true

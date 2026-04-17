@@ -7,6 +7,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -271,6 +272,225 @@ func TestChooseContainerForLogs(t *testing.T) {
 	}
 	if got := ChooseContainerForLogs(pod, "nonexistent"); got != "app" {
 		t.Errorf("expected app, got %s", got)
+	}
+}
+
+// newPatchableCluster returns a fake cluster with a deployment that opts in
+// to all patch_* scopes, suitable for exercising patch_probe, patch_resources
+// and patch_registry end-to-end.
+func newPatchableCluster(scopes string) *fake.Clientset {
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "app", Namespace: "default",
+			Annotations: map[string]string{AllowPatchAnnotation: scopes},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "app"}},
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name:  "main",
+						Image: "wrong.registry.io/myrepo/app:v1.2.3",
+						ReadinessProbe: &corev1.Probe{
+							InitialDelaySeconds: 0,
+							PeriodSeconds:       5,
+							FailureThreshold:    1,
+							TimeoutSeconds:      1,
+						},
+					}},
+				},
+			},
+		},
+	}
+	return fake.NewSimpleClientset(dep)
+}
+
+func TestDeploymentAllowsPatch(t *testing.T) {
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{AllowPatchAnnotation: "probe, resources"},
+		},
+	}
+	if !DeploymentAllowsPatch(dep, "probe") {
+		t.Error("probe should be allowed")
+	}
+	if !DeploymentAllowsPatch(dep, "resources") {
+		t.Error("resources should be allowed")
+	}
+	if DeploymentAllowsPatch(dep, "registry") {
+		t.Error("registry should not be allowed")
+	}
+
+	dep.Annotations[AllowPatchAnnotation] = "*"
+	if !DeploymentAllowsPatch(dep, "registry") {
+		t.Error("wildcard should allow any scope")
+	}
+
+	dep.Annotations = nil
+	if DeploymentAllowsPatch(dep, "probe") {
+		t.Error("missing annotation should block all patches")
+	}
+	if DeploymentAllowsPatch(nil, "probe") {
+		t.Error("nil deployment should not allow patch")
+	}
+}
+
+func TestPatchDeploymentProbe(t *testing.T) {
+	cs := newPatchableCluster("probe")
+	ctx := context.Background()
+
+	err := PatchDeploymentProbe(ctx, cs, "default", "app", "main", "readiness",
+		map[string]string{
+			"initial_delay_seconds": "10",
+			"failure_threshold":     "5",
+		}, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "app", metav1.GetOptions{})
+	p := dep.Spec.Template.Spec.Containers[0].ReadinessProbe
+	if p.InitialDelaySeconds != 10 || p.FailureThreshold != 5 {
+		t.Errorf("expected probe fields updated, got initial=%d failure=%d",
+			p.InitialDelaySeconds, p.FailureThreshold)
+	}
+}
+
+func TestPatchDeploymentProbe_RequiresOptIn(t *testing.T) {
+	cs := newPatchableCluster("resources")
+	ctx := context.Background()
+
+	err := PatchDeploymentProbe(ctx, cs, "default", "app", "main", "readiness",
+		map[string]string{"initial_delay_seconds": "10"}, false)
+	if err == nil || !strings.Contains(err.Error(), "opt in") {
+		t.Errorf("expected opt-in error, got %v", err)
+	}
+}
+
+func TestPatchDeploymentProbe_InvalidInputs(t *testing.T) {
+	cs := newPatchableCluster("probe")
+	ctx := context.Background()
+
+	// Out of bounds
+	if err := PatchDeploymentProbe(ctx, cs, "default", "app", "main", "readiness",
+		map[string]string{"initial_delay_seconds": "999999"}, false); err == nil {
+		t.Error("expected out-of-bounds error")
+	}
+	// Unknown probe type
+	if err := PatchDeploymentProbe(ctx, cs, "default", "app", "main", "startup",
+		map[string]string{"initial_delay_seconds": "10"}, false); err == nil {
+		t.Error("expected error for unknown probe type")
+	}
+	// No fields
+	if err := PatchDeploymentProbe(ctx, cs, "default", "app", "main", "readiness",
+		map[string]string{}, false); err == nil {
+		t.Error("expected error for empty fields")
+	}
+	// Unknown field
+	if err := PatchDeploymentProbe(ctx, cs, "default", "app", "main", "readiness",
+		map[string]string{"httpGet_path": "/"}, false); err == nil {
+		t.Error("expected error for unknown field")
+	}
+}
+
+func TestPatchDeploymentResources(t *testing.T) {
+	cs := newPatchableCluster("resources")
+	ctx := context.Background()
+
+	err := PatchDeploymentResources(ctx, cs, "default", "app", "main",
+		map[string]string{
+			"cpu_request":    "100m",
+			"memory_request": "128Mi",
+			"memory_limit":   "256Mi",
+		}, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "app", metav1.GetOptions{})
+	r := dep.Spec.Template.Spec.Containers[0].Resources
+	if r.Requests[corev1.ResourceCPU] != resource.MustParse("100m") {
+		t.Errorf("expected cpu_request=100m, got %s", r.Requests.Cpu())
+	}
+	if r.Limits[corev1.ResourceMemory] != resource.MustParse("256Mi") {
+		t.Errorf("expected memory_limit=256Mi, got %s", r.Limits.Memory())
+	}
+}
+
+func TestPatchDeploymentResources_RequestExceedsLimit(t *testing.T) {
+	cs := newPatchableCluster("resources")
+	ctx := context.Background()
+
+	err := PatchDeploymentResources(ctx, cs, "default", "app", "main",
+		map[string]string{
+			"memory_request": "512Mi",
+			"memory_limit":   "256Mi",
+		}, false)
+	if err == nil || !strings.Contains(err.Error(), "exceeds limit") {
+		t.Errorf("expected requests > limits error, got %v", err)
+	}
+}
+
+func TestPatchDeploymentResources_OutOfBounds(t *testing.T) {
+	cs := newPatchableCluster("resources")
+	ctx := context.Background()
+
+	if err := PatchDeploymentResources(ctx, cs, "default", "app", "main",
+		map[string]string{"memory_request": "64Gi"}, false); err == nil {
+		t.Error("expected out-of-bounds error on huge memory request")
+	}
+	if err := PatchDeploymentResources(ctx, cs, "default", "app", "main",
+		map[string]string{"cpu_request": "1m"}, false); err == nil {
+		t.Error("expected out-of-bounds error on tiny cpu request")
+	}
+}
+
+func TestSwapRegistry(t *testing.T) {
+	cases := []struct {
+		image, registry, want string
+	}{
+		{"wrong.registry.io/repo/app:v1", "host.docker.internal:5050", "host.docker.internal:5050/repo/app:v1"},
+		{"nginx:1.25", "host.docker.internal:5050", "host.docker.internal:5050/nginx:1.25"},
+		{"localhost:5000/foo:bar", "host.docker.internal:5050", "host.docker.internal:5050/foo:bar"},
+		{"library/nginx:1.25", "host.docker.internal:5050", "host.docker.internal:5050/library/nginx:1.25"},
+	}
+	for _, c := range cases {
+		got, err := SwapRegistry(c.image, c.registry)
+		if err != nil {
+			t.Errorf("SwapRegistry(%q,%q) err=%v", c.image, c.registry, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("SwapRegistry(%q,%q)=%q want %q", c.image, c.registry, got, c.want)
+		}
+	}
+}
+
+func TestPatchDeploymentRegistry(t *testing.T) {
+	cs := newPatchableCluster("registry")
+	ctx := context.Background()
+
+	err := PatchDeploymentRegistry(ctx, cs, "default", "app", "main", "host.docker.internal:5050", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "app", metav1.GetOptions{})
+	got := dep.Spec.Template.Spec.Containers[0].Image
+	want := "host.docker.internal:5050/myrepo/app:v1.2.3"
+	if got != want {
+		t.Errorf("expected image %q, got %q", want, got)
+	}
+}
+
+func TestPatchDeploymentRegistry_NoChange(t *testing.T) {
+	cs := newPatchableCluster("registry")
+	ctx := context.Background()
+	// Same registry as the container already uses -> should error
+	err := PatchDeploymentRegistry(ctx, cs, "default", "app", "main", "wrong.registry.io", false)
+	if err == nil || !strings.Contains(err.Error(), "no change") {
+		t.Errorf("expected no-change error, got %v", err)
 	}
 }
 

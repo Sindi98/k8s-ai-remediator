@@ -116,6 +116,33 @@ func TestValidateOCIImage(t *testing.T) {
 	}
 }
 
+func TestMaybeBlockUnsafePatch(t *testing.T) {
+	enabled := PatchFlags{AllowProbe: true, AllowResources: true, AllowRegistry: true, Threshold: 0.9}
+	disabled := PatchFlags{Threshold: 0.9}
+
+	// Non-patch actions always pass
+	if err := MaybeBlockUnsafePatch(model.Decision{Action: model.ActionNoop}, disabled); err != nil {
+		t.Errorf("noop should not be blocked: %v", err)
+	}
+
+	// Disabled flag blocks
+	for _, a := range []model.Action{model.ActionPatchProbe, model.ActionPatchResources, model.ActionPatchRegistry} {
+		if err := MaybeBlockUnsafePatch(model.Decision{Action: a, Confidence: 0.99}, disabled); err == nil {
+			t.Errorf("%s should be blocked when flag is off", a)
+		}
+	}
+
+	// Below threshold blocks
+	if err := MaybeBlockUnsafePatch(model.Decision{Action: model.ActionPatchProbe, Confidence: 0.5}, enabled); err == nil {
+		t.Error("expected block below threshold")
+	}
+
+	// Enabled + above threshold passes
+	if err := MaybeBlockUnsafePatch(model.Decision{Action: model.ActionPatchProbe, Confidence: 0.95}, enabled); err != nil {
+		t.Errorf("expected pass, got %v", err)
+	}
+}
+
 func TestMaybeBlockUnsafeImageUpdate_InvalidOCI(t *testing.T) {
 	d := model.Decision{
 		Action:     model.ActionSetDeploymentImage,
@@ -138,9 +165,18 @@ func TestBuildPrompt_ContainsFields(t *testing.T) {
 
 func TestBuildPrompt_GuidesOnReadinessProbes(t *testing.T) {
 	p := BuildPrompt("ns1", "Pod", "my-pod", "Warning", "Unhealthy", "Readiness probe failed", "")
-	for _, expected := range []string{"Unhealthy", "probe", "inspect_pod_logs"} {
+	for _, expected := range []string{"Unhealthy", "probe", "inspect_pod_logs", "patch_probe"} {
 		if !strings.Contains(p, expected) {
 			t.Errorf("prompt should contain %q to guide the LLM on probe failures", expected)
+		}
+	}
+}
+
+func TestBuildPrompt_DocumentsPatchActions(t *testing.T) {
+	p := BuildPrompt("ns1", "Pod", "my-pod", "Warning", "BackOff", "", "")
+	for _, expected := range []string{"patch_probe", "patch_resources", "patch_registry", "new_registry", "cpu_request", "memory_limit"} {
+		if !strings.Contains(p, expected) {
+			t.Errorf("prompt should document patch action %q", expected)
 		}
 	}
 }

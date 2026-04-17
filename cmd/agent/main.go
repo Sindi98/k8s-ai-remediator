@@ -35,6 +35,14 @@ func executeDecision(
 	if err := policy.MaybeBlockUnsafeImageUpdate(d, cfg.AllowImageUpdates, cfg.ImageUpdateThreshold); err != nil {
 		return err
 	}
+	if err := policy.MaybeBlockUnsafePatch(d, policy.PatchFlags{
+		AllowProbe:     cfg.AllowPatchProbe,
+		AllowResources: cfg.AllowPatchResources,
+		AllowRegistry:  cfg.AllowPatchRegistry,
+		Threshold:      cfg.PatchConfidenceThreshold,
+	}); err != nil {
+		return err
+	}
 
 	switch d.Action {
 	case model.ActionNoop, model.ActionAskHuman, model.ActionMarkForManualFix:
@@ -73,6 +81,33 @@ func executeDecision(
 			return err
 		}
 		return kube.SetDeploymentImage(ctx, cs, d.Namespace, depName, d.Parameters["image"], d.Parameters["container"], cfg.DryRun)
+
+	case model.ActionPatchProbe:
+		depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName, d.Parameters)
+		if err != nil {
+			return err
+		}
+		fields := map[string]string{}
+		for _, k := range []string{"initial_delay_seconds", "period_seconds", "failure_threshold", "success_threshold", "timeout_seconds"} {
+			if v := strings.TrimSpace(d.Parameters[k]); v != "" {
+				fields[k] = v
+			}
+		}
+		return kube.PatchDeploymentProbe(ctx, cs, d.Namespace, depName, d.Parameters["container"], d.Parameters["probe"], fields, cfg.DryRun)
+
+	case model.ActionPatchResources:
+		depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName, d.Parameters)
+		if err != nil {
+			return err
+		}
+		return kube.PatchDeploymentResources(ctx, cs, d.Namespace, depName, d.Parameters["container"], d.Parameters, cfg.DryRun)
+
+	case model.ActionPatchRegistry:
+		depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName, d.Parameters)
+		if err != nil {
+			return err
+		}
+		return kube.PatchDeploymentRegistry(ctx, cs, d.Namespace, depName, d.Parameters["container"], d.Parameters["new_registry"], cfg.DryRun)
 
 	default:
 		return fmt.Errorf("unsupported action")
