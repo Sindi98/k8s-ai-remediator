@@ -325,7 +325,7 @@ Tutte le variabili sono lette da environment (tipicamente via ConfigMap).
 | `ALLOW_PATCH_PROBE` | `false` | Abilita l'azione `patch_probe` (richiede anche annotation `ai-remediator/allow-patch` con scope `probe`) |
 | `ALLOW_PATCH_RESOURCES` | `false` | Abilita l'azione `patch_resources` (scope `resources`) |
 | `ALLOW_PATCH_REGISTRY` | `false` | Abilita l'azione `patch_registry` (scope `registry`) |
-| `PATCH_CONFIDENCE_THRESHOLD` | `0.92` | Confidenza minima per qualsiasi azione `patch_*` |
+| `PATCH_CONFIDENCE_THRESHOLD` | `0.85` | Confidenza minima per qualsiasi azione `patch_*` |
 
 ### Variabili Ollama (resilienza)
 
@@ -380,7 +380,7 @@ consenso:
 2. **Opt-in per Deployment** tramite annotation `ai-remediator/allow-patch: "probe,resources,registry"` (o `"*"` per tutti gli scope).
 
 In piu ogni `patch_*` e bloccato se la confidence dell'LLM e sotto
-`PATCH_CONFIDENCE_THRESHOLD` (default `0.92`).
+`PATCH_CONFIDENCE_THRESHOLD` (default `0.85`).
 
 Esempio di opt-in sul Deployment target:
 

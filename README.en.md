@@ -325,7 +325,7 @@ All variables are read from environment variables (typically via ConfigMap).
 | `ALLOW_PATCH_PROBE` | `false` | Enables the `patch_probe` action (also requires the `ai-remediator/allow-patch` annotation with scope `probe`) |
 | `ALLOW_PATCH_RESOURCES` | `false` | Enables the `patch_resources` action (scope `resources`) |
 | `ALLOW_PATCH_REGISTRY` | `false` | Enables the `patch_registry` action (scope `registry`) |
-| `PATCH_CONFIDENCE_THRESHOLD` | `0.92` | Minimum confidence for any `patch_*` action |
+| `PATCH_CONFIDENCE_THRESHOLD` | `0.85` | Minimum confidence for any `patch_*` action |
 
 ### Ollama Variables (Resilience)
 
@@ -379,7 +379,7 @@ are disabled by default and require a double opt-in:
 2. **Per-Deployment opt-in** via the annotation `ai-remediator/allow-patch: "probe,resources,registry"` (or `"*"` for all scopes).
 
 In addition, every `patch_*` is blocked if the LLM confidence is below
-`PATCH_CONFIDENCE_THRESHOLD` (default `0.92`).
+`PATCH_CONFIDENCE_THRESHOLD` (default `0.85`).
 
 Example opt-in on the target Deployment:
 

@@ -116,6 +116,24 @@ func TestValidateOCIImage(t *testing.T) {
 	}
 }
 
+func TestMaybeBlockRestartOnProbeFailure(t *testing.T) {
+	d := model.Decision{Action: model.ActionRestartDeployment}
+	if err := MaybeBlockRestartOnProbeFailure(d, "Unhealthy"); err == nil {
+		t.Error("expected block when reason=Unhealthy")
+	}
+	if err := MaybeBlockRestartOnProbeFailure(d, "unhealthy"); err == nil {
+		t.Error("case-insensitive match expected")
+	}
+	if err := MaybeBlockRestartOnProbeFailure(d, "BackOff"); err != nil {
+		t.Errorf("restart for BackOff should pass, got %v", err)
+	}
+	// Non-restart actions never blocked.
+	other := model.Decision{Action: model.ActionInspectPodLogs}
+	if err := MaybeBlockRestartOnProbeFailure(other, "Unhealthy"); err != nil {
+		t.Errorf("inspect_pod_logs should pass, got %v", err)
+	}
+}
+
 func TestMaybeBlockUnsafePatch(t *testing.T) {
 	enabled := PatchFlags{AllowProbe: true, AllowResources: true, AllowRegistry: true, Threshold: 0.9}
 	disabled := PatchFlags{Threshold: 0.9}
