@@ -32,6 +32,21 @@ type AgentConfig struct {
 	// MaxEventsPerPoll caps how many Warning events trigger an Ollama
 	// call per poll cycle; excess events are skipped and picked up next poll.
 	MaxEventsPerPoll int
+
+	// AllowPatchProbe enables the patch_probe action that tunes probe
+	// timing fields on a Deployment. Opt-in required also via the
+	// "ai-remediator/allow-patch: probe" annotation on the target Deployment.
+	AllowPatchProbe bool
+	// AllowPatchResources enables the patch_resources action.
+	// Requires the "resources" entry in the allow-patch annotation.
+	AllowPatchResources bool
+	// AllowPatchRegistry enables the patch_registry action that rewrites
+	// the registry prefix of container images.
+	// Requires the "registry" entry in the allow-patch annotation.
+	AllowPatchRegistry bool
+	// PatchConfidenceThreshold gates the three patch_* actions on the
+	// LLM confidence field. Defaults to 0.92.
+	PatchConfidenceThreshold float64
 }
 
 // LoadFromEnv reads agent configuration from environment variables.
@@ -53,9 +68,13 @@ func LoadFromEnv() AgentConfig {
 		LeaderElection:       Getbool("LEADER_ELECTION", false),
 		LeaseName:            Getenv("LEASE_NAME", "ai-remediator-leader"),
 		LeaseNamespace:       Getenv("LEASE_NAMESPACE", "ai-remediator"),
-		MinSeverity:          Getenv("MIN_SEVERITY", "medium"),
-		DedupeTTLSec:         Getint("DEDUPE_TTL_SECONDS", 300),
-		MaxEventsPerPoll:     Getint("MAX_EVENTS_PER_POLL", 10),
+		MinSeverity:              Getenv("MIN_SEVERITY", "medium"),
+		DedupeTTLSec:             Getint("DEDUPE_TTL_SECONDS", 300),
+		MaxEventsPerPoll:         Getint("MAX_EVENTS_PER_POLL", 10),
+		AllowPatchProbe:          Getbool("ALLOW_PATCH_PROBE", false),
+		AllowPatchResources:      Getbool("ALLOW_PATCH_RESOURCES", false),
+		AllowPatchRegistry:       Getbool("ALLOW_PATCH_REGISTRY", false),
+		PatchConfidenceThreshold: Getfloat("PATCH_CONFIDENCE_THRESHOLD", 0.92),
 	}
 }
 

@@ -322,6 +322,10 @@ All variables are read from environment variables (typically via ConfigMap).
 | `SCALE_MAX` | `5` | Maximum allowed replicas |
 | `ALLOW_IMAGE_UPDATES` | `false` | Enables the `set_deployment_image` action |
 | `IMAGE_UPDATE_CONFIDENCE_THRESHOLD` | `0.92` | Minimum confidence to update an image |
+| `ALLOW_PATCH_PROBE` | `false` | Enables the `patch_probe` action (also requires the `ai-remediator/allow-patch` annotation with scope `probe`) |
+| `ALLOW_PATCH_RESOURCES` | `false` | Enables the `patch_resources` action (scope `resources`) |
+| `ALLOW_PATCH_REGISTRY` | `false` | Enables the `patch_registry` action (scope `registry`) |
+| `PATCH_CONFIDENCE_THRESHOLD` | `0.92` | Minimum confidence for any `patch_*` action |
 
 ### Ollama Variables (Resilience)
 
@@ -361,6 +365,39 @@ All variables are read from environment variables (typically via ConfigMap).
 | `delete_and_recreate_pod` | Mutation | Same as above, used when the pod needs to be recreated from scratch |
 | `scale_deployment` | Mutation | Updates `spec.replicas` within `SCALE_MIN`/`SCALE_MAX` bounds |
 | `set_deployment_image` | Mutation | Updates the container image (requires `ALLOW_IMAGE_UPDATES=true`, confidence above threshold, valid OCI image) |
+| `patch_probe` | Mutation (patch) | Tunes readiness/liveness probe timing fields (`initialDelaySeconds`, `periodSeconds`, `failureThreshold`, `successThreshold`, `timeoutSeconds`). Never the probe handler |
+| `patch_resources` | Mutation (patch) | Updates CPU/memory `requests`/`limits` of a container within fixed bounds |
+| `patch_registry` | Mutation (patch) | Rewrites only the registry prefix of the image, preserving path and tag |
+
+### Controlled Deployment patches (new)
+
+The three `patch_*` actions let the agent fix common misconfigurations
+(overly strict probe, undersized requests/limits, wrong registry). They
+are disabled by default and require a double opt-in:
+
+1. **Global feature flag** via env var (`ALLOW_PATCH_PROBE`, `ALLOW_PATCH_RESOURCES`, `ALLOW_PATCH_REGISTRY`).
+2. **Per-Deployment opt-in** via the annotation `ai-remediator/allow-patch: "probe,resources,registry"` (or `"*"` for all scopes).
+
+In addition, every `patch_*` is blocked if the LLM confidence is below
+`PATCH_CONFIDENCE_THRESHOLD` (default `0.92`).
+
+Example opt-in on the target Deployment:
+
+```bash
+kubectl -n myns annotate deployment myapp \
+  ai-remediator/allow-patch="probe,resources"
+```
+
+Parameters expected from the LLM for each action:
+
+- `patch_probe`: `deployment_name`, `container`, `probe` (`readiness`|`liveness`), at least one of `initial_delay_seconds`, `period_seconds`, `failure_threshold`, `success_threshold`, `timeout_seconds`.
+- `patch_resources`: `deployment_name`, `container`, at least one of `cpu_request`, `memory_request`, `cpu_limit`, `memory_limit` (Kubernetes quantities).
+- `patch_registry`: `deployment_name`, `container`, `new_registry` (e.g. `host.docker.internal:5050`).
+
+Probe numeric fields are validated against fixed bounds (e.g.
+`period_seconds` in `[1, 300]`), resource quantities against `[10m, 8]`
+CPU and `[16Mi, 16Gi]` memory, and image references are rebuilt
+preserving path+tag.
 
 ### Container Selection Logic for Logs
 

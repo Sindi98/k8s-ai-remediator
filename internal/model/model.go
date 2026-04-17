@@ -57,6 +57,9 @@ const (
 	ActionScaleDeployment    Action = "scale_deployment"
 	ActionInspectPodLogs     Action = "inspect_pod_logs"
 	ActionSetDeploymentImage Action = "set_deployment_image"
+	ActionPatchProbe         Action = "patch_probe"
+	ActionPatchResources     Action = "patch_resources"
+	ActionPatchRegistry      Action = "patch_registry"
 	ActionMarkForManualFix   Action = "mark_for_manual_fix"
 	ActionAskHuman           Action = "ask_human"
 )
@@ -66,7 +69,8 @@ func AllActions() []Action {
 	return []Action{
 		ActionNoop, ActionRestartDeployment, ActionDeleteFailedPod,
 		ActionDeleteAndRecreate, ActionScaleDeployment, ActionInspectPodLogs,
-		ActionSetDeploymentImage, ActionMarkForManualFix, ActionAskHuman,
+		ActionSetDeploymentImage, ActionPatchProbe, ActionPatchResources,
+		ActionPatchRegistry, ActionMarkForManualFix, ActionAskHuman,
 	}
 }
 

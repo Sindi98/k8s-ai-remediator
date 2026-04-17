@@ -10,6 +10,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/tuo-user/k8s-ai-remediator/internal/config"
+	"github.com/tuo-user/k8s-ai-remediator/internal/kube"
 	"github.com/tuo-user/k8s-ai-remediator/internal/model"
 )
 
@@ -167,5 +168,147 @@ func TestExecuteDecision_UnsupportedAction(t *testing.T) {
 	d := model.Decision{Action: model.Action("unknown_action"), Namespace: "default"}
 	if err := executeDecision(context.Background(), cs, d, defaultCfg()); err == nil {
 		t.Error("expected error for unsupported action")
+	}
+}
+
+func newPatchableClusterForAgent(t *testing.T, scopes string) *fake.Clientset {
+	t.Helper()
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "app", Namespace: "default",
+			Annotations: map[string]string{kube.AllowPatchAnnotation: scopes},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "app"}},
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name:  "main",
+						Image: "wrong.registry.io/repo/app:v1",
+						ReadinessProbe: &corev1.Probe{
+							PeriodSeconds:    5,
+							FailureThreshold: 1,
+							TimeoutSeconds:   1,
+						},
+					}},
+				},
+			},
+		},
+	}
+	return fake.NewSimpleClientset(dep)
+}
+
+func patchFlagsCfg() config.AgentConfig {
+	c := defaultCfg()
+	c.AllowPatchProbe = true
+	c.AllowPatchResources = true
+	c.AllowPatchRegistry = true
+	c.PatchConfidenceThreshold = 0.9
+	return c
+}
+
+func TestExecuteDecision_PatchProbe_FlagOffBlocked(t *testing.T) {
+	cs := newPatchableClusterForAgent(t, "probe")
+	d := model.Decision{
+		Action: model.ActionPatchProbe, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 0.95,
+		Parameters: map[string]string{
+			"container": "main", "probe": "readiness",
+			"initial_delay_seconds": "10",
+		},
+	}
+	if err := executeDecision(context.Background(), cs, d, defaultCfg()); err == nil {
+		t.Error("patch_probe should be blocked when ALLOW_PATCH_PROBE is off")
+	}
+}
+
+func TestExecuteDecision_PatchProbe_BelowThresholdBlocked(t *testing.T) {
+	cs := newPatchableClusterForAgent(t, "probe")
+	d := model.Decision{
+		Action: model.ActionPatchProbe, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 0.5,
+		Parameters: map[string]string{
+			"container": "main", "probe": "readiness",
+			"initial_delay_seconds": "10",
+		},
+	}
+	if err := executeDecision(context.Background(), cs, d, patchFlagsCfg()); err == nil {
+		t.Error("patch_probe should be blocked below confidence threshold")
+	}
+}
+
+func TestExecuteDecision_PatchProbe_AnnotationRequired(t *testing.T) {
+	// Deployment without the opt-in annotation scope for probe.
+	cs := newPatchableClusterForAgent(t, "resources")
+	d := model.Decision{
+		Action: model.ActionPatchProbe, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 0.95,
+		Parameters: map[string]string{
+			"container": "main", "probe": "readiness",
+			"initial_delay_seconds": "10",
+		},
+	}
+	if err := executeDecision(context.Background(), cs, d, patchFlagsCfg()); err == nil {
+		t.Error("patch_probe should require opt-in annotation")
+	}
+}
+
+func TestExecuteDecision_PatchProbe_HappyPath(t *testing.T) {
+	cs := newPatchableClusterForAgent(t, "probe")
+	ctx := context.Background()
+	d := model.Decision{
+		Action: model.ActionPatchProbe, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 0.95,
+		Parameters: map[string]string{
+			"container": "main", "probe": "readiness",
+			"initial_delay_seconds": "10",
+			"timeout_seconds":       "5",
+		},
+	}
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "app", metav1.GetOptions{})
+	p := dep.Spec.Template.Spec.Containers[0].ReadinessProbe
+	if p.InitialDelaySeconds != 10 || p.TimeoutSeconds != 5 {
+		t.Errorf("probe fields not applied: %+v", p)
+	}
+}
+
+func TestExecuteDecision_PatchResources_HappyPath(t *testing.T) {
+	cs := newPatchableClusterForAgent(t, "resources")
+	ctx := context.Background()
+	d := model.Decision{
+		Action: model.ActionPatchResources, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 0.95,
+		Parameters: map[string]string{
+			"container":      "main",
+			"memory_request": "64Mi",
+			"memory_limit":   "128Mi",
+		},
+	}
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestExecuteDecision_PatchRegistry_HappyPath(t *testing.T) {
+	cs := newPatchableClusterForAgent(t, "registry")
+	ctx := context.Background()
+	d := model.Decision{
+		Action: model.ActionPatchRegistry, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 0.95,
+		Parameters: map[string]string{
+			"container":    "main",
+			"new_registry": "host.docker.internal:5050",
+		},
+	}
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "app", metav1.GetOptions{})
+	if got := dep.Spec.Template.Spec.Containers[0].Image; got != "host.docker.internal:5050/repo/app:v1" {
+		t.Errorf("unexpected image %q", got)
 	}
 }

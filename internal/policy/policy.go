@@ -28,6 +28,40 @@ func MaybeBlockUnsafeImageUpdate(d model.Decision, allowImageUpdates bool, thres
 	return nil
 }
 
+// PatchFlags groups the enable flags for the three patch_* actions so
+// callers can pass them around atomically.
+type PatchFlags struct {
+	AllowProbe     bool
+	AllowResources bool
+	AllowRegistry  bool
+	Threshold      float64
+}
+
+// MaybeBlockUnsafePatch enforces the global feature flag and the confidence
+// threshold for the three patch_* actions. The per-Deployment opt-in
+// annotation is checked separately inside the kube package because it
+// requires reading the Deployment.
+func MaybeBlockUnsafePatch(d model.Decision, flags PatchFlags) error {
+	var enabled bool
+	switch d.Action {
+	case model.ActionPatchProbe:
+		enabled = flags.AllowProbe
+	case model.ActionPatchResources:
+		enabled = flags.AllowResources
+	case model.ActionPatchRegistry:
+		enabled = flags.AllowRegistry
+	default:
+		return nil
+	}
+	if !enabled {
+		return fmt.Errorf("%s disabled by policy", d.Action)
+	}
+	if d.Confidence < flags.Threshold {
+		return fmt.Errorf("%s blocked: confidence %.2f below threshold %.2f", d.Action, d.Confidence, flags.Threshold)
+	}
+	return nil
+}
+
 var (
 	controlCharRe    = regexp.MustCompile(`[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]`)
 	injectionPattern = regexp.MustCompile(`(?i)(ignore previous instructions|ignore all instructions|disregard above|system:\s|you are now|forget everything|new instructions:)`)
@@ -83,7 +117,7 @@ Object name: %s
 %s
 
 Rules:
-- Allowed actions: noop,restart_deployment,delete_failed_pod,delete_and_recreate_pod,scale_deployment,inspect_pod_logs,set_deployment_image,mark_for_manual_fix,ask_human
+- Allowed actions: noop,restart_deployment,delete_failed_pod,delete_and_recreate_pod,scale_deployment,inspect_pod_logs,set_deployment_image,patch_probe,patch_resources,patch_registry,mark_for_manual_fix,ask_human
 - Severity must be one of: critical, high, medium, low, info
 - For critical and high severity incidents, take immediate remediation action when confident
 - For medium severity incidents, attempt remediation if a safe action is available (e.g. restart, delete_and_recreate_pod, inspect_pod_logs)
@@ -96,7 +130,11 @@ Rules:
 - Use set_deployment_image only if parameters.image contains a concrete image string
 - Use mark_for_manual_fix when the image problem cannot be resolved safely from the event alone
 - If using inspect_pod_logs on a multi-container pod, include parameters.container when possible
-- Readiness or liveness probe failures (reason Unhealthy) without a crash indicate a probe misconfiguration or a flaky dependency: a deployment restart will not fix them, so prefer inspect_pod_logs and classify as low severity unless the pod has also restarted many times
-- When the action targets a Deployment, set parameters.deployment_name so the agent can act even if the specific pod no longer exists`,
+- Readiness or liveness probe failures (reason Unhealthy) without a crash indicate a probe misconfiguration or a flaky dependency: prefer patch_probe when the event clearly points to a timing issue (initialDelay too low, timeout too short), otherwise inspect_pod_logs; do not use restart_deployment for probe-only failures
+- When the action targets a Deployment, set parameters.deployment_name so the agent can act even if the specific pod no longer exists
+- patch_probe tunes probe timing only. Required parameters: deployment_name, container, probe (readiness|liveness), and at least one of initial_delay_seconds, period_seconds, failure_threshold, success_threshold, timeout_seconds. Do not rewrite the probe handler (exec/httpGet/tcpSocket)
+- patch_resources adjusts CPU/memory requests and limits. Required parameters: deployment_name, container, and at least one of cpu_request, memory_request, cpu_limit, memory_limit. Use Kubernetes quantity strings (e.g. "250m", "512Mi"). Prefer this for OOMKilled signals
+- patch_registry rewrites only the registry host of the container image, keeping the path and tag. Required parameters: deployment_name, container, new_registry (e.g. "host.docker.internal:5050"). Prefer this for ErrImagePull/ErrImageNeverPull caused by a wrong registry prefix
+- patch_* actions require a high-confidence read of the event (>= 0.92) and an opt-in annotation on the target Deployment; if either is unlikely, prefer mark_for_manual_fix`,
 		etype, reason, message, ns, kind, name, extra)
 }
