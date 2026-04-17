@@ -589,7 +589,9 @@ func InspectPodLogs(ctx context.Context, cs kubernetes.Interface, ns, kind, name
 	return nil
 }
 
-// DeploymentToText produces a human-readable summary of a deployment.
+// DeploymentToText produces a human-readable summary of a deployment,
+// including probe timing and the patch opt-in annotation so the LLM can
+// pick between inspect_pod_logs and a concrete patch_* action.
 func DeploymentToText(dep *appsv1.Deployment) string {
 	if dep == nil {
 		return ""
@@ -605,12 +607,41 @@ func DeploymentToText(dep *appsv1.Deployment) string {
 		replicas = *dep.Spec.Replicas
 	}
 
-	return fmt.Sprintf(
+	out := fmt.Sprintf(
 		"Deployment snapshot: name=%s replicas=%d containers=%s",
 		dep.Name,
 		replicas,
 		strings.Join(containers, ";"),
 	)
+
+	// Surface the patch opt-in so the LLM knows which patch_* actions are
+	// unlocked on this specific Deployment.
+	if v := strings.TrimSpace(dep.Annotations[AllowPatchAnnotation]); v != "" {
+		out += fmt.Sprintf("\nAllow-patch scopes (opt-in via annotation): %s", v)
+	} else {
+		out += "\nAllow-patch scopes (opt-in via annotation): none"
+	}
+
+	// Emit current probe timings so the LLM can propose incremental changes
+	// (e.g. double failureThreshold) without guessing blindly.
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		for probeName, p := range map[string]*corev1.Probe{
+			"readinessProbe": c.ReadinessProbe,
+			"livenessProbe":  c.LivenessProbe,
+		} {
+			if p == nil {
+				continue
+			}
+			out += fmt.Sprintf(
+				"\nContainer %s %s: initialDelay=%d period=%d failureThreshold=%d successThreshold=%d timeout=%d",
+				c.Name, probeName,
+				p.InitialDelaySeconds, p.PeriodSeconds,
+				p.FailureThreshold, p.SuccessThreshold, p.TimeoutSeconds,
+			)
+		}
+	}
+
+	return out
 }
 
 // DeploymentSnapshot fetches and formats a deployment summary.
