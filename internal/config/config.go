@@ -56,6 +56,19 @@ type AgentConfig struct {
 	// PatchConfidenceThreshold gates the three patch_* actions on the
 	// LLM confidence field. Defaults to 0.85.
 	PatchConfidenceThreshold float64
+
+	// NotifySMTPHost, Port, User, Password, From, To configure the SMTP
+	// notifier that emails a short report after every executeDecision.
+	// If host/user/to are empty the notifier is disabled (no-op).
+	NotifySMTPHost     string
+	NotifySMTPPort     int
+	NotifySMTPUser     string
+	NotifySMTPPassword string
+	NotifyFrom         string
+	NotifyTo           string
+	// NotifyMinSeverity filters which decisions trigger an email.
+	// Uses the same severity vocabulary as MinSeverity. Defaults to "medium".
+	NotifyMinSeverity string
 }
 
 // LoadFromEnv reads agent configuration from environment variables.
@@ -86,6 +99,13 @@ func LoadFromEnv() AgentConfig {
 		AllowPatchResources:      Getbool("ALLOW_PATCH_RESOURCES", false),
 		AllowPatchRegistry:       Getbool("ALLOW_PATCH_REGISTRY", false),
 		PatchConfidenceThreshold: Getfloat("PATCH_CONFIDENCE_THRESHOLD", 0.85),
+		NotifySMTPHost:           Getenv("NOTIFY_SMTP_HOST", ""),
+		NotifySMTPPort:           Getint("NOTIFY_SMTP_PORT", 587),
+		NotifySMTPUser:           Getenv("NOTIFY_SMTP_USER", ""),
+		NotifySMTPPassword:       Getenv("NOTIFY_SMTP_PASSWORD", ""),
+		NotifyFrom:               Getenv("NOTIFY_FROM", ""),
+		NotifyTo:                 Getenv("NOTIFY_TO", ""),
+		NotifyMinSeverity:        Getenv("NOTIFY_MIN_SEVERITY", "medium"),
 	}
 }
 

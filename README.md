@@ -17,6 +17,7 @@ Agente AI in Go che osserva eventi Kubernetes di tipo `Warning` e applica remedi
   - [2. Installazione dell'agente](#2-installazione-dellagente)
 - [Configurazione](#configurazione)
 - [Remediation supportate](#remediation-supportate)
+- [Notifiche email](#notifiche-email)
 - [Osservabilita](#osservabilita)
 - [Sicurezza](#sicurezza)
 - [Alta disponibilita (Leader Election)](#alta-disponibilita-leader-election)
@@ -419,6 +420,162 @@ Nei pod multi-container, `inspect_pod_logs` seleziona il container:
 1. Usa il container specificato nei parametri, se presente e valido
 2. Altrimenti sceglie il container con il maggior numero di restart
 3. Come fallback, usa il primo container nella spec
+
+---
+
+## Notifiche email
+
+L'agente puo inviare via SMTP una breve email dopo ogni `executeDecision`,
+con il quadro "situazione anomala -> decisione presa -> situazione post
+intervento". Va bene per cluster di test con carico moderato; non e pensato
+per volumi di produzione (un'email per decisione).
+
+Tre pattern supportati senza modifiche al codice:
+
+1. **Self-notification iCloud**: usi il tuo Apple ID sia come mittente che
+   come destinatario (ti mandi gli alert a te stesso). Non serve creare
+   altri account.
+2. **Account bot Gmail** dedicato: un indirizzo separato per l'agente,
+   gli alert vanno a un indirizzo operativo.
+3. **Servizio transazionale** (Resend / Mailgun / Postmark): cambia solo
+   host e credenziali, il codice resta lo stesso.
+
+### Setup con iCloud Mail (pattern 1 o 2)
+
+Genera una **password app-specific** per il tuo Apple ID
+(<https://account.apple.com> → Accesso e Sicurezza → Password specifiche
+per app). **Importante**: non incollarla in chat o in repository; applicala
+solo come Secret sul cluster.
+
+Placeholder usati sotto: sostituisci `alerts-bot@icloud.com` con il tuo
+Apple ID reale e `ops-alerts@example.com` con la casella dove vuoi
+ricevere gli alert (puo essere lo stesso indirizzo per self-notification).
+
+```bash
+# Crea il Secret con le credenziali (password app-specific appena generata)
+kubectl -n ai-remediator create secret generic ai-remediator-notify \
+  --from-literal=NOTIFY_SMTP_USER='alerts-bot@icloud.com' \
+  --from-literal=NOTIFY_SMTP_PASSWORD='xxxx-xxxx-xxxx-xxxx'
+
+# Solo host/porta/destinatari nella ConfigMap (non-segreti)
+kubectl -n ai-remediator patch configmap ai-remediator-config \
+  --type=merge -p '{"data":{
+    "NOTIFY_SMTP_HOST":"smtp.mail.me.com",
+    "NOTIFY_SMTP_PORT":"587",
+    "NOTIFY_FROM":"alerts-bot@icloud.com",
+    "NOTIFY_TO":"ops-alerts@example.com",
+    "NOTIFY_MIN_SEVERITY":"medium"
+  }}'
+
+# Monta il Secret come envFrom (si somma alla ConfigMap gia presente)
+kubectl -n ai-remediator patch deployment ai-remediator --type='json' -p='[
+  {"op":"add","path":"/spec/template/spec/containers/0/envFrom/-","value":
+    {"secretRef":{"name":"ai-remediator-notify"}}}
+]'
+
+kubectl -n ai-remediator rollout restart deployment/ai-remediator
+```
+
+### Setup con Gmail (alternativa)
+
+Crea un account dedicato (es. `ai-remediator-bot@gmail.com`), attiva 2FA,
+genera una App Password (<https://myaccount.google.com/apppasswords>) e
+cambia solo host e utente:
+
+```bash
+kubectl -n ai-remediator create secret generic ai-remediator-notify \
+  --from-literal=NOTIFY_SMTP_USER='ai-remediator-bot@gmail.com' \
+  --from-literal=NOTIFY_SMTP_PASSWORD='xxxxxxxxxxxxxxxx'
+
+kubectl -n ai-remediator patch configmap ai-remediator-config \
+  --type=merge -p '{"data":{
+    "NOTIFY_SMTP_HOST":"smtp.gmail.com",
+    "NOTIFY_SMTP_PORT":"587",
+    "NOTIFY_FROM":"ai-remediator-bot@gmail.com",
+    "NOTIFY_TO":"ops-alerts@example.com",
+    "NOTIFY_MIN_SEVERITY":"medium"
+  }}'
+```
+
+Il Deployment patch e il rollout restart sono identici al caso iCloud.
+
+### Variabili di configurazione
+
+| Variabile | Default | Descrizione |
+|-----------|---------|-------------|
+| `NOTIFY_SMTP_HOST` | *(vuoto)* | Host SMTP (es. `smtp.mail.me.com`, `smtp.gmail.com`). Vuoto → notifier disattivato (no-op) |
+| `NOTIFY_SMTP_PORT` | `587` | Porta SMTP con STARTTLS |
+| `NOTIFY_SMTP_USER` | *(vuoto)* | Username SMTP (di solito email completa). Vuoto → notifier disattivato |
+| `NOTIFY_SMTP_PASSWORD` | *(vuoto)* | Password app-specific |
+| `NOTIFY_FROM` | = `NOTIFY_SMTP_USER` | Mittente visibile nell'email |
+| `NOTIFY_TO` | *(vuoto)* | Destinatario. Vuoto → notifier disattivato. Puo coincidere con `NOTIFY_FROM` (self-notification) |
+| `NOTIFY_MIN_SEVERITY` | `medium` | Invia email solo per decisioni a severita >= di questa. Valori: `critical`, `high`, `medium`, `low`, `info` |
+
+Se uno qualsiasi tra `HOST`, `USER`, `TO` e vuoto, il notifier non prova
+nemmeno a connettersi: il log allo startup mostra `notify: SMTP not
+configured, notifications disabled`.
+
+### Tuning della verbosita
+
+| Use case | `NOTIFY_MIN_SEVERITY` | Frequenza tipica |
+|----------|-------------------|------------------|
+| Solo emergenze (prod) | `critical` | Rara |
+| Produzione normale | `high` | Alcune al giorno per cluster sano |
+| Test/demo (default) | `medium` | Una ogni scenario attivo |
+| Debug verboso | `low` | Fino a una ogni 5 min per ogni `(deployment, reason)` — la dedup TTL rate-limita |
+| Tutto | `info` | Include azioni `noop` dell'LLM |
+
+A parita di `NOTIFY_MIN_SEVERITY`, la dedup di segnale (TTL
+`DEDUPE_TTL_SECONDS`) limita comunque il traffico: non ricevi piu di una
+mail per `(ns, Deployment, reason)` dentro la finestra.
+
+### Verifica setup
+
+```bash
+# Dopo il rollout restart, la riga deve riportare tutti i campi valorizzati
+kubectl -n ai-remediator logs deploy/ai-remediator --tail=30 \
+  | grep 'notify: SMTP configured'
+```
+
+Output atteso:
+```
+notify: SMTP configured host=smtp.mail.me.com port=587 from=alerts-bot@icloud.com to=ops-alerts@example.com minSeverity=medium
+```
+
+Se vedi invece `notify: SMTP not configured, notifications disabled`, il
+Secret non e stato montato: controlla `envFrom` del Deployment con
+`kubectl -n ai-remediator get deployment ai-remediator -o jsonpath='{.spec.template.spec.containers[0].envFrom}'`.
+
+### Corpo dell'email
+
+Plain text con tre blocchi:
+
+```
+Situazione anomala
+  Namespace: incident-lab
+  Kind: Pod
+  Name: memory-hog-xxxx
+  Reason: BackOff
+  Message: ...
+  Severity: high
+
+Decisione presa
+  Action: patch_resources
+  Probable cause: ...
+  Summary: ...
+  Confidence: 1.00
+  Parameters:
+    container: app
+    memory_limit: 256Mi
+    memory_request: 128Mi
+
+Situazione post intervento
+  Azione applicata con successo.
+```
+
+Se `executeDecision` fallisce (guard o errore Kubernetes), il terzo blocco
+mostra `Azione non applicata. Errore: <testo>`. L'invio e fire-and-forget
+con timeout di 30s e non blocca il poll loop.
 
 ---
 

@@ -22,6 +22,7 @@ import (
 	"github.com/tuo-user/k8s-ai-remediator/internal/kube"
 	"github.com/tuo-user/k8s-ai-remediator/internal/metrics"
 	"github.com/tuo-user/k8s-ai-remediator/internal/model"
+	"github.com/tuo-user/k8s-ai-remediator/internal/notify"
 	"github.com/tuo-user/k8s-ai-remediator/internal/ollama"
 	"github.com/tuo-user/k8s-ai-remediator/internal/policy"
 )
@@ -127,7 +128,7 @@ func executeDecision(
 
 // runLoop executes the main event polling loop. It returns when the parent
 // context is cancelled (e.g. on SIGTERM), allowing for graceful shutdown.
-func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder) {
+func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder, notifier notify.Notifier) {
 	seen := map[string]bool{}
 
 	// Signal dedup: suppresses identical (ns|kind|name|reason) within a TTL.
@@ -308,10 +309,24 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 				continue
 			}
 
-			if err := executeDecision(pollCtx, cs, d, cfg, e.Reason, extra); err != nil {
+			execErr := executeDecision(pollCtx, cs, d, cfg, e.Reason, extra)
+			if execErr != nil {
 				m.ExecutionErrors.Add(1)
-				slog.Error("execute decision failed", "action", d.Action, "error", err)
+				slog.Error("execute decision failed", "action", d.Action, "error", execErr)
 			}
+
+			// Fire-and-forget notification so SMTP latency never blocks
+			// the poll loop. The notifier filters on NOTIFY_MIN_SEVERITY
+			// and silently skips when SMTP is not configured.
+			notifier.NotifyDecision(pollCtx, notify.DecisionResult{
+				Namespace:    e.Namespace,
+				Kind:         e.InvolvedObject.Kind,
+				Name:         e.InvolvedObject.Name,
+				EventReason:  e.Reason,
+				EventMessage: e.Message,
+				Decision:     d,
+				ExecutionErr: execErr,
+			})
 		}
 	}
 
@@ -352,6 +367,16 @@ func main() {
 	ollamaClient := ollama.NewClient(cfg.BaseURL, cfg.Model, cfg.OllamaRPS, cfg.OllamaMaxRetries, cfg.OllamaTLSSkipVerify, cfg.OllamaHTTPTimeoutSec)
 	m := metrics.New()
 
+	notifier := notify.New(notify.SMTPConfig{
+		Host:        cfg.NotifySMTPHost,
+		Port:        cfg.NotifySMTPPort,
+		User:        cfg.NotifySMTPUser,
+		Password:    cfg.NotifySMTPPassword,
+		From:        cfg.NotifyFrom,
+		To:          cfg.NotifyTo,
+		MinSeverity: model.ParseSeverity(cfg.NotifyMinSeverity),
+	})
+
 	// Start metrics server in background
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", m.Handler())
@@ -371,7 +396,7 @@ func main() {
 	defer stop()
 
 	run := func(ctx context.Context) {
-		runLoop(ctx, cs, ollamaClient, cfg, m)
+		runLoop(ctx, cs, ollamaClient, cfg, m, notifier)
 	}
 
 	if cfg.LeaderElection {
