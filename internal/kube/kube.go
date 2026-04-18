@@ -178,12 +178,12 @@ func ScaleDeployment(ctx context.Context, cs kubernetes.Interface, ns, name stri
 }
 
 // SetDeploymentImage updates a container's image in the deployment spec.
+// Rejects no-op updates (proposed image equals current) since they cannot
+// fix transient pull failures and waste a rollout: in those cases the LLM
+// should pick delete_failed_pod or restart_deployment instead.
 func SetDeploymentImage(ctx context.Context, cs kubernetes.Interface, ns, name, image, container string, dryRun bool) error {
 	if strings.TrimSpace(image) == "" {
 		return fmt.Errorf("image parameter is required")
-	}
-	if dryRun {
-		return nil
 	}
 
 	dep, err := cs.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
@@ -207,6 +207,14 @@ func SetDeploymentImage(ctx context.Context, cs kubernetes.Interface, ns, name, 
 			return fmt.Errorf("deployment has no containers")
 		}
 		idx = 0
+	}
+
+	if dep.Spec.Template.Spec.Containers[idx].Image == image {
+		return fmt.Errorf("set_deployment_image is a no-op: container %q already runs %q; for transient pull failures use delete_failed_pod or restart_deployment", dep.Spec.Template.Spec.Containers[idx].Name, image)
+	}
+
+	if dryRun {
+		return nil
 	}
 
 	dep.Spec.Template.Spec.Containers[idx].Image = image
