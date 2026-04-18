@@ -429,28 +429,43 @@ summarising "anomaly detected -> decision taken -> post-intervention
 status". Good for small test clusters; not meant for production-scale
 volume (one email per decision).
 
-### Setup with iCloud Mail
+Three supported patterns, all via the same code:
+
+1. **iCloud self-notification**: your Apple ID is both sender and recipient.
+   Nothing else to create.
+2. **Dedicated Gmail bot**: a separate address for the agent, alerts routed
+   to an ops mailbox.
+3. **Transactional provider** (Resend / Mailgun / Postmark): only host and
+   credentials change.
+
+### Setup with iCloud Mail (patterns 1 or 2)
 
 Generate an **app-specific password** for your Apple ID
-(<https://account.apple.com> → Security → App-specific passwords). Then:
+(<https://account.apple.com> → Sign-In & Security → App-specific
+passwords). **Important**: never paste this password into chat or into a
+repository; apply it only as a cluster Secret.
+
+Placeholders below: replace `alerts-bot@icloud.com` with your actual Apple
+ID and `ops-alerts@example.com` with the mailbox where you want the
+alerts (it can be the same address for self-notification).
 
 ```bash
-# Create the Secret with credentials (never put them in the ConfigMap)
+# Create the Secret with credentials (freshly generated app-specific password)
 kubectl -n ai-remediator create secret generic ai-remediator-notify \
-  --from-literal=NOTIFY_SMTP_USER='you@icloud.com' \
+  --from-literal=NOTIFY_SMTP_USER='alerts-bot@icloud.com' \
   --from-literal=NOTIFY_SMTP_PASSWORD='xxxx-xxxx-xxxx-xxxx'
 
-# Add only host/port/recipients to the ConfigMap (non-secrets)
+# Only host/port/recipients in the ConfigMap (non-secret)
 kubectl -n ai-remediator patch configmap ai-remediator-config \
   --type=merge -p '{"data":{
     "NOTIFY_SMTP_HOST":"smtp.mail.me.com",
     "NOTIFY_SMTP_PORT":"587",
-    "NOTIFY_FROM":"you@icloud.com",
-    "NOTIFY_TO":"recipient@icloud.com",
+    "NOTIFY_FROM":"alerts-bot@icloud.com",
+    "NOTIFY_TO":"ops-alerts@example.com",
     "NOTIFY_MIN_SEVERITY":"medium"
   }}'
 
-# Mount the Secret as extra env in the Deployment
+# Mount the Secret as envFrom (in addition to the existing ConfigMap)
 kubectl -n ai-remediator patch deployment ai-remediator --type='json' -p='[
   {"op":"add","path":"/spec/template/spec/containers/0/envFrom/-","value":
     {"secretRef":{"name":"ai-remediator-notify"}}}
@@ -459,21 +474,75 @@ kubectl -n ai-remediator patch deployment ai-remediator --type='json' -p='[
 kubectl -n ai-remediator rollout restart deployment/ai-remediator
 ```
 
+### Setup with Gmail (alternative)
+
+Create a dedicated account (e.g. `ai-remediator-bot@gmail.com`), enable 2FA,
+generate an App Password (<https://myaccount.google.com/apppasswords>), and
+only change host and username:
+
+```bash
+kubectl -n ai-remediator create secret generic ai-remediator-notify \
+  --from-literal=NOTIFY_SMTP_USER='ai-remediator-bot@gmail.com' \
+  --from-literal=NOTIFY_SMTP_PASSWORD='xxxxxxxxxxxxxxxx'
+
+kubectl -n ai-remediator patch configmap ai-remediator-config \
+  --type=merge -p '{"data":{
+    "NOTIFY_SMTP_HOST":"smtp.gmail.com",
+    "NOTIFY_SMTP_PORT":"587",
+    "NOTIFY_FROM":"ai-remediator-bot@gmail.com",
+    "NOTIFY_TO":"ops-alerts@example.com",
+    "NOTIFY_MIN_SEVERITY":"medium"
+  }}'
+```
+
+The Deployment patch and rollout restart are identical to the iCloud case.
+
 ### Configuration variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NOTIFY_SMTP_HOST` | *(empty)* | SMTP host. Empty → notifier disabled (no-op) |
-| `NOTIFY_SMTP_PORT` | `587` | SMTP port (STARTTLS) |
-| `NOTIFY_SMTP_USER` | *(empty)* | SMTP username. Empty → notifier disabled |
-| `NOTIFY_SMTP_PASSWORD` | *(empty)* | Password / app-specific password |
+| `NOTIFY_SMTP_HOST` | *(empty)* | SMTP host (e.g. `smtp.mail.me.com`, `smtp.gmail.com`). Empty → notifier disabled (no-op) |
+| `NOTIFY_SMTP_PORT` | `587` | SMTP port with STARTTLS |
+| `NOTIFY_SMTP_USER` | *(empty)* | SMTP username (usually the full email). Empty → notifier disabled |
+| `NOTIFY_SMTP_PASSWORD` | *(empty)* | App-specific password |
 | `NOTIFY_FROM` | = `NOTIFY_SMTP_USER` | Sender visible in the email |
-| `NOTIFY_TO` | *(empty)* | Recipient. Empty → notifier disabled |
-| `NOTIFY_MIN_SEVERITY` | `medium` | Only send email for decisions at or above this severity |
+| `NOTIFY_TO` | *(empty)* | Recipient. Empty → notifier disabled. May equal `NOTIFY_FROM` (self-notification) |
+| `NOTIFY_MIN_SEVERITY` | `medium` | Only send email for decisions at or above this severity. Values: `critical`, `high`, `medium`, `low`, `info` |
 
 If any of `HOST`, `USER`, `TO` is empty the notifier does not even attempt
 to connect: the startup log prints `notify: SMTP not configured,
 notifications disabled`.
+
+### Tuning verbosity
+
+| Use case | `NOTIFY_MIN_SEVERITY` | Typical frequency |
+|----------|----------------------|-------------------|
+| Emergencies only (prod) | `critical` | Rare |
+| Normal production | `high` | A few a day on a healthy cluster |
+| Test/demo (default) | `medium` | One per active scenario |
+| Verbose debug | `low` | Up to one every 5 min per `(deployment, reason)` — dedup TTL throttles |
+| Everything | `info` | Includes LLM `noop` decisions |
+
+At any `NOTIFY_MIN_SEVERITY`, signal dedup (TTL `DEDUPE_TTL_SECONDS`) keeps
+traffic under control: you never receive more than one email per
+`(ns, Deployment, reason)` within the window.
+
+### Setup verification
+
+```bash
+# After the rollout restart, the line must report every field populated
+kubectl -n ai-remediator logs deploy/ai-remediator --tail=30 \
+  | grep 'notify: SMTP configured'
+```
+
+Expected output:
+```
+notify: SMTP configured host=smtp.mail.me.com port=587 from=alerts-bot@icloud.com to=ops-alerts@example.com minSeverity=medium
+```
+
+If you see `notify: SMTP not configured, notifications disabled` instead,
+the Secret was not mounted: check the Deployment `envFrom` with
+`kubectl -n ai-remediator get deployment ai-remediator -o jsonpath='{.spec.template.spec.containers[0].envFrom}'`.
 
 ### Email body
 
