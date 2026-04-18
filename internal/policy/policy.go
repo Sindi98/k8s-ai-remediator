@@ -170,9 +170,9 @@ Rules:
 - If the incident mentions CrashLoopBackOff, you may use inspect_pod_logs first, but if the pod is managed by a Deployment and the issue looks recoverable, prefer restart_deployment over delete_and_recreate_pod (the specific pod name from the event may no longer exist)
 - Use delete_and_recreate_pod only for standalone pods not managed by a Deployment
 - If a pod is failed or stuck and managed by a Deployment, use restart_deployment
-- If the issue mentions ImagePullBackOff or ErrImagePull, do not invent an image name
-- Use set_deployment_image only if parameters.image contains a concrete image string
-- Use mark_for_manual_fix when the image problem cannot be resolved safely from the event alone
+- If the issue mentions ImagePullBackOff, ErrImagePull or "Failed to pull image", do not invent an image name
+- HARD RULE: never propose set_deployment_image with the SAME image already present in the Deployment snapshot containers list. It is a no-op (the rollout would re-create pods that hit the same pull failure) and the agent will reject it. For transient pull failures (network blip, registry rate-limit on a previously-working image) PICK delete_failed_pod or restart_deployment to retry the pull. Use set_deployment_image only when proposing a DIFFERENT, concrete and safe replacement image.
+- Use mark_for_manual_fix when the image problem cannot be resolved safely from the event alone (e.g. tag truly does not exist anywhere)
 - If using inspect_pod_logs on a multi-container pod, include parameters.container when possible
 - HARD RULE: if the event reason is Unhealthy (readiness or liveness probe failure) and the pod is not crashing, NEVER pick restart_deployment. A rolling restart spawns a new pod that immediately hits the same probe misconfiguration. If the Deployment snapshot reports "Allow-patch scopes" containing "probe" or "*", PICK patch_probe DIRECTLY (do not fall back to inspect_pod_logs; the logs will not reveal a probe timing problem). Read the current probe values from the snapshot and propose new, MORE PERMISSIVE integer values. Typical safe choices: failure_threshold=5, period_seconds=10 or 15, timeout_seconds=5. If the snapshot reports "Allow-patch scopes: none", fall back to inspect_pod_logs or mark_for_manual_fix
 - Every patch_probe parameter value MUST be a plain decimal integer string. Good: "5", "15". BAD: "x5", "2x", "+3", "5s", "5 seconds". Do NOT write expressions or multipliers; compute the final integer yourself and emit only that

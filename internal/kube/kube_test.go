@@ -271,6 +271,19 @@ func TestSetDeploymentImage_EmptyImage(t *testing.T) {
 	}
 }
 
+func TestSetDeploymentImage_NoopRejected(t *testing.T) {
+	cs := newFakeCluster(t) // container "app" already runs "nginx:1.25"
+	err := SetDeploymentImage(context.Background(), cs, "default", "web", "nginx:1.25", "app", false)
+	if err == nil || !strings.Contains(err.Error(), "no-op") {
+		t.Errorf("expected no-op error when proposed image equals current, got %v", err)
+	}
+	// Sanity: same image with dry-run also rejected (we want the signal, not the apply).
+	err = SetDeploymentImage(context.Background(), cs, "default", "web", "nginx:1.25", "app", true)
+	if err == nil || !strings.Contains(err.Error(), "no-op") {
+		t.Errorf("expected no-op error in dry-run too, got %v", err)
+	}
+}
+
 func TestSetDeploymentImage_ContainerNotFound(t *testing.T) {
 	cs := newFakeCluster(t)
 	if err := SetDeploymentImage(context.Background(), cs, "default", "web", "nginx:1.26", "nonexistent", false); err == nil {
