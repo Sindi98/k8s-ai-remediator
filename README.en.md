@@ -265,7 +265,7 @@ kubectl create configmap ai-remediator-config \
   --from-literal=OLLAMA_MODEL=qwen2.5:14b \
   --from-literal=DRY_RUN=false \
   --from-literal=POLL_INTERVAL_SECONDS=30 \
-  --from-literal=MIN_SEVERITY=medium \
+  --from-literal=MIN_SEVERITY=low \
   --from-literal=SCALE_MIN=1 \
   --from-literal=SCALE_MAX=5 \
   --from-literal=ALLOW_IMAGE_UPDATES=true \
