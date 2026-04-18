@@ -17,6 +17,7 @@ AI agent written in Go that watches Kubernetes `Warning` events and applies cont
   - [2. Installing the Agent](#2-installing-the-agent)
 - [Configuration](#configuration)
 - [Supported Remediations](#supported-remediations)
+- [Email notifications](#email-notifications)
 - [Observability](#observability)
 - [Security](#security)
 - [High Availability (Leader Election)](#high-availability-leader-election)
@@ -418,6 +419,92 @@ In multi-container pods, `inspect_pod_logs` selects the container:
 1. Uses the container specified in parameters, if present and valid
 2. Otherwise selects the container with the highest restart count
 3. Falls back to the first container in the spec
+
+---
+
+## Email notifications
+
+The agent can send a short email over SMTP after each `executeDecision`,
+summarising "anomaly detected -> decision taken -> post-intervention
+status". Good for small test clusters; not meant for production-scale
+volume (one email per decision).
+
+### Setup with iCloud Mail
+
+Generate an **app-specific password** for your Apple ID
+(<https://account.apple.com> → Security → App-specific passwords). Then:
+
+```bash
+# Create the Secret with credentials (never put them in the ConfigMap)
+kubectl -n ai-remediator create secret generic ai-remediator-notify \
+  --from-literal=NOTIFY_SMTP_USER='you@icloud.com' \
+  --from-literal=NOTIFY_SMTP_PASSWORD='xxxx-xxxx-xxxx-xxxx'
+
+# Add only host/port/recipients to the ConfigMap (non-secrets)
+kubectl -n ai-remediator patch configmap ai-remediator-config \
+  --type=merge -p '{"data":{
+    "NOTIFY_SMTP_HOST":"smtp.mail.me.com",
+    "NOTIFY_SMTP_PORT":"587",
+    "NOTIFY_FROM":"you@icloud.com",
+    "NOTIFY_TO":"recipient@icloud.com",
+    "NOTIFY_MIN_SEVERITY":"medium"
+  }}'
+
+# Mount the Secret as extra env in the Deployment
+kubectl -n ai-remediator patch deployment ai-remediator --type='json' -p='[
+  {"op":"add","path":"/spec/template/spec/containers/0/envFrom/-","value":
+    {"secretRef":{"name":"ai-remediator-notify"}}}
+]'
+
+kubectl -n ai-remediator rollout restart deployment/ai-remediator
+```
+
+### Configuration variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NOTIFY_SMTP_HOST` | *(empty)* | SMTP host. Empty → notifier disabled (no-op) |
+| `NOTIFY_SMTP_PORT` | `587` | SMTP port (STARTTLS) |
+| `NOTIFY_SMTP_USER` | *(empty)* | SMTP username. Empty → notifier disabled |
+| `NOTIFY_SMTP_PASSWORD` | *(empty)* | Password / app-specific password |
+| `NOTIFY_FROM` | = `NOTIFY_SMTP_USER` | Sender visible in the email |
+| `NOTIFY_TO` | *(empty)* | Recipient. Empty → notifier disabled |
+| `NOTIFY_MIN_SEVERITY` | `medium` | Only send email for decisions at or above this severity |
+
+If any of `HOST`, `USER`, `TO` is empty the notifier does not even attempt
+to connect: the startup log prints `notify: SMTP not configured,
+notifications disabled`.
+
+### Email body
+
+Plain text with three blocks:
+
+```
+Situazione anomala
+  Namespace: incident-lab
+  Kind: Pod
+  Name: memory-hog-xxxx
+  Reason: BackOff
+  Message: ...
+  Severity: high
+
+Decisione presa
+  Action: patch_resources
+  Probable cause: ...
+  Summary: ...
+  Confidence: 1.00
+  Parameters:
+    container: app
+    memory_limit: 256Mi
+    memory_request: 128Mi
+
+Situazione post intervento
+  Azione applicata con successo.
+```
+
+If `executeDecision` fails (guard block or Kubernetes error), the third
+block reads `Azione non applicata. Errore: <text>`. Sending is
+fire-and-forget with a 30s timeout and never blocks the poll loop.
 
 ---
 
