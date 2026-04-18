@@ -84,7 +84,7 @@ Effect: the container moves from `memory_limit=32Mi` to `memory_limit=256Mi`.
 `polinux/stress` completes the 256MB allocation without OOM → pod `Running`.
 
 ### severe-failedscheduling (patch_resources or abstention)
-With opt-in enabled you expect:
+With opt-in enabled (`ai-remediator/allow-patch=resources`) you expect:
 ```json
 {
   "action": "patch_resources",
@@ -99,11 +99,36 @@ With opt-in enabled you expect:
   }
 }
 ```
+Effect: the impossible requests (`cpu=500, memory=500Gi`) get replaced with
+schedulable values. The pod moves from `Pending` to `Running`.
+
 Note: the validator enforces bounds `[10m, 8]` CPU and `[16Mi, 16Gi]` memory.
 Proposed values outside those bounds are rejected with `quantity outside bounds`.
 
 Without the opt-in: `mark_for_manual_fix` — the agent correctly abstains
 because it cannot infer sensible values for a generic workload.
+
+Active guards for this scenario (event reason `FailedScheduling`):
+- `MaybeBlockWrongActionOnFailedScheduling` rejects `scale_deployment` and
+  `restart_deployment` (scaling down doesn't help a single pod with
+  impossible requests; restarting doesn't either).
+
+## Dedup, caps and timeouts: what to expect in the logs
+
+With the full configuration (dedup TTL 300s, cap 10 events/poll,
+OLLAMA_HTTP_TIMEOUT_SECONDS=360, POLL_CONTEXT_TIMEOUT_SECONDS=480):
+
+- Only one `decision` per `(Deployment, reason)` every ~5 minutes: repetitions
+  of the same signal within the TTL are counted as `EventsSkipped`.
+- Each Ollama call can take 100-300s with qwen2.5:14b on CPU. If you see
+  `Client.Timeout exceeded while awaiting headers`, raise
+  `OLLAMA_HTTP_TIMEOUT_SECONDS`. If you see `context deadline exceeded`
+  (without `Client.Timeout`), raise `POLL_CONTEXT_TIMEOUT_SECONDS` (must
+  stay > `OLLAMA_HTTP_TIMEOUT_SECONDS`).
+- When a guard blocks an action you don't see a crash but a clear
+  `execute decision failed` line with the error (e.g.
+  `restart_deployment blocked: event reason=Unhealthy`). The dedup TTL
+  prevents the same signal from retrying for 5 minutes.
 
 ## Usage
 
