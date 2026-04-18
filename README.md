@@ -25,6 +25,7 @@ Agente AI in Go che osserva eventi Kubernetes di tipo `Warning` e applica remedi
 - [Scenari di errore](#scenari-di-errore)
 - [Sviluppo](#sviluppo)
 - [Comandi di verifica](#comandi-di-verifica)
+- [Troubleshooting](#troubleshooting)
 - [Reset ambiente](#reset-ambiente)
 
 ---
@@ -484,14 +485,21 @@ kubectl -n ai-remediator expose deployment ai-remediator \
 
 ### Livelli di protezione
 
-1. **Allowlist delle azioni**: solo le 9 azioni predefinite sono accettate; qualsiasi altra viene rifiutata
+1. **Allowlist delle azioni**: solo le 12 azioni predefinite sono accettate; qualsiasi altra viene rifiutata
 2. **Dry-run mode**: con `DRY_RUN=true` nessuna modifica viene applicata al cluster
-3. **Policy bounds**: `scale_deployment` vincolato a `SCALE_MIN`/`SCALE_MAX`
-4. **Confidence threshold**: `set_deployment_image` bloccato sotto la soglia configurata
-5. **Validazione OCI**: le immagini dal LLM vengono validate contro il formato OCI standard
-6. **Sanitizzazione prompt**: i messaggi degli eventi Kubernetes vengono sanitizzati prima di essere inviati all'LLM (rimozione caratteri di controllo, pattern di prompt injection, troncamento)
-7. **Container distroless**: l'immagine non ha shell, file system minimo, utente non-root
-8. **Rate limiting**: previene il sovraccarico di Ollama durante storm di eventi
+3. **Policy bounds**: `scale_deployment` vincolato a `SCALE_MIN`/`SCALE_MAX`; `patch_resources` ai bounds `[10m, 8]` CPU e `[16Mi, 16Gi]` memoria; `patch_probe` ai bounds per campo (`failureThreshold` 1-20, `periodSeconds` 1-300, ...)
+4. **Confidence threshold**: `set_deployment_image` bloccato sotto `IMAGE_UPDATE_CONFIDENCE_THRESHOLD` (default 0.92); le tre azioni `patch_*` sotto `PATCH_CONFIDENCE_THRESHOLD` (default 0.85)
+5. **Feature flag per azione rischiosa**: `ALLOW_IMAGE_UPDATES`, `ALLOW_PATCH_PROBE`, `ALLOW_PATCH_RESOURCES`, `ALLOW_PATCH_REGISTRY` — tutte `false` di default
+6. **Opt-in per Deployment** per le azioni `patch_*`: richiesta la annotation `ai-remediator/allow-patch` con gli scope (`probe`, `resources`, `registry`, `*`)
+7. **Guardie contro remediation controproducenti** (bloccano decisioni dell'LLM che non risolverebbero la causa e sprechero cicli):
+   - `restart_deployment` bloccato su eventi `Unhealthy` (probe misconfiguration non si risolve con un restart)
+   - `restart_deployment` bloccato se `PodStatusSummary` mostra `OOMKilled` o `exit=137` (memoria insufficiente non si risolve con un restart)
+   - `scale_deployment` e `restart_deployment` bloccati su eventi `FailedScheduling` (risorse impossibili non si risolvono scalando)
+8. **Validazione OCI**: le immagini dal LLM vengono validate contro il formato OCI standard
+9. **Sanitizzazione prompt**: i messaggi degli eventi Kubernetes vengono sanitizzati prima di essere inviati all'LLM (rimozione caratteri di controllo, pattern di prompt injection, troncamento)
+10. **Container distroless**: l'immagine non ha shell, file system minimo, utente non-root
+11. **Rate limiting**: previene il sovraccarico di Ollama durante storm di eventi
+12. **Deduplicazione per segnale**: collassa gli eventi `(ns, Deployment, reason)` in un'unica chiamata LLM per `DEDUPE_TTL_SECONDS` (default 300s); cap `MAX_EVENTS_PER_POLL` (default 10)
 
 ### Protezione da prompt injection
 
@@ -499,6 +507,48 @@ I campi `reason`, `message` e `extra` degli eventi Kubernetes sono sanitizzati p
 - Caratteri di controllo rimossi (tranne `\n` e `\t`)
 - Pattern di injection comuni redatti: "ignore previous instructions", "disregard above", "system:", "forget everything", "new instructions:"
 - Campi troncati a 2000 caratteri (500 per reason)
+
+### Flusso di decisione
+
+Per ogni evento Warning l'agente segue questo flusso deterministico:
+
+```
+Evento Kubernetes (Warning)
+        |
+        v
+Dedup per (ns, Deployment|Pod, reason) con TTL
+        |  (skip se gia processato nello stesso TTL)
+        v
+Cap per poll (MAX_EVENTS_PER_POLL)
+        |
+        v
+Costruzione prompt:
+  - evento sanitizzato
+  - Deployment snapshot: replicas, containers, Allow-patch scopes, probe timings
+  - PodStatusSummary: fase pod, container state, lastTerminated reason/exit
+  - HARD RULES specifiche per ogni reason
+        |
+        v
+Chiamata Ollama con response schema JSON
+        |  (rate-limited a OLLAMA_RPS, retry su 5xx, timeout OLLAMA_HTTP_TIMEOUT_SECONDS)
+        v
+Decision validata: allowlist azioni, severity, confidence
+        |
+        v
+Policy guards:
+  - MaybeBlockUnsafeImageUpdate       (confidence >= soglia, OCI valida, flag on)
+  - MaybeBlockUnsafePatch             (patch_*: flag on, confidence >= soglia)
+  - MaybeBlockRestartOnProbeFailure   (event=Unhealthy)
+  - MaybeBlockRestartOnOOMKilled      (extra contiene OOMKilled/exit=137)
+  - MaybeBlockWrongActionOnFailedScheduling (event=FailedScheduling)
+        |
+        v
+Esecuzione (in dry-run-off) o log-only (in dry-run-on):
+  - patch_* leggono la annotation del Deployment per ulteriore opt-in
+  - parametri numerici validati contro bounds per campo/risorsa
+```
+
+Se il guard rifiuta la decisione, l'agente emette un `execute decision failed` visibile e la dedup TTL rate-limita nuovi tentativi sullo stesso segnale per `DEDUPE_TTL_SECONDS`, evitando loop.
 
 ---
 
@@ -841,6 +891,75 @@ kubectl -n ai-remediator create configmap ai-remediator-config \
 # Restart per applicare le modifiche
 kubectl -n ai-remediator rollout restart deployment/ai-remediator
 ```
+
+---
+
+## Troubleshooting
+
+Sintomi comuni e azioni correttive, riferiti al flusso degli scenari.
+
+### Il pod dell'agente gira, ma non vedo mai `decision` sui miei eventi
+
+Possibili cause:
+1. **Il binario in esecuzione non ha le feature recenti**. Verifica dalla
+   prima riga dopo il restart:
+   ```bash
+   kubectl -n ai-remediator logs deploy/ai-remediator --tail=30 \
+     | grep '"msg":"agent started"' | tail -1 | jq .
+   ```
+   Deve contenere `"buildFeatures":"dedup,infer-dep-from-podname,..."` e
+   valori coerenti per `allowPatchProbe`, `dedupeTTLSec`, eccetera. Se il
+   campo manca, rebuild e push dell'immagine + `rollout restart`.
+2. **La `ConfigMap` manca di una env var** (es. `MIN_SEVERITY=low` mentre
+   gli eventi sono a `medium`): rivedi la sezione "Configurazione".
+3. **Dedup TTL attivo**: ogni segnale viene rivalutato solo dopo
+   `DEDUPE_TTL_SECONDS` (default 5 min). Aspetta, oppure abbassalo.
+
+### `ollama rate limiter: context deadline exceeded`
+
+La richiesta LLM e stata accodata piu a lungo del `pollCtx`. Tipico di
+storm di eventi non deduplicati (pod gia ruotati con nomi differenti).
+Verifica:
+- `"dedupeTTLSec"` e `"maxEventsPerPoll"` siano non-zero nel log `agent started`.
+- La inferenza funzioni: `ResolveDeploymentFromPod` + `InferDeploymentFromPodName`
+  devono convergere tutti i pod fantasma sullo stesso Deployment.
+- In un cluster di test con molti eventi vecchi, aspetta un giro o due: la
+  dedup TTL e il cap drenano la coda.
+
+### `Post "...": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`
+
+Ollama ci mette piu di `OLLAMA_HTTP_TIMEOUT_SECONDS` a rispondere. Sul
+CPU con qwen2.5:14b sono comuni tempi da 100 a 300s. Alza il timeout:
+```bash
+kubectl -n ai-remediator patch configmap ai-remediator-config \
+  --type=merge -p '{"data":{
+    "OLLAMA_HTTP_TIMEOUT_SECONDS":"360",
+    "POLL_CONTEXT_TIMEOUT_SECONDS":"480"
+  }}'
+kubectl -n ai-remediator rollout restart deployment/ai-remediator
+```
+Invariante: `POLL_CONTEXT_TIMEOUT_SECONDS > OLLAMA_HTTP_TIMEOUT_SECONDS`.
+
+### `Post "...": context deadline exceeded` (senza `Client.Timeout`)
+
+Qui sta scadendo il `pollCtx`, non il client HTTP. Alza
+`POLL_CONTEXT_TIMEOUT_SECONDS` (vedi sopra).
+
+### `execute decision failed` con uno dei seguenti messaggi
+
+| Messaggio | Causa | Rimedio |
+|-----------|-------|---------|
+| `set_deployment_image disabled by policy` | `ALLOW_IMAGE_UPDATES=false` | Abilitalo nella ConfigMap se vuoi auto-fix del tag. |
+| `set_deployment_image blocked: confidence X below threshold Y` | LLM non sufficientemente sicuro | Scendi `IMAGE_UPDATE_CONFIDENCE_THRESHOLD` o aspetta un segnale piu chiaro |
+| `set_deployment_image blocked: invalid OCI image reference` | LLM ha inventato un'immagine non valida | Nessuno: rifiuto corretto |
+| `patch_probe disabled by policy` | `ALLOW_PATCH_PROBE=false` | Abilita il flag |
+| `patch_probe blocked: confidence X below threshold Y` | LLM non sicuro | Scendi `PATCH_CONFIDENCE_THRESHOLD` o attendi nuova evidenza |
+| `deployment ... does not opt in to patch_probe (set annotation ai-remediator/allow-patch)` | Manca annotation sul Deployment | `kubectl annotate deployment X ai-remediator/allow-patch=probe` |
+| `probe field "failure_threshold" not an integer: parsing "x5"` | LLM ha emesso un moltiplicatore o espressione | Rifiuto corretto. Attendi il prossimo ciclo; il prompt ora richiede esplicitamente integer puri |
+| `cpu_request: quantity outside bounds` | Valore fuori `[10m, 8]` CPU o `[16Mi, 16Gi]` memoria | Rifiuto corretto. Alza i bounds in codice o fai manual fix |
+| `restart_deployment blocked: event reason=Unhealthy` | L'LLM ha proposto di riavviare un pod con probe flaky | Atteso. Attendi che l'LLM converga su `patch_probe` (se la annotation c'e) |
+| `restart_deployment blocked: pod status shows OOMKilled` | L'LLM ha proposto restart su un OOM | Atteso. Attendi `patch_resources` |
+| `scale_deployment blocked: event reason=FailedScheduling` | L'LLM ha proposto di scalare un pod che chiede troppe risorse | Atteso. Attendi `patch_resources` o `mark_for_manual_fix` |
 
 ---
 
