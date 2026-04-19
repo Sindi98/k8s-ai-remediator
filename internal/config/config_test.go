@@ -69,6 +69,71 @@ func TestGetfloat(t *testing.T) {
 	}
 }
 
+func TestParseCSV(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"", nil},
+		{"   ", nil},
+		{",,, ,", nil},
+		{"ns1", []string{"ns1"}},
+		{"ns1,ns2,ns3", []string{"ns1", "ns2", "ns3"}},
+		{" ns1 , ns2 ,, ns3 ", []string{"ns1", "ns2", "ns3"}},
+	}
+	for _, c := range cases {
+		got := ParseCSV(c.in)
+		if len(got) != len(c.want) {
+			t.Errorf("ParseCSV(%q) = %v, want %v", c.in, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("ParseCSV(%q)[%d] = %q, want %q", c.in, i, got[i], c.want[i])
+			}
+		}
+	}
+}
+
+func TestLoadFromEnv_NamespaceDefaults(t *testing.T) {
+	for _, k := range []string{"INCLUDE_NAMESPACES", "EXCLUDE_NAMESPACES"} {
+		os.Unsetenv(k)
+	}
+	cfg := LoadFromEnv()
+	if len(cfg.IncludeNamespaces) != 0 {
+		t.Errorf("expected empty include by default, got %v", cfg.IncludeNamespaces)
+	}
+	expected := map[string]bool{
+		"kube-system":         true,
+		"kube-public":         true,
+		"kube-node-lease":     true,
+		"local-path-storage":  true,
+	}
+	if len(cfg.ExcludeNamespaces) != len(expected) {
+		t.Errorf("expected %d default exclude namespaces, got %v", len(expected), cfg.ExcludeNamespaces)
+	}
+	for _, ns := range cfg.ExcludeNamespaces {
+		if !expected[ns] {
+			t.Errorf("unexpected default exclude namespace %q", ns)
+		}
+	}
+}
+
+func TestLoadFromEnv_NamespaceOverride(t *testing.T) {
+	os.Setenv("INCLUDE_NAMESPACES", "incident-lab,prod-app")
+	os.Setenv("EXCLUDE_NAMESPACES", "noisy")
+	defer os.Unsetenv("INCLUDE_NAMESPACES")
+	defer os.Unsetenv("EXCLUDE_NAMESPACES")
+
+	cfg := LoadFromEnv()
+	if len(cfg.IncludeNamespaces) != 2 || cfg.IncludeNamespaces[0] != "incident-lab" {
+		t.Errorf("unexpected include: %v", cfg.IncludeNamespaces)
+	}
+	if len(cfg.ExcludeNamespaces) != 1 || cfg.ExcludeNamespaces[0] != "noisy" {
+		t.Errorf("unexpected exclude: %v", cfg.ExcludeNamespaces)
+	}
+}
+
 func TestLoadFromEnv_Defaults(t *testing.T) {
 	for _, k := range []string{"OLLAMA_BASE_URL", "OLLAMA_MODEL", "DRY_RUN", "SCALE_MIN", "SCALE_MAX",
 		"POLL_INTERVAL_SECONDS", "ALLOW_IMAGE_UPDATES", "IMAGE_UPDATE_CONFIDENCE_THRESHOLD",

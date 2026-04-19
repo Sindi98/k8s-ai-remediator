@@ -325,6 +325,8 @@ All variables are read from environment variables (typically via ConfigMap).
 | `POLL_INTERVAL_SECONDS` | `30` | Event polling interval (seconds) |
 | `DEDUPE_TTL_SECONDS` | `300` | Dedup TTL for `(ns, kind, name, reason)` signals: identical events within the window do not trigger a new LLM call |
 | `MAX_EVENTS_PER_POLL` | `10` | Maximum number of events that trigger an LLM call per poll cycle; excess events are deferred to the next poll |
+| `INCLUDE_NAMESPACES` | *(empty)* | Comma-separated allowlist of namespaces. When set the agent only reacts to events from those namespaces. Empty = all namespaces minus the excluded ones |
+| `EXCLUDE_NAMESPACES` | `kube-system,kube-public,kube-node-lease,local-path-storage` | Comma-separated denylist of system namespaces. Events here are never sent to the LLM. Always wins over the allowlist (a namespace in both is excluded) |
 
 ### Policy Variables
 
@@ -1075,12 +1077,18 @@ Possible causes:
 
 The LLM request sat in the queue longer than the `pollCtx`. Typical during
 event storms that are not deduplicated (rolled-over pods with different
-names). Verify:
-- `"dedupeTTLSec"` and `"maxEventsPerPoll"` are non-zero in the `agent started` log.
+names) or for system-namespace events that should never be processed.
+
+Verify:
+- `"excludeNamespaces"` at startup contains `kube-system`, `kube-public`,
+  `kube-node-lease`, `local-path-storage`. Without the denylist every
+  CoreDNS or kube-scheduler warning reaches the LLM.
+- `"dedupeTTLSec"` and `"maxEventsPerPoll"` are non-zero.
 - Inference works: `ResolveDeploymentFromPod` + `InferDeploymentFromPodName`
   should converge all phantom pods onto the same Deployment.
-- In a test cluster with many stale events, wait a poll or two: the dedup
-  TTL and cap drain the queue.
+- On a test cluster with many stale events, wait a poll or two: the dedup
+  TTL and cap drain the queue. To cut further noise, switch to a tight
+  allowlist with `INCLUDE_NAMESPACES=incident-lab`.
 
 ### `Post "...": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`
 

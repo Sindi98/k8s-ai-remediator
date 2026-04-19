@@ -128,6 +128,18 @@ func executeDecision(
 
 // runLoop executes the main event polling loop. It returns when the parent
 // context is cancelled (e.g. on SIGTERM), allowing for graceful shutdown.
+// toSet builds a quick-lookup set from a slice of strings.
+func toSet(in []string) map[string]bool {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(in))
+	for _, v := range in {
+		out[v] = true
+	}
+	return out
+}
+
 func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder, notifier notify.Notifier) {
 	seen := map[string]bool{}
 
@@ -135,6 +147,11 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 	// Protects Ollama from bursts (e.g. flaky probes emitting many Unhealthy events).
 	signalSeen := map[string]time.Time{}
 	dedupeTTL := time.Duration(cfg.DedupeTTLSec) * time.Second
+
+	// Build O(1) namespace lookup tables once. include is empty -> "all
+	// allowed except excluded"; non-empty include -> only listed allowed.
+	include := toSet(cfg.IncludeNamespaces)
+	exclude := toSet(cfg.ExcludeNamespaces)
 
 	minSev := model.ParseSeverity(cfg.MinSeverity)
 
@@ -151,6 +168,8 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 		"patchConfidenceThreshold", cfg.PatchConfidenceThreshold,
 		"dedupeTTLSec", cfg.DedupeTTLSec,
 		"maxEventsPerPoll", cfg.MaxEventsPerPoll,
+		"includeNamespaces", cfg.IncludeNamespaces,
+		"excludeNamespaces", cfg.ExcludeNamespaces,
 		"podLogTailLines", cfg.PodLogTailLines,
 		"ollamaRPS", cfg.OllamaRPS,
 		"ollamaHTTPTimeoutSec", cfg.OllamaHTTPTimeoutSec,
@@ -193,6 +212,17 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 			seen[key] = true
 
 			if !strings.EqualFold(e.Type, "Warning") {
+				m.EventsSkipped.Add(1)
+				continue
+			}
+
+			// Namespace filter: skip kube-system and friends, plus anything
+			// not in the include allowlist when present.
+			if exclude[e.Namespace] {
+				m.EventsSkipped.Add(1)
+				continue
+			}
+			if len(include) > 0 && !include[e.Namespace] {
 				m.EventsSkipped.Add(1)
 				continue
 			}
