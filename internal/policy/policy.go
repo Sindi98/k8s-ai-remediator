@@ -169,23 +169,23 @@ noop, restart_deployment, delete_failed_pod, delete_and_recreate_pod, scale_depl
 
 === DECISION TREE (evaluate in order, stop at first match) ===
 
-1. Event reason is "Unhealthy" (probe failure, no crash):
-   - If snapshot "Allow-patch scopes" contains "probe" or "*":
-       action=patch_probe, severity=high
-       params: deployment_name, container, probe (readiness|liveness),
-               failure_threshold="5", period_seconds="15", timeout_seconds="5"
-   - Else: action=inspect_pod_logs (or mark_for_manual_fix if no container)
-   NEVER pick restart_deployment for Unhealthy.
+0. PRIORITY SCAN: search the entire incident text for "OOMKilled",
+   "exit=137", "Insufficient cpu", "Insufficient memory", "FailedScheduling".
+   If present, jump IMMEDIATELY to the matching rule below (1 for OOM,
+   2 for FailedScheduling) without considering the event reason alone.
 
-2. PodStatusSummary shows lastTerminated reason=OOMKilled OR exit=137:
-   - If "Allow-patch scopes" contains "resources" or "*":
+1. OOMKilled or exit=137 present ANYWHERE (event message, PodStatusSummary,
+   lastTerminated reason):
+   - If snapshot "Allow-patch scopes" contains "resources" or "*":
        action=patch_resources, severity=high
        params: deployment_name, container,
-               memory_limit=<2x-8x current>, memory_request=<half of limit>
+               memory_limit=<2x-8x current limit, at least 256Mi>,
+               memory_request=<half of limit>
    - Else: action=mark_for_manual_fix
-   NEVER pick restart_deployment on OOMKilled.
+   NEVER pick restart_deployment when OOMKilled is visible. The new pod
+   hits the same limit and OOMs again.
 
-3. Event reason is "FailedScheduling" (pod Pending, Insufficient cpu/memory):
+2. Event reason is "FailedScheduling" (pod Pending, Insufficient cpu/memory):
    - If "Allow-patch scopes" contains "resources" or "*":
        action=patch_resources, severity=critical
        params: deployment_name, container,
@@ -194,7 +194,15 @@ noop, restart_deployment, delete_failed_pod, delete_and_recreate_pod, scale_depl
    - Else: action=mark_for_manual_fix
    NEVER pick scale_deployment or restart_deployment on FailedScheduling.
 
-4. Event reason is "BackOff" (CrashLoopBackOff) AND PodStatusSummary is NOT OOM:
+3. Event reason is "Unhealthy" (probe failure, no crash, no OOM):
+   - If snapshot "Allow-patch scopes" contains "probe" or "*":
+       action=patch_probe, severity=high
+       params: deployment_name, container, probe (readiness|liveness),
+               failure_threshold="5", period_seconds="15", timeout_seconds="5"
+   - Else: action=inspect_pod_logs (or mark_for_manual_fix if no container)
+   NEVER pick restart_deployment for Unhealthy.
+
+4. Event reason is "BackOff" (CrashLoopBackOff) AND no OOMKilled/exit=137:
    - action=restart_deployment, severity=high
      params: deployment_name
    - If container is crashing for a reason you can deduce (bad config, missing file),

@@ -242,7 +242,7 @@ func TestBuildPrompt_ContainsDecisionTreeAndExamples(t *testing.T) {
 		"\"action\":\"patch_resources\"",
 		"\"action\":\"restart_deployment\"",
 		"NEVER pick restart_deployment for Unhealthy",
-		"NEVER pick restart_deployment on OOMKilled",
+		"NEVER pick restart_deployment when OOMKilled is visible",
 		"NEVER pick scale_deployment or restart_deployment on FailedScheduling",
 		"NEVER propose the SAME image",
 	} {

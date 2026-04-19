@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -39,7 +41,18 @@ func executeDecision(
 		return err
 	}
 	if err := policy.MaybeBlockRestartOnOOMKilled(d, extra); err != nil {
-		return err
+		// Auto-escalation: if the Deployment opts in to resources patching,
+		// silently transform the rejected restart into a patch_resources
+		// with a safe 2x bump (floor 256Mi). This covers the common case
+		// where the LLM fails the "NEVER restart on OOMKilled" rule.
+		if transformed, ok := tryAutoPatchResourcesOnOOM(ctx, cs, d, cfg); ok {
+			slog.Info("auto-escalation: restart_deployment → patch_resources (OOMKilled)",
+				"ns", transformed.Namespace, "deployment", transformed.Parameters["deployment_name"],
+				"memory_limit", transformed.Parameters["memory_limit"])
+			d = transformed
+		} else {
+			return err
+		}
 	}
 	if err := policy.MaybeBlockWrongActionOnFailedScheduling(d, eventReason); err != nil {
 		return err
@@ -128,6 +141,72 @@ func executeDecision(
 
 // runLoop executes the main event polling loop. It returns when the parent
 // context is cancelled (e.g. on SIGTERM), allowing for graceful shutdown.
+// tryAutoPatchResourcesOnOOM converts a blocked restart_deployment into a
+// patch_resources when the target Deployment has the "resources" opt-in
+// annotation and the global flag is on. Uses a conservative 2x bump of
+// the current memory_limit (minimum 256Mi) so the retry has a realistic
+// chance of succeeding. Returns (transformed, true) on success,
+// (untouched, false) otherwise.
+func tryAutoPatchResourcesOnOOM(ctx context.Context, cs kubernetes.Interface, d model.Decision, cfg config.AgentConfig) (model.Decision, bool) {
+	if !cfg.AllowPatchResources {
+		return d, false
+	}
+
+	depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName, d.Parameters)
+	if err != nil {
+		return d, false
+	}
+
+	dep, err := cs.AppsV1().Deployments(d.Namespace).Get(ctx, depName, metav1.GetOptions{})
+	if err != nil {
+		return d, false
+	}
+	if !kube.DeploymentAllowsPatch(dep, "resources") {
+		return d, false
+	}
+	if len(dep.Spec.Template.Spec.Containers) == 0 {
+		return d, false
+	}
+
+	// Use the first container (common case for single-container Deployments).
+	c := dep.Spec.Template.Spec.Containers[0]
+	newLimit := computeBumpedMemoryLimit(c.Resources.Limits[corev1.ResourceMemory])
+
+	transformed := d
+	transformed.Action = model.ActionPatchResources
+	if transformed.Parameters == nil {
+		transformed.Parameters = map[string]string{}
+	}
+	transformed.Parameters["deployment_name"] = depName
+	transformed.Parameters["container"] = c.Name
+	transformed.Parameters["memory_limit"] = newLimit
+	return transformed, true
+}
+
+// computeBumpedMemoryLimit returns a safe "next step" memory limit: 2x the
+// current value (or 256Mi when the current is unset or smaller), capped at
+// the package-wide MaxMemoryQuantity so the subsequent validator does not
+// reject it.
+func computeBumpedMemoryLimit(current resource.Quantity) string {
+	floor := resource.MustParse("256Mi")
+	var target resource.Quantity
+	if current.IsZero() {
+		target = floor
+	} else {
+		doubled := current.DeepCopy()
+		doubled.Set(current.Value() * 2)
+		if doubled.Cmp(floor) < 0 {
+			target = floor
+		} else {
+			target = doubled
+		}
+	}
+	if target.Cmp(kube.MaxMemoryQuantity) > 0 {
+		target = kube.MaxMemoryQuantity.DeepCopy()
+	}
+	return target.String()
+}
+
 // toSet builds a quick-lookup set from a slice of strings.
 func toSet(in []string) map[string]bool {
 	if len(in) == 0 {
