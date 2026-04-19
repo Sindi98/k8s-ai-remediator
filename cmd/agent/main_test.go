@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -365,6 +366,48 @@ func TestCanonicalReason(t *testing.T) {
 		if got != c.want {
 			t.Errorf("canonicalReason(%q, %q) = %q, want %q", c.reason, c.message, got, c.want)
 		}
+	}
+}
+
+func TestExecuteDecision_Scale_RejectsOverflowReplicas(t *testing.T) {
+	// Replicas outside int32 would silently wrap on cast; expect an error.
+	cs := newFakeCluster(t)
+	d := model.Decision{
+		Action: model.ActionScaleDeployment, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "web",
+		Parameters: map[string]string{"replicas": "9999999999"}, // > MaxInt32
+	}
+	err := executeDecision(context.Background(), cs, d, defaultCfg(), "", "")
+	if err == nil {
+		t.Error("expected error for replicas above int32 range")
+	}
+}
+
+func TestDedupCache_EvictsExpiredEntries(t *testing.T) {
+	c := &dedupCache{
+		seen:       map[string]time.Time{},
+		signalSeen: map[string]time.Time{},
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	now := time.Now()
+	c.seen["old-key"] = old
+	c.signalSeen["old-signal"] = old
+	c.seen["fresh"] = now
+	c.signalSeen["fresh-signal"] = now
+
+	c.evict(now, 5*time.Minute, time.Hour)
+
+	if _, ok := c.seen["old-key"]; ok {
+		t.Error("expected old seen entry to be evicted")
+	}
+	if _, ok := c.signalSeen["old-signal"]; ok {
+		t.Error("expected old signal entry to be evicted")
+	}
+	if _, ok := c.seen["fresh"]; !ok {
+		t.Error("fresh seen entry should survive eviction")
+	}
+	if _, ok := c.signalSeen["fresh-signal"]; !ok {
+		t.Error("fresh signal entry should survive eviction")
 	}
 }
 

@@ -71,8 +71,19 @@ func New(cfg SMTPConfig) Notifier {
 		"host", cfg.Host, "port", cfg.Port,
 		"from", cfg.From, "to", cfg.To,
 		"minSeverity", string(cfg.MinSeverity))
-	return &smtpNotifier{cfg: cfg, send: sendViaSMTP}
+	return &smtpNotifier{
+		cfg:  cfg,
+		send: sendViaSMTP,
+		sem:  make(chan struct{}, maxConcurrentSends),
+	}
 }
+
+// maxConcurrentSends caps in-flight SMTP goroutines so that an event storm
+// (many decisions per poll) cannot spawn unbounded dispatchers and exhaust
+// goroutines or overwhelm the SMTP server. Excess notifications are dropped
+// with a warning rather than queued, since the poll loop is the authority
+// on what is actionable.
+const maxConcurrentSends = 16
 
 type noopNotifier struct{}
 
@@ -90,18 +101,40 @@ func sendViaSMTP(addr string, auth smtp.Auth, from string, to []string, msg []by
 type smtpNotifier struct {
 	cfg  SMTPConfig
 	send sendFunc
+	// sem bounds concurrent dispatch goroutines (non-blocking acquire:
+	// overflow is dropped with a log line, not queued).
+	sem chan struct{}
 }
 
 // NotifyDecision is fire-and-forget from the caller's perspective: it
 // dispatches the email in a goroutine with its own 30s timeout, so slow
-// SMTP servers never block the poll loop.
+// SMTP servers never block the poll loop. The goroutine pool is bounded
+// via n.sem; when saturated the notification is dropped (rare in practice
+// because poll dedup/caps already throttle upstream).
 func (n *smtpNotifier) NotifyDecision(ctx context.Context, r DecisionResult) {
 	severity := model.ParseSeverity(r.Decision.Severity)
 	if !severity.MeetsMinimum(n.cfg.MinSeverity) {
 		return
 	}
 
+	// Tests construct smtpNotifier literals without a semaphore; only
+	// apply the cap when the production factory wired one up.
+	if n.sem != nil {
+		select {
+		case n.sem <- struct{}{}:
+		default:
+			slog.Warn("notify: SMTP send dropped (in-flight cap reached)",
+				"cap", cap(n.sem),
+				"ns", r.Namespace, "name", r.Name,
+				"action", r.Decision.Action)
+			return
+		}
+	}
+
 	go func() {
+		if n.sem != nil {
+			defer func() { <-n.sem }()
+		}
 		// Detach from the poll context so the email survives poll-level
 		// timeouts, but cap it to avoid hanging forever.
 		sendCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

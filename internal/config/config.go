@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -41,6 +42,10 @@ type AgentConfig struct {
 	// MaxEventsPerPoll caps how many Warning events trigger an Ollama
 	// call per poll cycle; excess events are skipped and picked up next poll.
 	MaxEventsPerPoll int
+	// EventSeenTTLSec bounds how long the per-ResourceVersion dedup cache
+	// keeps entries. Kubernetes GCs events after ~1h, so any value around
+	// that window prevents unbounded memory growth on long-running agents.
+	EventSeenTTLSec int
 
 	// AllowPatchProbe enables the patch_probe action that tunes probe
 	// timing fields on a Deployment. Opt-in required also via the
@@ -81,9 +86,11 @@ type AgentConfig struct {
 	NotifyMinSeverity string
 }
 
-// LoadFromEnv reads agent configuration from environment variables.
+// LoadFromEnv reads agent configuration from environment variables and
+// enforces invariants that would otherwise produce confusing runtime
+// failures (e.g. a poll context that expires before the HTTP timeout).
 func LoadFromEnv() AgentConfig {
-	return AgentConfig{
+	cfg := AgentConfig{
 		BaseURL:              Getenv("OLLAMA_BASE_URL", "http://ollama.ollama.svc.cluster.local:11434/api"),
 		Model:                Getenv("OLLAMA_MODEL", "qwen2.5:14b"),
 		DryRun:               Getbool("DRY_RUN", false),
@@ -105,6 +112,7 @@ func LoadFromEnv() AgentConfig {
 		MinSeverity:              Getenv("MIN_SEVERITY", "medium"),
 		DedupeTTLSec:             Getint("DEDUPE_TTL_SECONDS", 300),
 		MaxEventsPerPoll:         Getint("MAX_EVENTS_PER_POLL", 10),
+		EventSeenTTLSec:          Getint("EVENT_SEEN_TTL_SECONDS", 3600),
 		AllowPatchProbe:          Getbool("ALLOW_PATCH_PROBE", false),
 		AllowPatchResources:      Getbool("ALLOW_PATCH_RESOURCES", false),
 		AllowPatchRegistry:       Getbool("ALLOW_PATCH_REGISTRY", false),
@@ -119,6 +127,22 @@ func LoadFromEnv() AgentConfig {
 		NotifyTo:                 Getenv("NOTIFY_TO", ""),
 		NotifyMinSeverity:        Getenv("NOTIFY_MIN_SEVERITY", "medium"),
 	}
+
+	// Invariant: the poll-wide context must outlive a single Ollama call,
+	// otherwise the context expires mid-request and the HTTP client sees
+	// "context deadline exceeded" before its own timeout fires.
+	// Auto-correct with a warning rather than failing startup: misconfig at
+	// deploy time should not block remediation of unrelated workloads.
+	if cfg.PollContextTimeoutSec <= cfg.OllamaHTTPTimeoutSec {
+		corrected := cfg.OllamaHTTPTimeoutSec + 60
+		slog.Warn("config: POLL_CONTEXT_TIMEOUT_SECONDS must be greater than OLLAMA_HTTP_TIMEOUT_SECONDS; auto-correcting",
+			"ollamaHTTPTimeoutSec", cfg.OllamaHTTPTimeoutSec,
+			"pollContextTimeoutSec", cfg.PollContextTimeoutSec,
+			"corrected", corrected)
+		cfg.PollContextTimeoutSec = corrected
+	}
+
+	return cfg
 }
 
 func Getenv(key, def string) string {

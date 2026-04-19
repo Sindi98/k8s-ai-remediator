@@ -15,7 +15,32 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 )
+
+// mutateDeployment reads a Deployment, applies mutate, and writes it back,
+// automatically re-reading on resourceVersion conflicts so concurrent
+// controllers (HPA, another agent, kubectl apply) cannot silently clobber
+// each other. Returns a terminal error when mutate fails deterministically
+// (e.g. validation error) without triggering a retry.
+func mutateDeployment(
+	ctx context.Context,
+	cs kubernetes.Interface,
+	ns, name string,
+	mutate func(*appsv1.Deployment) error,
+) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		dep, err := cs.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if err := mutate(dep); err != nil {
+			return err
+		}
+		_, err = cs.AppsV1().Deployments(ns).Update(ctx, dep, metav1.UpdateOptions{})
+		return err
+	})
+}
 
 // AllowPatchAnnotation is the Deployment annotation that opts the workload
 // in to the patch_* actions. Its value is a comma-separated list of the
@@ -136,18 +161,13 @@ func RestartDeployment(ctx context.Context, cs kubernetes.Interface, ns, name st
 	if dryRun {
 		return nil
 	}
-
-	dep, err := cs.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return err
-	}
-	if dep.Spec.Template.Annotations == nil {
-		dep.Spec.Template.Annotations = map[string]string{}
-	}
-	dep.Spec.Template.Annotations["ai-remediator/restarted-at"] = time.Now().UTC().Format(time.RFC3339)
-
-	_, err = cs.AppsV1().Deployments(ns).Update(ctx, dep, metav1.UpdateOptions{})
-	return err
+	return mutateDeployment(ctx, cs, ns, name, func(dep *appsv1.Deployment) error {
+		if dep.Spec.Template.Annotations == nil {
+			dep.Spec.Template.Annotations = map[string]string{}
+		}
+		dep.Spec.Template.Annotations["ai-remediator/restarted-at"] = time.Now().UTC().Format(time.RFC3339)
+		return nil
+	})
 }
 
 // DeletePod removes a pod, relying on the controller to recreate it.
@@ -166,15 +186,11 @@ func ScaleDeployment(ctx context.Context, cs kubernetes.Interface, ns, name stri
 	if dryRun {
 		return nil
 	}
-
-	dep, err := cs.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return err
-	}
-	dep.Spec.Replicas = &replicas
-
-	_, err = cs.AppsV1().Deployments(ns).Update(ctx, dep, metav1.UpdateOptions{})
-	return err
+	return mutateDeployment(ctx, cs, ns, name, func(dep *appsv1.Deployment) error {
+		r := replicas
+		dep.Spec.Replicas = &r
+		return nil
+	})
 }
 
 // SetDeploymentImage updates a container's image in the deployment spec.
@@ -185,12 +201,30 @@ func SetDeploymentImage(ctx context.Context, cs kubernetes.Interface, ns, name, 
 	if strings.TrimSpace(image) == "" {
 		return fmt.Errorf("image parameter is required")
 	}
-
-	dep, err := cs.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
+	if dryRun {
+		// Validate without mutating so callers get feedback on no-op updates
+		// and missing containers in dry-run mode too.
+		dep, err := cs.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		_, err = pickContainerForImage(dep, image, container)
 		return err
 	}
+	return mutateDeployment(ctx, cs, ns, name, func(dep *appsv1.Deployment) error {
+		idx, err := pickContainerForImage(dep, image, container)
+		if err != nil {
+			return err
+		}
+		dep.Spec.Template.Spec.Containers[idx].Image = image
+		return nil
+	})
+}
 
+// pickContainerForImage resolves the target container index and rejects
+// no-op image changes. Shared between the dry-run and write paths so both
+// surface the same validation errors.
+func pickContainerForImage(dep *appsv1.Deployment, image, container string) (int, error) {
 	idx := -1
 	if container != "" {
 		for i, c := range dep.Spec.Template.Spec.Containers {
@@ -200,26 +234,18 @@ func SetDeploymentImage(ctx context.Context, cs kubernetes.Interface, ns, name, 
 			}
 		}
 		if idx == -1 {
-			return fmt.Errorf("container %s not found", container)
+			return -1, fmt.Errorf("container %s not found", container)
 		}
 	} else {
 		if len(dep.Spec.Template.Spec.Containers) == 0 {
-			return fmt.Errorf("deployment has no containers")
+			return -1, fmt.Errorf("deployment has no containers")
 		}
 		idx = 0
 	}
-
 	if dep.Spec.Template.Spec.Containers[idx].Image == image {
-		return fmt.Errorf("set_deployment_image is a no-op: container %q already runs %q; for transient pull failures use delete_failed_pod or restart_deployment", dep.Spec.Template.Spec.Containers[idx].Name, image)
+		return -1, fmt.Errorf("set_deployment_image is a no-op: container %q already runs %q; for transient pull failures use delete_failed_pod or restart_deployment", dep.Spec.Template.Spec.Containers[idx].Name, image)
 	}
-
-	if dryRun {
-		return nil
-	}
-
-	dep.Spec.Template.Spec.Containers[idx].Image = image
-	_, err = cs.AppsV1().Deployments(ns).Update(ctx, dep, metav1.UpdateOptions{})
-	return err
+	return idx, nil
 }
 
 // ProbeFieldBounds caps each tunable probe field to a sane range. The LLM
@@ -268,62 +294,63 @@ func findContainerIndex(containers []corev1.Container, name string) (int, error)
 // handler (exec/httpGet/tcpSocket) since those are more likely to be
 // correct-but-flaky than misconfigured.
 func PatchDeploymentProbe(ctx context.Context, cs kubernetes.Interface, ns, name, container, probeType string, fields map[string]string, dryRun bool) error {
-	dep, err := cs.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return err
-	}
-	if !DeploymentAllowsPatch(dep, "probe") {
-		return fmt.Errorf("deployment %s/%s does not opt in to patch_probe (set annotation %s)", ns, name, AllowPatchAnnotation)
-	}
-
-	idx, err := findContainerIndex(dep.Spec.Template.Spec.Containers, container)
-	if err != nil {
-		return err
-	}
-	c := &dep.Spec.Template.Spec.Containers[idx]
-
-	var probe **corev1.Probe
-	switch strings.ToLower(strings.TrimSpace(probeType)) {
-	case "readiness":
-		probe = &c.ReadinessProbe
-	case "liveness":
-		probe = &c.LivenessProbe
-	default:
-		return fmt.Errorf("probe must be one of: readiness, liveness")
-	}
-	if *probe == nil {
-		return fmt.Errorf("container %q has no %s probe to patch", c.Name, probeType)
-	}
-
-	changed := false
-	for key, raw := range fields {
-		v, err := parseProbeField(key, raw)
+	apply := func(dep *appsv1.Deployment) error {
+		if !DeploymentAllowsPatch(dep, "probe") {
+			return fmt.Errorf("deployment %s/%s does not opt in to patch_probe (set annotation %s)", ns, name, AllowPatchAnnotation)
+		}
+		idx, err := findContainerIndex(dep.Spec.Template.Spec.Containers, container)
 		if err != nil {
 			return err
 		}
-		switch key {
-		case "initial_delay_seconds":
-			(*probe).InitialDelaySeconds = v
-		case "period_seconds":
-			(*probe).PeriodSeconds = v
-		case "failure_threshold":
-			(*probe).FailureThreshold = v
-		case "success_threshold":
-			(*probe).SuccessThreshold = v
-		case "timeout_seconds":
-			(*probe).TimeoutSeconds = v
+		c := &dep.Spec.Template.Spec.Containers[idx]
+
+		var probe **corev1.Probe
+		switch strings.ToLower(strings.TrimSpace(probeType)) {
+		case "readiness":
+			probe = &c.ReadinessProbe
+		case "liveness":
+			probe = &c.LivenessProbe
+		default:
+			return fmt.Errorf("probe must be one of: readiness, liveness")
 		}
-		changed = true
-	}
-	if !changed {
-		return fmt.Errorf("patch_probe requires at least one probe field in parameters")
+		if *probe == nil {
+			return fmt.Errorf("container %q has no %s probe to patch", c.Name, probeType)
+		}
+
+		changed := false
+		for key, raw := range fields {
+			v, err := parseProbeField(key, raw)
+			if err != nil {
+				return err
+			}
+			switch key {
+			case "initial_delay_seconds":
+				(*probe).InitialDelaySeconds = v
+			case "period_seconds":
+				(*probe).PeriodSeconds = v
+			case "failure_threshold":
+				(*probe).FailureThreshold = v
+			case "success_threshold":
+				(*probe).SuccessThreshold = v
+			case "timeout_seconds":
+				(*probe).TimeoutSeconds = v
+			}
+			changed = true
+		}
+		if !changed {
+			return fmt.Errorf("patch_probe requires at least one probe field in parameters")
+		}
+		return nil
 	}
 
 	if dryRun {
-		return nil
+		dep, err := cs.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		return apply(dep)
 	}
-	_, err = cs.AppsV1().Deployments(ns).Update(ctx, dep, metav1.UpdateOptions{})
-	return err
+	return mutateDeployment(ctx, cs, ns, name, apply)
 }
 
 // ResourceBounds caps requests/limits to avoid runaway allocations driven
@@ -351,78 +378,79 @@ func parseQuantityInRange(raw string, min, max resource.Quantity) (resource.Quan
 // Any subset can be provided; the rest are left untouched. Values are bounded
 // by Min/Max*Quantity and requests must not exceed limits.
 func PatchDeploymentResources(ctx context.Context, cs kubernetes.Interface, ns, name, container string, params map[string]string, dryRun bool) error {
-	dep, err := cs.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return err
-	}
-	if !DeploymentAllowsPatch(dep, "resources") {
-		return fmt.Errorf("deployment %s/%s does not opt in to patch_resources (set annotation %s)", ns, name, AllowPatchAnnotation)
-	}
-
-	idx, err := findContainerIndex(dep.Spec.Template.Spec.Containers, container)
-	if err != nil {
-		return err
-	}
-	c := &dep.Spec.Template.Spec.Containers[idx]
-
-	if c.Resources.Requests == nil {
-		c.Resources.Requests = corev1.ResourceList{}
-	}
-	if c.Resources.Limits == nil {
-		c.Resources.Limits = corev1.ResourceList{}
-	}
-
-	changed := false
-	if raw := strings.TrimSpace(params["cpu_request"]); raw != "" {
-		q, err := parseQuantityInRange(raw, MinCPUQuantity, MaxCPUQuantity)
+	apply := func(dep *appsv1.Deployment) error {
+		if !DeploymentAllowsPatch(dep, "resources") {
+			return fmt.Errorf("deployment %s/%s does not opt in to patch_resources (set annotation %s)", ns, name, AllowPatchAnnotation)
+		}
+		idx, err := findContainerIndex(dep.Spec.Template.Spec.Containers, container)
 		if err != nil {
-			return fmt.Errorf("cpu_request: %w", err)
+			return err
 		}
-		c.Resources.Requests[corev1.ResourceCPU] = q
-		changed = true
-	}
-	if raw := strings.TrimSpace(params["memory_request"]); raw != "" {
-		q, err := parseQuantityInRange(raw, MinMemoryQuantity, MaxMemoryQuantity)
-		if err != nil {
-			return fmt.Errorf("memory_request: %w", err)
-		}
-		c.Resources.Requests[corev1.ResourceMemory] = q
-		changed = true
-	}
-	if raw := strings.TrimSpace(params["cpu_limit"]); raw != "" {
-		q, err := parseQuantityInRange(raw, MinCPUQuantity, MaxCPUQuantity)
-		if err != nil {
-			return fmt.Errorf("cpu_limit: %w", err)
-		}
-		c.Resources.Limits[corev1.ResourceCPU] = q
-		changed = true
-	}
-	if raw := strings.TrimSpace(params["memory_limit"]); raw != "" {
-		q, err := parseQuantityInRange(raw, MinMemoryQuantity, MaxMemoryQuantity)
-		if err != nil {
-			return fmt.Errorf("memory_limit: %w", err)
-		}
-		c.Resources.Limits[corev1.ResourceMemory] = q
-		changed = true
-	}
-	if !changed {
-		return fmt.Errorf("patch_resources requires at least one of cpu_request, memory_request, cpu_limit, memory_limit")
-	}
+		c := &dep.Spec.Template.Spec.Containers[idx]
 
-	// Enforce requests <= limits when both are set.
-	for _, rt := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
-		req, hasReq := c.Resources.Requests[rt]
-		lim, hasLim := c.Resources.Limits[rt]
-		if hasReq && hasLim && req.Cmp(lim) > 0 {
-			return fmt.Errorf("%s request %s exceeds limit %s", rt, req.String(), lim.String())
+		if c.Resources.Requests == nil {
+			c.Resources.Requests = corev1.ResourceList{}
 		}
+		if c.Resources.Limits == nil {
+			c.Resources.Limits = corev1.ResourceList{}
+		}
+
+		changed := false
+		if raw := strings.TrimSpace(params["cpu_request"]); raw != "" {
+			q, err := parseQuantityInRange(raw, MinCPUQuantity, MaxCPUQuantity)
+			if err != nil {
+				return fmt.Errorf("cpu_request: %w", err)
+			}
+			c.Resources.Requests[corev1.ResourceCPU] = q
+			changed = true
+		}
+		if raw := strings.TrimSpace(params["memory_request"]); raw != "" {
+			q, err := parseQuantityInRange(raw, MinMemoryQuantity, MaxMemoryQuantity)
+			if err != nil {
+				return fmt.Errorf("memory_request: %w", err)
+			}
+			c.Resources.Requests[corev1.ResourceMemory] = q
+			changed = true
+		}
+		if raw := strings.TrimSpace(params["cpu_limit"]); raw != "" {
+			q, err := parseQuantityInRange(raw, MinCPUQuantity, MaxCPUQuantity)
+			if err != nil {
+				return fmt.Errorf("cpu_limit: %w", err)
+			}
+			c.Resources.Limits[corev1.ResourceCPU] = q
+			changed = true
+		}
+		if raw := strings.TrimSpace(params["memory_limit"]); raw != "" {
+			q, err := parseQuantityInRange(raw, MinMemoryQuantity, MaxMemoryQuantity)
+			if err != nil {
+				return fmt.Errorf("memory_limit: %w", err)
+			}
+			c.Resources.Limits[corev1.ResourceMemory] = q
+			changed = true
+		}
+		if !changed {
+			return fmt.Errorf("patch_resources requires at least one of cpu_request, memory_request, cpu_limit, memory_limit")
+		}
+
+		// Enforce requests <= limits when both are set.
+		for _, rt := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			req, hasReq := c.Resources.Requests[rt]
+			lim, hasLim := c.Resources.Limits[rt]
+			if hasReq && hasLim && req.Cmp(lim) > 0 {
+				return fmt.Errorf("%s request %s exceeds limit %s", rt, req.String(), lim.String())
+			}
+		}
+		return nil
 	}
 
 	if dryRun {
-		return nil
+		dep, err := cs.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		return apply(dep)
 	}
-	_, err = cs.AppsV1().Deployments(ns).Update(ctx, dep, metav1.UpdateOptions{})
-	return err
+	return mutateDeployment(ctx, cs, ns, name, apply)
 }
 
 // SwapRegistry replaces the registry host prefix in an image reference,
@@ -458,35 +486,35 @@ func SwapRegistry(image, newRegistry string) (string, error) {
 // while preserving the path and tag. Intended for fixing typos or moving
 // between local registries without allowing arbitrary image swaps.
 func PatchDeploymentRegistry(ctx context.Context, cs kubernetes.Interface, ns, name, container, newRegistry string, dryRun bool) error {
-	dep, err := cs.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return err
-	}
-	if !DeploymentAllowsPatch(dep, "registry") {
-		return fmt.Errorf("deployment %s/%s does not opt in to patch_registry (set annotation %s)", ns, name, AllowPatchAnnotation)
-	}
+	apply := func(dep *appsv1.Deployment) error {
+		if !DeploymentAllowsPatch(dep, "registry") {
+			return fmt.Errorf("deployment %s/%s does not opt in to patch_registry (set annotation %s)", ns, name, AllowPatchAnnotation)
+		}
+		idx, err := findContainerIndex(dep.Spec.Template.Spec.Containers, container)
+		if err != nil {
+			return err
+		}
+		c := &dep.Spec.Template.Spec.Containers[idx]
 
-	idx, err := findContainerIndex(dep.Spec.Template.Spec.Containers, container)
-	if err != nil {
-		return err
-	}
-	c := &dep.Spec.Template.Spec.Containers[idx]
-
-	newImage, err := SwapRegistry(c.Image, newRegistry)
-	if err != nil {
-		return err
-	}
-	if newImage == c.Image {
-		return fmt.Errorf("new registry produces the same image %q; no change", newImage)
-	}
-
-	dep.Spec.Template.Spec.Containers[idx].Image = newImage
-
-	if dryRun {
+		newImage, err := SwapRegistry(c.Image, newRegistry)
+		if err != nil {
+			return err
+		}
+		if newImage == c.Image {
+			return fmt.Errorf("new registry produces the same image %q; no change", newImage)
+		}
+		dep.Spec.Template.Spec.Containers[idx].Image = newImage
 		return nil
 	}
-	_, err = cs.AppsV1().Deployments(ns).Update(ctx, dep, metav1.UpdateOptions{})
-	return err
+
+	if dryRun {
+		dep, err := cs.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		return apply(dep)
+	}
+	return mutateDeployment(ctx, cs, ns, name, apply)
 }
 
 // ReadPodLogs reads the logs of a specific container.
