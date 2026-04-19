@@ -218,15 +218,21 @@ kubectl -n ollama expose deployment ollama \
 
 # Attendi il rollout e installa il modello
 kubectl -n ollama rollout status deployment/ollama --timeout=180s
-kubectl -n ollama exec -it deploy/ollama -- ollama pull qwen2.5:14b
+# qwen2.5:7b e il default consigliato per CPU (chiamate da 30-90s).
+# Se hai GPU o vuoi massima qualita, usa qwen2.5:14b (chiamate 3-6min su CPU).
+kubectl -n ollama exec -it deploy/ollama -- ollama pull qwen2.5:7b
 kubectl -n ollama exec -it deploy/ollama -- ollama list
 ```
 
 > **Nota**: il valore di `OLLAMA_MODEL` nella ConfigMap deve coincidere esattamente con il nome mostrato da `ollama list`.
 >
-> **Requisiti nodo Ollama**: `qwen2.5:14b` richiede almeno **8GB di RAM libera** per l'inferenza. Se il pod resta in `Pending`, verifica che il nodo abbia risorse sufficienti con `kubectl describe node`. Per cluster locali:
-> - **Docker Desktop**: Settings → Resources → assegna almeno **10GB di RAM** e **4 CPU**, poi Apply & Restart
-> - **minikube**: `minikube start --memory=10240 --cpus=4`
+> **Scelta del modello e requisiti di RAM**:
+> - `qwen2.5:7b` (consigliato per CPU): ~4 GB RAM libera, chiamate ~30-90s. Qualita piu che sufficiente perche il prompt e strutturato come decision tree con few-shot examples.
+> - `qwen2.5:14b`: ~8 GB RAM libera, chiamate ~3-6 min su CPU. Qualita superiore; adatto se hai GPU o timeout estesi.
+>
+> Se il pod resta in `Pending`, verifica che il nodo abbia risorse sufficienti con `kubectl describe node`. Per cluster locali:
+> - **Docker Desktop**: Settings → Resources → assegna almeno **6 GB RAM / 4 CPU** (14b: 10 GB), poi Apply & Restart
+> - **minikube**: `minikube start --memory=6144 --cpus=4` (14b: `--memory=10240`)
 > - **kind**: configura le risorse del container Docker sottostante
 
 ### 2. Installazione dell'agente
@@ -262,7 +268,7 @@ kubectl create clusterrolebinding ai-remediator \
 kubectl create configmap ai-remediator-config \
   -n ai-remediator \
   --from-literal=OLLAMA_BASE_URL=http://ollama.ollama.svc.cluster.local:11434/api \
-  --from-literal=OLLAMA_MODEL=qwen2.5:14b \
+  --from-literal=OLLAMA_MODEL=qwen2.5:7b \
   --from-literal=DRY_RUN=false \
   --from-literal=POLL_INTERVAL_SECONDS=30 \
   --from-literal=MIN_SEVERITY=low \
@@ -320,7 +326,7 @@ Tutte le variabili sono lette da environment (tipicamente via ConfigMap).
 | Variabile | Default | Descrizione |
 |-----------|---------|-------------|
 | `OLLAMA_BASE_URL` | `http://ollama.ollama.svc.cluster.local:11434/api` | URL base dell'API Ollama |
-| `OLLAMA_MODEL` | `qwen2.5:14b` | Nome del modello LLM (deve corrispondere a `ollama list`) |
+| `OLLAMA_MODEL` | `qwen2.5:14b` (default di codice). Consigliato per CPU locale: `qwen2.5:7b` | Nome del modello LLM (deve corrispondere a `ollama list`). Con CPU usa `7b`: ~30-90s per chiamata. Con GPU o per alta qualita, `14b`: ~3-6min su CPU |
 | `DRY_RUN` | `false` | Se `true`, logga le decisioni senza applicare remediation |
 | `POLL_INTERVAL_SECONDS` | `30` | Intervallo di polling degli eventi (secondi) |
 | `DEDUPE_TTL_SECONDS` | `300` | TTL di deduplicazione per `(ns, kind, name, reason)`: eventi identici entro la finestra non generano una nuova chiamata LLM |
@@ -1025,7 +1031,7 @@ kubectl auth can-i update deployments \
 ```bash
 kubectl -n ai-remediator create configmap ai-remediator-config \
   --from-literal=OLLAMA_BASE_URL=http://ollama.ollama.svc.cluster.local:11434/api \
-  --from-literal=OLLAMA_MODEL=qwen2.5:14b \
+  --from-literal=OLLAMA_MODEL=qwen2.5:7b \
   --from-literal=DRY_RUN=false \
   --from-literal=POLL_INTERVAL_SECONDS=30 \
   --from-literal=MIN_SEVERITY=medium \
@@ -1093,13 +1099,29 @@ Verifica:
 
 ### `Post "...": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`
 
-Ollama ci mette piu di `OLLAMA_HTTP_TIMEOUT_SECONDS` a rispondere. Sul
-CPU con qwen2.5:14b sono comuni tempi da 100 a 300s. Alza il timeout:
+Ollama ci mette piu di `OLLAMA_HTTP_TIMEOUT_SECONDS` a rispondere.
+Tempi tipici su CPU:
+- `qwen2.5:7b`: 30-90s (timeout 180s basta)
+- `qwen2.5:14b`: 100-360s (timeout 360-600s)
+
+**Soluzione preferita**: passa al 7b (4x piu veloce):
+```bash
+kubectl -n ollama exec -it deploy/ollama -- ollama pull qwen2.5:7b
+kubectl -n ai-remediator patch configmap ai-remediator-config \
+  --type=merge -p '{"data":{
+    "OLLAMA_MODEL":"qwen2.5:7b",
+    "OLLAMA_HTTP_TIMEOUT_SECONDS":"180",
+    "POLL_CONTEXT_TIMEOUT_SECONDS":"300"
+  }}'
+kubectl -n ai-remediator rollout restart deployment/ai-remediator
+```
+
+**Alternativa se resti sul 14b**: alza i timeout
 ```bash
 kubectl -n ai-remediator patch configmap ai-remediator-config \
   --type=merge -p '{"data":{
-    "OLLAMA_HTTP_TIMEOUT_SECONDS":"360",
-    "POLL_CONTEXT_TIMEOUT_SECONDS":"480"
+    "OLLAMA_HTTP_TIMEOUT_SECONDS":"600",
+    "POLL_CONTEXT_TIMEOUT_SECONDS":"720"
   }}'
 kubectl -n ai-remediator rollout restart deployment/ai-remediator
 ```
