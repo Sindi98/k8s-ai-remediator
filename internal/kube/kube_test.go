@@ -310,11 +310,18 @@ func TestChooseContainerForLogs(t *testing.T) {
 	if got := ChooseContainerForLogs(pod, ""); got != "app" {
 		t.Errorf("expected app (most restarts), got %s", got)
 	}
-	if got := ChooseContainerForLogs(nil, "fallback"); got != "fallback" {
-		t.Errorf("expected fallback, got %s", got)
+	// Nil pod: we cannot verify the preferred container exists, so return
+	// the empty sentinel instead of echoing back an unvalidated string.
+	if got := ChooseContainerForLogs(nil, "fallback"); got != "" {
+		t.Errorf("expected empty for nil pod, got %s", got)
 	}
 	if got := ChooseContainerForLogs(pod, "nonexistent"); got != "app" {
 		t.Errorf("expected app, got %s", got)
+	}
+	// Pod with zero containers and no statuses: nothing to read from.
+	empty := &corev1.Pod{}
+	if got := ChooseContainerForLogs(empty, "anything"); got != "" {
+		t.Errorf("expected empty for pod without containers, got %s", got)
 	}
 }
 
@@ -497,6 +504,14 @@ func TestSwapRegistry(t *testing.T) {
 		{"nginx:1.25", "host.docker.internal:5050", "host.docker.internal:5050/nginx:1.25"},
 		{"localhost:5000/foo:bar", "host.docker.internal:5050", "host.docker.internal:5050/foo:bar"},
 		{"library/nginx:1.25", "host.docker.internal:5050", "host.docker.internal:5050/library/nginx:1.25"},
+		// Multi-segment path: preserve everything after the registry host.
+		{"docker.io/library/repo/image:tag", "localhost:5050", "localhost:5050/library/repo/image:tag"},
+		// Bare "localhost" (no port) is recognised as a registry host.
+		{"localhost/app:v1", "gcr.io", "gcr.io/app:v1"},
+		// Trailing slash on the new registry must be tolerated.
+		{"nginx:1.25", "host.docker.internal:5050/", "host.docker.internal:5050/nginx:1.25"},
+		// Digest references must be preserved.
+		{"docker.io/library/nginx@sha256:abc123", "mirror.local", "mirror.local/library/nginx@sha256:abc123"},
 	}
 	for _, c := range cases {
 		got, err := SwapRegistry(c.image, c.registry)

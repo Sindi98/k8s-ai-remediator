@@ -538,10 +538,14 @@ func ReadPodLogs(ctx context.Context, cs kubernetes.Interface, ns, podName, cont
 	return string(b), nil
 }
 
-// ChooseContainerForLogs picks the best container to read logs from.
+// ChooseContainerForLogs picks the best container to read logs from. Returns
+// an empty string only when the pod has no containers at all; callers
+// (InspectPodLogs) treat that as "nothing to do" rather than a hard error.
+// The preferred value is used solely as a filter against actual containers,
+// never echoed back when it doesn't exist.
 func ChooseContainerForLogs(pod *corev1.Pod, preferred string) string {
 	if pod == nil {
-		return preferred
+		return ""
 	}
 
 	if preferred != "" {
@@ -569,7 +573,7 @@ func ChooseContainerForLogs(pod *corev1.Pod, preferred string) string {
 		return pod.Spec.Containers[0].Name
 	}
 
-	return preferred
+	return ""
 }
 
 // InspectPodLogs fetches current and previous logs for a pod or deployment.
@@ -680,10 +684,17 @@ func DeploymentToText(dep *appsv1.Deployment) string {
 	return out
 }
 
-// DeploymentSnapshot fetches and formats a deployment summary.
+// DeploymentSnapshot fetches and formats a deployment summary. Returns the
+// empty string when the deployment cannot be read so the caller can still
+// prompt the LLM with partial context; NotFound is common (stale events,
+// deployment already deleted) and stays silent, while transient API errors
+// are logged so operators can spot pattern failures in the logs.
 func DeploymentSnapshot(ctx context.Context, cs kubernetes.Interface, ns, depName string) string {
 	dep, err := cs.AppsV1().Deployments(ns).Get(ctx, depName, metav1.GetOptions{})
 	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			slog.Warn("DeploymentSnapshot: failed to read deployment", "ns", ns, "name", depName, "error", err)
+		}
 		return ""
 	}
 	return DeploymentToText(dep)
@@ -697,6 +708,9 @@ func DeploymentSnapshot(ctx context.Context, cs kubernetes.Interface, ns, depNam
 func PodStatusSummary(ctx context.Context, cs kubernetes.Interface, ns, podName string) string {
 	pod, err := cs.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			slog.Warn("PodStatusSummary: failed to read pod", "ns", ns, "name", podName, "error", err)
+		}
 		return ""
 	}
 
