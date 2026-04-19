@@ -144,14 +144,18 @@ func SanitizeForPrompt(s string, maxLen int) string {
 }
 
 // BuildPrompt constructs the LLM prompt from Kubernetes event fields.
+// The prompt is tuned for smaller local models (e.g. qwen2.5:7b): a compact
+// decision tree, few-shot examples, and explicit format constraints, instead
+// of long prose that smaller models often ignore.
 func BuildPrompt(ns, kind, name, etype, reason, message, extra string) string {
 	const fieldMaxLen = 2000
 	reason = SanitizeForPrompt(reason, 500)
 	message = SanitizeForPrompt(message, fieldMaxLen)
 	extra = SanitizeForPrompt(extra, fieldMaxLen)
 
-	return fmt.Sprintf(`Analyze this Kubernetes incident and return only JSON.
+	return fmt.Sprintf(`You are a Kubernetes remediation agent. Return ONLY valid JSON matching the schema, nothing else.
 
+=== INCIDENT ===
 Event type: %s
 Reason: %s
 Message: %s
@@ -160,28 +164,91 @@ Object kind: %s
 Object name: %s
 %s
 
-Rules:
-- Allowed actions: noop,restart_deployment,delete_failed_pod,delete_and_recreate_pod,scale_deployment,inspect_pod_logs,set_deployment_image,patch_probe,patch_resources,patch_registry,mark_for_manual_fix,ask_human
-- Severity must be one of: critical, high, medium, low, info
-- For critical and high severity incidents, take immediate remediation action when confident
-- For medium severity incidents, attempt remediation if a safe action is available (e.g. restart, delete_and_recreate_pod, inspect_pod_logs)
-- Use noop or ask_human only for low/info severity or when confidence is very low
-- Never propose shell commands
-- If the incident mentions CrashLoopBackOff, you may use inspect_pod_logs first, but if the pod is managed by a Deployment and the issue looks recoverable, prefer restart_deployment over delete_and_recreate_pod (the specific pod name from the event may no longer exist)
-- Use delete_and_recreate_pod only for standalone pods not managed by a Deployment
-- If a pod is failed or stuck and managed by a Deployment, use restart_deployment
-- If the issue mentions ImagePullBackOff, ErrImagePull or "Failed to pull image", do not invent an image name
-- HARD RULE: never propose set_deployment_image with the SAME image already present in the Deployment snapshot containers list. It is a no-op (the rollout would re-create pods that hit the same pull failure) and the agent will reject it. For transient pull failures (network blip, registry rate-limit on a previously-working image) PICK delete_failed_pod or restart_deployment to retry the pull. Use set_deployment_image only when proposing a DIFFERENT, concrete and safe replacement image.
-- Use mark_for_manual_fix when the image problem cannot be resolved safely from the event alone (e.g. tag truly does not exist anywhere)
-- If using inspect_pod_logs on a multi-container pod, include parameters.container when possible
-- HARD RULE: if the event reason is Unhealthy (readiness or liveness probe failure) and the pod is not crashing, NEVER pick restart_deployment. A rolling restart spawns a new pod that immediately hits the same probe misconfiguration. If the Deployment snapshot reports "Allow-patch scopes" containing "probe" or "*", PICK patch_probe DIRECTLY (do not fall back to inspect_pod_logs; the logs will not reveal a probe timing problem). Read the current probe values from the snapshot and propose new, MORE PERMISSIVE integer values. Typical safe choices: failure_threshold=5, period_seconds=10 or 15, timeout_seconds=5. If the snapshot reports "Allow-patch scopes: none", fall back to inspect_pod_logs or mark_for_manual_fix
-- Every patch_probe parameter value MUST be a plain decimal integer string. Good: "5", "15". BAD: "x5", "2x", "+3", "5s", "5 seconds". Do NOT write expressions or multipliers; compute the final integer yourself and emit only that
-- When the action targets a Deployment, set parameters.deployment_name so the agent can act even if the specific pod no longer exists
-- patch_probe tunes probe timing only. Required parameters: deployment_name, container, probe (readiness|liveness), and at least one of initial_delay_seconds, period_seconds, failure_threshold, success_threshold, timeout_seconds. Do not rewrite the probe handler (exec/httpGet/tcpSocket)
-- patch_resources adjusts CPU/memory requests and limits. Required parameters: deployment_name, container, and at least one of cpu_request, memory_request, cpu_limit, memory_limit. Use Kubernetes quantity strings (e.g. "250m", "512Mi"). Prefer this for OOMKilled signals
-- HARD RULE: if the pod status shows lastTerminated reason=OOMKilled or exit=137, or the event reason is BackOff on a Deployment whose snapshot reports Allow-patch scopes containing "resources" or "*", PICK patch_resources DIRECTLY (restart_deployment is useless: the new pod will hit the same memory limit). Read the current memory_limit from the container spec (if any) and propose a higher value as a plain quantity string, e.g. memory_limit="256Mi" when the current is 32Mi. If the pod status shows lastTerminated reason=Error and the exit code is not 137, patch_resources is not appropriate; prefer inspect_pod_logs first
-- HARD RULE: if the event reason is FailedScheduling (pod stuck Pending with "Insufficient cpu/memory" or similar), NEVER pick scale_deployment or restart_deployment: they cannot solve a single-pod resource request bigger than any node. If the Deployment snapshot reports Allow-patch scopes containing "resources" or "*", PICK patch_resources DIRECTLY with reasonable node-sized values (cpu_request around 100m, memory_request around 64-128Mi). Without the opt-in, pick mark_for_manual_fix
-- patch_registry rewrites only the registry host of the container image, keeping the path and tag. Required parameters: deployment_name, container, new_registry (e.g. "host.docker.internal:5050"). Prefer this for ErrImagePull/ErrImageNeverPull caused by a wrong registry prefix
-- patch_* actions require a high-confidence read of the event (>= 0.85) and an opt-in annotation on the target Deployment; if either is unlikely, prefer mark_for_manual_fix`,
+=== ALLOWED ACTIONS ===
+noop, restart_deployment, delete_failed_pod, delete_and_recreate_pod, scale_deployment, inspect_pod_logs, set_deployment_image, patch_probe, patch_resources, patch_registry, mark_for_manual_fix, ask_human
+
+=== DECISION TREE (evaluate in order, stop at first match) ===
+
+1. Event reason is "Unhealthy" (probe failure, no crash):
+   - If snapshot "Allow-patch scopes" contains "probe" or "*":
+       action=patch_probe, severity=high
+       params: deployment_name, container, probe (readiness|liveness),
+               failure_threshold="5", period_seconds="15", timeout_seconds="5"
+   - Else: action=inspect_pod_logs (or mark_for_manual_fix if no container)
+   NEVER pick restart_deployment for Unhealthy.
+
+2. PodStatusSummary shows lastTerminated reason=OOMKilled OR exit=137:
+   - If "Allow-patch scopes" contains "resources" or "*":
+       action=patch_resources, severity=high
+       params: deployment_name, container,
+               memory_limit=<2x-8x current>, memory_request=<half of limit>
+   - Else: action=mark_for_manual_fix
+   NEVER pick restart_deployment on OOMKilled.
+
+3. Event reason is "FailedScheduling" (pod Pending, Insufficient cpu/memory):
+   - If "Allow-patch scopes" contains "resources" or "*":
+       action=patch_resources, severity=critical
+       params: deployment_name, container,
+               cpu_request="100m", memory_request="64Mi",
+               cpu_limit="500m", memory_limit="256Mi"
+   - Else: action=mark_for_manual_fix
+   NEVER pick scale_deployment or restart_deployment on FailedScheduling.
+
+4. Event reason is "BackOff" (CrashLoopBackOff) AND PodStatusSummary is NOT OOM:
+   - action=restart_deployment, severity=high
+     params: deployment_name
+   - If container is crashing for a reason you can deduce (bad config, missing file),
+     prefer inspect_pod_logs first (include parameters.container).
+
+5. Image pull failure ("Failed to pull image", ErrImagePull, ImagePullBackOff):
+   - If the image in the Deployment snapshot is SYNTACTICALLY VALID (looks like a real tag):
+       action=restart_deployment, severity=high, params: deployment_name
+       (this retries the pull; transient network or registry rate-limit)
+   - If the image is clearly wrong/inventato AND you know a safe replacement:
+       action=set_deployment_image, severity=high
+       params: deployment_name, image=<DIFFERENT valid image string>
+       NEVER propose the SAME image already in the snapshot (no-op).
+   - If the wrong registry host is the root cause AND "Allow-patch scopes" contains "registry" or "*":
+       action=patch_registry
+       params: deployment_name, container, new_registry
+   - Else: action=mark_for_manual_fix
+
+6. Nothing else matches: action=inspect_pod_logs if you need logs, else mark_for_manual_fix.
+
+=== OUTPUT FORMAT CONSTRAINTS ===
+- severity ∈ {critical, high, medium, low, info}
+- confidence: float 0.0-1.0 (>=0.85 unlocks set_deployment_image and patch_*)
+- Whenever the action targets a Deployment, ALWAYS set params.deployment_name
+- Numeric params for patch_probe: decimal integer strings only
+  OK: "5", "15"
+  NOT OK: "x5", "2x", "+3", "5s", "5 seconds"
+- Quantity params for patch_resources: Kubernetes quantity strings ("100m", "256Mi")
+- NEVER propose shell commands
+- NEVER invent image names or registry hosts; only use concrete strings
+
+=== EXAMPLES ===
+
+Example A - Unhealthy probe with opt-in:
+  Event reason: Unhealthy
+  Snapshot: Allow-patch scopes: probe; readinessProbe failureThreshold=2 period=5
+  → {"action":"patch_probe","severity":"high","confidence":0.95,
+     "probable_cause":"Probe timing too strict for this workload",
+     "params":{"deployment_name":"app","container":"main","probe":"readiness",
+               "failure_threshold":"5","period_seconds":"15"}}
+
+Example B - OOMKilled with opt-in:
+  Event reason: BackOff; Pod lastTerminated reason=OOMKilled exit=137
+  Snapshot: Allow-patch scopes: resources; container memory_limit=32Mi
+  → {"action":"patch_resources","severity":"high","confidence":0.95,
+     "probable_cause":"Memory limit too low for workload allocation",
+     "params":{"deployment_name":"app","container":"main",
+               "memory_limit":"256Mi","memory_request":"128Mi"}}
+
+Example C - Failed to pull, valid image:
+  Event reason: Failed; Message: Failed to pull image "busybox:1.36"
+  Snapshot: containers=main=busybox:1.36
+  → {"action":"restart_deployment","severity":"high","confidence":0.9,
+     "probable_cause":"Transient pull failure (network or registry rate-limit)",
+     "params":{"deployment_name":"app"}}`,
 		etype, reason, message, ns, kind, name, extra)
 }

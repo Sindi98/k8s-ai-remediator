@@ -226,8 +226,29 @@ func TestBuildPrompt_DocumentsPatchActions(t *testing.T) {
 
 func TestBuildPrompt_MentionsDeploymentNameParam(t *testing.T) {
 	p := BuildPrompt("ns1", "Pod", "my-pod", "Warning", "BackOff", "", "")
-	if !strings.Contains(p, "parameters.deployment_name") {
-		t.Error("prompt should instruct the LLM to set parameters.deployment_name for deployment-targeted actions")
+	// Accept either "parameters.deployment_name" or "params.deployment_name"
+	// since the compact prompt uses the shorter form.
+	if !strings.Contains(p, "params.deployment_name") && !strings.Contains(p, "parameters.deployment_name") {
+		t.Error("prompt should instruct the LLM to set (params|parameters).deployment_name for deployment-targeted actions")
+	}
+}
+
+func TestBuildPrompt_ContainsDecisionTreeAndExamples(t *testing.T) {
+	p := BuildPrompt("ns1", "Pod", "my-pod", "Warning", "Unhealthy", "Readiness probe failed", "")
+	for _, expected := range []string{
+		"DECISION TREE",
+		"EXAMPLES",
+		"\"action\":\"patch_probe\"",
+		"\"action\":\"patch_resources\"",
+		"\"action\":\"restart_deployment\"",
+		"NEVER pick restart_deployment for Unhealthy",
+		"NEVER pick restart_deployment on OOMKilled",
+		"NEVER pick scale_deployment or restart_deployment on FailedScheduling",
+		"NEVER propose the SAME image",
+	} {
+		if !strings.Contains(p, expected) {
+			t.Errorf("prompt should contain %q", expected)
+		}
 	}
 }
 
