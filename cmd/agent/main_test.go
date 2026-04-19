@@ -6,6 +6,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -199,6 +200,150 @@ func TestExecuteDecision_BlocksRestartForOOMKilled(t *testing.T) {
 	if err := executeDecision(context.Background(), cs, d, defaultCfg(), "BackOff",
 		"container=app state=Running"); err != nil {
 		t.Errorf("plain BackOff should not be blocked, got %v", err)
+	}
+}
+
+func TestComputeBumpedMemoryLimit(t *testing.T) {
+	mustQ := func(s string) resource.Quantity { return resource.MustParse(s) }
+
+	cases := []struct {
+		current string
+		want    string
+	}{
+		{"", "256Mi"},    // nothing set → floor
+		{"16Mi", "256Mi"}, // doubled (32Mi) < floor → floor wins
+		{"32Mi", "256Mi"}, // doubled (64Mi) < floor → floor wins
+		{"256Mi", "512Mi"},   // exact 2x above floor
+		{"1Gi", "2Gi"},       // 2x scaling
+		{"16Gi", "16Gi"},     // capped at MaxMemoryQuantity (16Gi)
+	}
+	for _, c := range cases {
+		var current resource.Quantity
+		if c.current != "" {
+			current = mustQ(c.current)
+		}
+		got := computeBumpedMemoryLimit(current)
+		gotQ := mustQ(got)
+		wantQ := mustQ(c.want)
+		if gotQ.Cmp(wantQ) != 0 {
+			t.Errorf("computeBumpedMemoryLimit(%q) = %q, want %q", c.current, got, c.want)
+		}
+	}
+}
+
+func TestTryAutoPatchResourcesOnOOM_NoOptIn(t *testing.T) {
+	// Deployment without the annotation → transformer declines.
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "main"}},
+			}},
+		},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	cfg := patchFlagsCfg()
+	d := model.Decision{Action: model.ActionRestartDeployment, Namespace: "default", ResourceKind: "Deployment", ResourceName: "app"}
+	_, ok := tryAutoPatchResourcesOnOOM(context.Background(), cs, d, cfg)
+	if ok {
+		t.Error("expected transformer to decline when annotation is absent")
+	}
+}
+
+func TestTryAutoPatchResourcesOnOOM_FlagOff(t *testing.T) {
+	cs := newPatchableClusterForAgent(t, "resources")
+	cfg := defaultCfg() // AllowPatchResources=false
+	d := model.Decision{Action: model.ActionRestartDeployment, Namespace: "default", ResourceKind: "Deployment", ResourceName: "app"}
+	_, ok := tryAutoPatchResourcesOnOOM(context.Background(), cs, d, cfg)
+	if ok {
+		t.Error("expected transformer to decline when ALLOW_PATCH_RESOURCES=false")
+	}
+}
+
+func TestTryAutoPatchResourcesOnOOM_Success(t *testing.T) {
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "memory-hog", Namespace: "default",
+			Annotations: map[string]string{"ai-remediator/allow-patch": "resources"},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name: "app",
+					Resources: corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("32Mi")},
+					},
+				}},
+			}},
+		},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	cfg := patchFlagsCfg()
+
+	d := model.Decision{
+		Action: model.ActionRestartDeployment, Namespace: "default",
+		ResourceKind: "Pod", ResourceName: "memory-hog-xxx-yyy",
+		Parameters: map[string]string{"deployment_name": "memory-hog"},
+	}
+	transformed, ok := tryAutoPatchResourcesOnOOM(context.Background(), cs, d, cfg)
+	if !ok {
+		t.Fatal("expected transformer to succeed")
+	}
+	if transformed.Action != model.ActionPatchResources {
+		t.Errorf("expected action=patch_resources, got %s", transformed.Action)
+	}
+	if transformed.Parameters["container"] != "app" {
+		t.Errorf("expected container=app, got %s", transformed.Parameters["container"])
+	}
+	// 32Mi * 2 = 64Mi < 256Mi floor → should snap to 256Mi.
+	gotLimit := resource.MustParse(transformed.Parameters["memory_limit"])
+	wantLimit := resource.MustParse("256Mi")
+	if gotLimit.Cmp(wantLimit) != 0 {
+		t.Errorf("expected memory_limit=256Mi, got %s", transformed.Parameters["memory_limit"])
+	}
+}
+
+func TestExecuteDecision_AutoEscalatesOOMRestartToPatchResources(t *testing.T) {
+	// End-to-end: blocked restart_deployment + OOM evidence + opt-in
+	// → transformed to patch_resources and applied.
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "memory-hog", Namespace: "default",
+			Annotations: map[string]string{"ai-remediator/allow-patch": "resources"},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "memory-hog"}},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name: "app",
+					Resources: corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("32Mi")},
+					},
+				}},
+			}},
+		},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	cfg := patchFlagsCfg()
+
+	d := model.Decision{
+		Action: model.ActionRestartDeployment, Namespace: "default",
+		ResourceKind: "Pod", ResourceName: "memory-hog-xxx-yyy",
+		Confidence: 0.95,
+		Parameters: map[string]string{"deployment_name": "memory-hog"},
+	}
+	// "extra" includes the OOM marker used by the guard.
+	extra := "container=app lastTerminated reason=OOMKilled exit=137"
+	if err := executeDecision(context.Background(), cs, d, cfg, "BackOff", extra); err != nil {
+		t.Fatalf("expected auto-escalation to succeed, got %v", err)
+	}
+	// Verify the Deployment was patched.
+	got, _ := cs.AppsV1().Deployments("default").Get(context.Background(), "memory-hog", metav1.GetOptions{})
+	newLimit := got.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory]
+	want := resource.MustParse("256Mi")
+	if newLimit.Cmp(want) != 0 {
+		t.Errorf("expected memory_limit=256Mi after auto-escalation, got %s", newLimit.String())
 	}
 }
 

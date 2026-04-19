@@ -18,9 +18,9 @@ metadata:
     scenario: critical
     error-type: oom-killed
   annotations:
-    # Opt-in per patch_resources (vedi README "Controlled Deployment patches").
-    # Richiede anche ALLOW_PATCH_RESOURCES=true nella ConfigMap dell'agente.
-    ai-remediator/allow-patch: "resources"
+    # Opt-in a tutte le azioni patch_* (probe, resources, registry).
+    # Richiede anche ALLOW_PATCH_* nella ConfigMap dell'agente.
+    ai-remediator/allow-patch: "*"
 spec:
   replicas: 1
   selector:

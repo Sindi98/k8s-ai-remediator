@@ -816,6 +816,11 @@ kubectl -n incident-lab patch deployment healable-app --type='json' -p='[
   {"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}
 ]'
 
+# Opt-in alle azioni patch_* (cosi l'agente puo modificare probe/resources/registry
+# in autonomia quando e il caso)
+kubectl -n incident-lab annotate deployment healable-app \
+  ai-remediator/allow-patch='*' --overwrite
+
 # Attendi che il pod sia sano
 kubectl -n incident-lab rollout status deployment/healable-app --timeout=120s
 ```

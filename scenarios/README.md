@@ -12,18 +12,14 @@ e astenersi correttamente sul quarto.
 
 | File | Severita | Event reason | Opt-in richiesto | Action attesa | Esito |
 |------|----------|--------------|-------------------|----------------|-------|
-| `low-readiness-flaky.yaml` | low | `Unhealthy` | `allow-patch: probe` | `patch_probe` | **auto-fix** |
-| `medium-imagepullbackoff.yaml` | medium | `ErrImagePull` / `ImagePullBackOff` | `ALLOW_IMAGE_UPDATES=true` | `set_deployment_image` | **auto-fix** (se il registry raggiunge il nuovo tag) |
-| `critical-oomkilled.yaml` | critical | `BackOff` + stato `OOMKilled` | `allow-patch: resources` | `patch_resources` | **auto-fix** |
-| `severe-failedscheduling.yaml` | severe | `FailedScheduling` | `allow-patch: resources` (opzionale) | `patch_resources` o `mark_for_manual_fix` | **auto-fix condizionale** o astensione |
+| `low-readiness-flaky.yaml` | low | `Unhealthy` | `allow-patch: "*"` | `patch_probe` | **auto-fix** |
+| `medium-imagepullbackoff.yaml` | medium | `ErrImagePull` / `ImagePullBackOff` | `allow-patch: "*"` + `ALLOW_IMAGE_UPDATES=true` | `set_deployment_image` (tag falso) o `patch_registry` | **auto-fix** (se il registry raggiunge il nuovo tag) |
+| `critical-oomkilled.yaml` | critical | `BackOff` + stato `OOMKilled` | `allow-patch: "*"` | `patch_resources` | **auto-fix** |
+| `severe-failedscheduling.yaml` | severe | `FailedScheduling` | `allow-patch: "*"` | `patch_resources` | **auto-fix** |
 
-Tutti i manifest `low-*` e `critical-*` contengono gia l'annotation di opt-in.
-Per il `severe` va aggiunta a mano se si vuole far provare `patch_resources`:
-
-```bash
-kubectl -n incident-lab annotate deployment unschedulable \
-  ai-remediator/allow-patch=resources --overwrite
-```
+Tutti i manifest ora includono `ai-remediator/allow-patch: "*"` (opt-in a
+tutti gli scope: probe, resources, registry). Applicando il YAML, l'agente
+puo modificare autonomamente il Deployment senza passaggi extra.
 
 ## Valori prodotti dall'agente (reference)
 
@@ -139,9 +135,8 @@ kubectl apply -f scenarios/medium-imagepullbackoff.yaml
 kubectl apply -f scenarios/critical-oomkilled.yaml
 kubectl apply -f scenarios/severe-failedscheduling.yaml
 
-# Opt-in aggiuntivo per il severe (se vuoi vedere patch_resources)
-kubectl -n incident-lab annotate deployment unschedulable \
-  ai-remediator/allow-patch=resources --overwrite
+# Tutti i manifest portano gia ai-remediator/allow-patch: "*", quindi
+# niente annotation manuale da aggiungere.
 
 # Osserva gli eventi generati
 kubectl -n incident-lab get events --sort-by=.metadata.creationTimestamp
