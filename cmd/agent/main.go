@@ -140,6 +140,25 @@ func toSet(in []string) map[string]bool {
 	return out
 }
 
+// canonicalReason collapses families of Kubernetes event reasons that
+// represent the same underlying incident. Examples:
+//   - "Failed" (on image pull), "ErrImagePull", "ImagePullBackOff" all
+//     describe one failed pull sequence — dedup them as "ImagePullFailure".
+// Keep the original reason in the event/prompt; only the dedup key uses
+// this canonical form.
+func canonicalReason(reason, message string) string {
+	r := strings.ToLower(strings.TrimSpace(reason))
+	switch r {
+	case "errimagepull", "imagepullbackoff":
+		return "ImagePullFailure"
+	case "failed":
+		if strings.Contains(strings.ToLower(message), "pull") {
+			return "ImagePullFailure"
+		}
+	}
+	return reason
+}
+
 func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder, notifier notify.Notifier) {
 	seen := map[string]bool{}
 
@@ -260,7 +279,7 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 				}
 			}
 
-			signal := e.Namespace + "|" + dedupKind + "|" + dedupName + "|" + e.Reason
+			signal := e.Namespace + "|" + dedupKind + "|" + dedupName + "|" + canonicalReason(e.Reason, e.Message)
 			if ts, ok := signalSeen[signal]; ok && now.Sub(ts) < dedupeTTL {
 				m.EventsSkipped.Add(1)
 				continue

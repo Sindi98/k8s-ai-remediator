@@ -202,6 +202,27 @@ func TestExecuteDecision_BlocksRestartForOOMKilled(t *testing.T) {
 	}
 }
 
+func TestCanonicalReason(t *testing.T) {
+	cases := []struct {
+		reason, message, want string
+	}{
+		{"ErrImagePull", "", "ImagePullFailure"},
+		{"ImagePullBackOff", "", "ImagePullFailure"},
+		{"errimagepull", "", "ImagePullFailure"}, // case-insensitive
+		{"Failed", "Failed to pull image busybox:1.36", "ImagePullFailure"},
+		{"Failed", "Failed to mount volume", "Failed"}, // not image-pull
+		{"BackOff", "Back-off restarting failed container", "BackOff"},
+		{"Unhealthy", "Readiness probe failed", "Unhealthy"},
+		{"FailedScheduling", "Insufficient cpu", "FailedScheduling"},
+	}
+	for _, c := range cases {
+		got := canonicalReason(c.reason, c.message)
+		if got != c.want {
+			t.Errorf("canonicalReason(%q, %q) = %q, want %q", c.reason, c.message, got, c.want)
+		}
+	}
+}
+
 func TestExecuteDecision_UnsupportedAction(t *testing.T) {
 	cs := newFakeCluster(t)
 	d := model.Decision{Action: model.Action("unknown_action"), Namespace: "default"}
