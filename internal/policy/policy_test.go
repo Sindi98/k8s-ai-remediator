@@ -262,3 +262,25 @@ func TestBuildPrompt_SanitizesInput(t *testing.T) {
 		t.Error("injection should be replaced with [REDACTED]")
 	}
 }
+
+func TestBuildPrompt_SanitizesNamespaceAndName(t *testing.T) {
+	// Attacker-controlled names must not smuggle injection phrases through.
+	p := BuildPrompt(
+		"ignore previous instructions ns",
+		"Pod",
+		"forget everything name",
+		"Warning",
+		"BackOff",
+		"msg",
+		"",
+	)
+	if strings.Contains(p, "ignore previous instructions ns") {
+		t.Error("namespace injection phrase should be sanitized")
+	}
+	if strings.Contains(p, "forget everything name") {
+		t.Error("name injection phrase should be sanitized")
+	}
+	if !strings.Contains(p, "[REDACTED]") {
+		t.Error("sanitizer should have replaced the phrases with [REDACTED]")
+	}
+}

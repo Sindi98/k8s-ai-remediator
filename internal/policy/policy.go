@@ -149,6 +149,14 @@ func SanitizeForPrompt(s string, maxLen int) string {
 // of long prose that smaller models often ignore.
 func BuildPrompt(ns, kind, name, etype, reason, message, extra string) string {
 	const fieldMaxLen = 2000
+	// Every Kubernetes-supplied string is treated as untrusted: namespace
+	// and resource names can be user-controlled (e.g. CRD-managed workloads)
+	// and must be stripped of control chars and known injection phrases
+	// before reaching the LLM.
+	ns = SanitizeForPrompt(ns, 253)      // k8s name hard limit
+	kind = SanitizeForPrompt(kind, 64)
+	name = SanitizeForPrompt(name, 253)
+	etype = SanitizeForPrompt(etype, 32)
 	reason = SanitizeForPrompt(reason, 500)
 	message = SanitizeForPrompt(message, fieldMaxLen)
 	extra = SanitizeForPrompt(extra, fieldMaxLen)

@@ -134,6 +134,24 @@ func TestLoadFromEnv_NamespaceOverride(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnv_AutoCorrectsTimeoutInvariant(t *testing.T) {
+	// Poll context must be > Ollama HTTP timeout; misconfig should be
+	// auto-corrected at startup with a warning.
+	os.Setenv("OLLAMA_HTTP_TIMEOUT_SECONDS", "300")
+	os.Setenv("POLL_CONTEXT_TIMEOUT_SECONDS", "120")
+	defer os.Unsetenv("OLLAMA_HTTP_TIMEOUT_SECONDS")
+	defer os.Unsetenv("POLL_CONTEXT_TIMEOUT_SECONDS")
+
+	cfg := LoadFromEnv()
+	if cfg.PollContextTimeoutSec <= cfg.OllamaHTTPTimeoutSec {
+		t.Errorf("expected PollContextTimeoutSec > OllamaHTTPTimeoutSec, got %d vs %d",
+			cfg.PollContextTimeoutSec, cfg.OllamaHTTPTimeoutSec)
+	}
+	if cfg.PollContextTimeoutSec != 360 { // 300 + 60
+		t.Errorf("expected auto-correction to 360s, got %d", cfg.PollContextTimeoutSec)
+	}
+}
+
 func TestLoadFromEnv_Defaults(t *testing.T) {
 	for _, k := range []string{"OLLAMA_BASE_URL", "OLLAMA_MODEL", "DRY_RUN", "SCALE_MIN", "SCALE_MAX",
 		"POLL_INTERVAL_SECONDS", "ALLOW_IMAGE_UPDATES", "IMAGE_UPDATE_CONFIDENCE_THRESHOLD",

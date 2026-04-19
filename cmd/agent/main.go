@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -94,6 +96,12 @@ func executeDecision(
 		r, err := strconv.Atoi(d.Parameters["replicas"])
 		if err != nil {
 			return fmt.Errorf("invalid replicas parameter")
+		}
+		// Guard against int->int32 overflow before casting: strconv.Atoi
+		// returns a platform int, which on 64-bit boxes accepts values well
+		// outside int32. ScaleDeployment then applies the user policy.
+		if r < math.MinInt32 || r > math.MaxInt32 {
+			return fmt.Errorf("replicas %d out of range", r)
 		}
 		return kube.ScaleDeployment(ctx, cs, d.Namespace, depName, int32(r), cfg.MinScale, cfg.MaxScale, cfg.DryRun)
 
@@ -226,7 +234,8 @@ func toSet(in []string) map[string]bool {
 // Keep the original reason in the event/prompt; only the dedup key uses
 // this canonical form.
 func canonicalReason(reason, message string) string {
-	r := strings.ToLower(strings.TrimSpace(reason))
+	trimmed := strings.TrimSpace(reason)
+	r := strings.ToLower(trimmed)
 	switch r {
 	case "errimagepull", "imagepullbackoff":
 		return "ImagePullFailure"
@@ -235,16 +244,71 @@ func canonicalReason(reason, message string) string {
 			return "ImagePullFailure"
 		}
 	}
-	return reason
+	// Return the trimmed form so "Failed" and "  Failed  " collapse to the
+	// same dedup key. Case is preserved for human readability in logs.
+	return trimmed
+}
+
+// dedupCache bundles the two dedup maps with a mutex. Today poll() runs
+// single-threaded on the leader, but the mutex documents the invariant and
+// keeps the cache safe if a future change (extra goroutine, informer) makes
+// access concurrent. Both maps are TTL-bounded to prevent unbounded growth
+// on long-running agents.
+type dedupCache struct {
+	mu         sync.Mutex
+	seen       map[string]time.Time
+	signalSeen map[string]time.Time
+}
+
+func (d *dedupCache) markSeen(key string, now time.Time) (fresh bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.seen[key]; ok {
+		return false
+	}
+	d.seen[key] = now
+	return true
+}
+
+func (d *dedupCache) isSignalFresh(signal string, now time.Time, ttl time.Duration) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ts, ok := d.signalSeen[signal]
+	return ok && now.Sub(ts) < ttl
+}
+
+func (d *dedupCache) markSignal(signal string, now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.signalSeen[signal] = now
+}
+
+func (d *dedupCache) evict(now time.Time, signalTTL, seenTTL time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for sig, ts := range d.signalSeen {
+		if now.Sub(ts) >= signalTTL {
+			delete(d.signalSeen, sig)
+		}
+	}
+	for key, ts := range d.seen {
+		if now.Sub(ts) >= seenTTL {
+			delete(d.seen, key)
+		}
+	}
 }
 
 func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder, notifier notify.Notifier) {
-	seen := map[string]bool{}
+	cache := &dedupCache{
+		seen:       map[string]time.Time{},
+		signalSeen: map[string]time.Time{},
+	}
 
-	// Signal dedup: suppresses identical (ns|kind|name|reason) within a TTL.
-	// Protects Ollama from bursts (e.g. flaky probes emitting many Unhealthy events).
-	signalSeen := map[string]time.Time{}
 	dedupeTTL := time.Duration(cfg.DedupeTTLSec) * time.Second
+	seenTTL := time.Duration(cfg.EventSeenTTLSec) * time.Second
+	if seenTTL <= 0 {
+		seenTTL = time.Hour
+	}
 
 	// Build O(1) namespace lookup tables once. include is empty -> "all
 	// allowed except excluded"; non-empty include -> only listed allowed.
@@ -265,6 +329,7 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 		"allowPatchRegistry", cfg.AllowPatchRegistry,
 		"patchConfidenceThreshold", cfg.PatchConfidenceThreshold,
 		"dedupeTTLSec", cfg.DedupeTTLSec,
+		"eventSeenTTLSec", cfg.EventSeenTTLSec,
 		"maxEventsPerPoll", cfg.MaxEventsPerPoll,
 		"includeNamespaces", cfg.IncludeNamespaces,
 		"excludeNamespaces", cfg.ExcludeNamespaces,
@@ -294,20 +359,15 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 		}
 
 		now := time.Now()
-		for sig, ts := range signalSeen {
-			if now.Sub(ts) >= dedupeTTL {
-				delete(signalSeen, sig)
-			}
-		}
+		cache.evict(now, dedupeTTL, seenTTL)
 
 		processed := 0
 		for _, e := range list.Items {
 			key := e.Namespace + "/" + e.Name + "/" + e.ResourceVersion
-			if seen[key] {
+			if !cache.markSeen(key, now) {
 				m.EventsSkipped.Add(1)
 				continue
 			}
-			seen[key] = true
 
 			if !strings.EqualFold(e.Type, "Warning") {
 				m.EventsSkipped.Add(1)
@@ -359,7 +419,7 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 			}
 
 			signal := e.Namespace + "|" + dedupKind + "|" + dedupName + "|" + canonicalReason(e.Reason, e.Message)
-			if ts, ok := signalSeen[signal]; ok && now.Sub(ts) < dedupeTTL {
+			if cache.isSignalFresh(signal, now, dedupeTTL) {
 				m.EventsSkipped.Add(1)
 				continue
 			}
@@ -371,7 +431,7 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 				continue
 			}
 
-			signalSeen[signal] = now
+			cache.markSignal(signal, now)
 			processed++
 			m.EventsProcessed.Add(1)
 
