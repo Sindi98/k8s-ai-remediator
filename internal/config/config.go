@@ -57,6 +57,16 @@ type AgentConfig struct {
 	// LLM confidence field. Defaults to 0.85.
 	PatchConfidenceThreshold float64
 
+	// IncludeNamespaces, when non-empty, restricts the agent to events
+	// originating from one of the listed namespaces. ExcludeNamespaces
+	// always wins: even an included namespace is skipped if also listed
+	// in ExcludeNamespaces. Defaults to empty (all namespaces allowed).
+	IncludeNamespaces []string
+	// ExcludeNamespaces drops events from the listed namespaces. Defaults
+	// to the standard system namespaces so that the agent never reacts to
+	// CoreDNS, kube-scheduler, local-path-provisioner and friends.
+	ExcludeNamespaces []string
+
 	// NotifySMTPHost, Port, User, Password, From, To configure the SMTP
 	// notifier that emails a short report after every executeDecision.
 	// If host/user/to are empty the notifier is disabled (no-op).
@@ -99,6 +109,8 @@ func LoadFromEnv() AgentConfig {
 		AllowPatchResources:      Getbool("ALLOW_PATCH_RESOURCES", false),
 		AllowPatchRegistry:       Getbool("ALLOW_PATCH_REGISTRY", false),
 		PatchConfidenceThreshold: Getfloat("PATCH_CONFIDENCE_THRESHOLD", 0.85),
+		IncludeNamespaces:        ParseCSV(Getenv("INCLUDE_NAMESPACES", "")),
+		ExcludeNamespaces:        ParseCSV(Getenv("EXCLUDE_NAMESPACES", "kube-system,kube-public,kube-node-lease,local-path-storage")),
 		NotifySMTPHost:           Getenv("NOTIFY_SMTP_HOST", ""),
 		NotifySMTPPort:           Getint("NOTIFY_SMTP_PORT", 587),
 		NotifySMTPUser:           Getenv("NOTIFY_SMTP_USER", ""),
@@ -135,6 +147,27 @@ func Getint(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// ParseCSV trims whitespace, drops empty entries and returns nil for an
+// empty input. Useful for namespace lists where "ns1, ns2 ,,ns3" should
+// become {"ns1", "ns2", "ns3"}.
+func ParseCSV(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func Getfloat(key string, def float64) float64 {

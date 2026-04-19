@@ -325,6 +325,8 @@ Tutte le variabili sono lette da environment (tipicamente via ConfigMap).
 | `POLL_INTERVAL_SECONDS` | `30` | Intervallo di polling degli eventi (secondi) |
 | `DEDUPE_TTL_SECONDS` | `300` | TTL di deduplicazione per `(ns, kind, name, reason)`: eventi identici entro la finestra non generano una nuova chiamata LLM |
 | `MAX_EVENTS_PER_POLL` | `10` | Numero massimo di eventi che attivano una chiamata LLM per ciclo di polling; gli eccessi sono rinviati al polling successivo |
+| `INCLUDE_NAMESPACES` | *(vuoto)* | Allowlist di namespace, comma-separated. Se valorizzato, l'agente reagisce **solo** a eventi di quei namespace. Vuoto = tutti i namespace tranne quelli esclusi |
+| `EXCLUDE_NAMESPACES` | `kube-system,kube-public,kube-node-lease,local-path-storage` | Denylist di namespace di sistema. Eventi qui non vengono mai inviati al LLM. Vince sempre sull'allowlist (un namespace listato in entrambi viene escluso) |
 
 ### Variabili di policy
 
@@ -1075,13 +1077,19 @@ Possibili cause:
 ### `ollama rate limiter: context deadline exceeded`
 
 La richiesta LLM e stata accodata piu a lungo del `pollCtx`. Tipico di
-storm di eventi non deduplicati (pod gia ruotati con nomi differenti).
+storm di eventi non deduplicati (pod gia ruotati con nomi differenti)
+oppure eventi di sistema che non dovremmo neanche processare.
+
 Verifica:
-- `"dedupeTTLSec"` e `"maxEventsPerPoll"` siano non-zero nel log `agent started`.
+- `"excludeNamespaces"` allo startup contenga `kube-system`, `kube-public`,
+  `kube-node-lease`, `local-path-storage`. Senza il denylist, ogni warning
+  di CoreDNS o kube-scheduler arriva al LLM.
+- `"dedupeTTLSec"` e `"maxEventsPerPoll"` siano non-zero.
 - La inferenza funzioni: `ResolveDeploymentFromPod` + `InferDeploymentFromPodName`
   devono convergere tutti i pod fantasma sullo stesso Deployment.
 - In un cluster di test con molti eventi vecchi, aspetta un giro o due: la
-  dedup TTL e il cap drenano la coda.
+  dedup TTL e il cap drenano la coda. Per ridurre ulteriormente il rumore
+  passa a `INCLUDE_NAMESPACES=incident-lab` (allowlist stretta).
 
 ### `Post "...": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`
 
