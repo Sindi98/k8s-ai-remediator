@@ -4,10 +4,10 @@
 # puo soddisfare. Lo scheduler fallisce ripetutamente generando eventi
 # Warning di reason FailedScheduling.
 #
-# Impatto: il workload non partira MAI senza intervento umano (ridurre i
-# requests, aggiungere nodi, cambiare profilo hw). E grave perche e un
-# blocco permanente e nessuna azione automatica dell'agente puo risolverlo.
-# Remediation tipica dell'agente: mark_for_manual_fix o ask_human.
+# Impatto: il workload non partira MAI senza intervento umano a meno che
+# l'agente non abbia l'opt-in "resources" per abbassare le requests a
+# valori schedulabili (vedi annotation sotto).
+# Remediation attesa: con opt-in → patch_resources; senza → mark_for_manual_fix.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,6 +17,10 @@ metadata:
     app: unschedulable
     scenario: severe
     error-type: failed-scheduling
+  annotations:
+    # Opt-in a tutte le azioni patch_* (probe, resources, registry).
+    # Richiede anche ALLOW_PATCH_* nella ConfigMap dell'agente.
+    ai-remediator/allow-patch: "*"
 spec:
   replicas: 1
   selector:

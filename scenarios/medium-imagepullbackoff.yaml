@@ -17,6 +17,11 @@ metadata:
     app: broken-image
     scenario: medium
     error-type: image-pull-backoff
+  annotations:
+    # Opt-in a tutte le azioni patch_* (utile per patch_registry se il
+    # problema e un prefisso registry errato). Per il tag falso servira
+    # comunque set_deployment_image via ALLOW_IMAGE_UPDATES=true.
+    ai-remediator/allow-patch: "*"
 spec:
   replicas: 1
   selector:
