@@ -372,6 +372,74 @@ All variables are read from environment variables (typically via ConfigMap).
 | `LEASE_NAME` | `ai-remediator-leader` | Lease resource name |
 | `LEASE_NAMESPACE` | `ai-remediator` | Lease resource namespace |
 
+### Dedup Backend
+
+By default dedup state (events already seen + recent signals) lives in memory: simple, zero-ops, but **lost on pod restart**, so right after a restart the agent may remediate the same incident twice. The Redis backend persists that state so dedup survives restarts (and, in the future, can be shared across replicas).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DEDUP_BACKEND` | `memory` | Dedup store backend. Values: `memory` (in-process), `redis` (shared, survives restarts) |
+| `REDIS_ADDR` | *(empty)* | Redis `host:port`. Required when `DEDUP_BACKEND=redis` |
+| `REDIS_PASSWORD` | *(empty)* | Redis password (typically injected from a Secret). Leave empty for unauthenticated Redis |
+| `REDIS_DB` | `0` | Redis logical DB number |
+| `REDIS_KEY_PREFIX` | `k8s-remediator:` | Prefix applied to every key the agent writes. Useful when sharing Redis with other services |
+
+**Behaviour during a Redis outage**: the store **fails open** (`MarkSeen` returns `fresh=true`, `IsSignalFresh` returns `false`). In practice: if Redis is down the agent behaves as if dedup were in-memory (possible duplicates), but **never blocks remediation**. If the initial connection fails at startup the agent automatically falls back to `memory` and logs a warning.
+
+#### Quick-start: Redis backend
+
+The `deploy/redis.yaml` manifest installs a single-instance Redis (Deployment + Service + PVC + NetworkPolicy, `redis:7.2-alpine`, AOF enabled, non-root, read-only rootfs):
+
+```bash
+# 1. (optional, recommended) Secret with the password
+kubectl -n ai-remediator create secret generic ai-remediator-redis \
+  --from-literal=password="$(openssl rand -base64 32)"
+
+# 2. Apply the manifest
+kubectl apply -f deploy/redis.yaml
+
+# 3. Wait until Redis is ready
+kubectl -n ai-remediator rollout status deployment/ai-remediator-redis --timeout=60s
+
+# 4. Add the env vars to the agent ConfigMap and reload the deployment
+kubectl -n ai-remediator patch configmap ai-remediator-config --type=merge -p '{
+  "data": {
+    "DEDUP_BACKEND": "redis",
+    "REDIS_ADDR": "ai-remediator-redis:6379",
+    "REDIS_KEY_PREFIX": "k8s-remediator:"
+  }
+}'
+
+# 5. Inject REDIS_PASSWORD from the Secret (if created at step 1)
+kubectl -n ai-remediator patch deployment ai-remediator --type='json' -p='[
+  {"op":"add","path":"/spec/template/spec/containers/0/env","value":[
+    {"name":"REDIS_PASSWORD","valueFrom":{"secretKeyRef":{"name":"ai-remediator-redis","key":"password"}}}
+  ]}
+]'
+
+# 6. Restart and verify
+kubectl -n ai-remediator rollout restart deployment/ai-remediator
+kubectl -n ai-remediator logs deploy/ai-remediator --tail=5 | grep 'dedup store'
+# expected: "dedup store initialised" backend=redis
+```
+
+**Verify on the Redis side**:
+
+```bash
+kubectl -n ai-remediator exec deploy/ai-remediator-redis -- \
+  redis-cli -a "$REDIS_PASSWORD" --no-auth-warning KEYS 'k8s-remediator:*'
+# seen:<ns>/<name>/<resourceVersion>   (TTL = EVENT_SEEN_TTL_SECONDS)
+# signal:<ns>|<kind>|<name>|<reason>   (TTL = DEDUPE_TTL_SECONDS)
+```
+
+**When you do NOT need Redis**:
+- The agent rarely restarts and you are fine with a handful of signals being re-evaluated after a restart.
+- You run with `DRY_RUN=true` purely for observation.
+
+**When you do**:
+- Production with auto-remediation policies enabled (`ALLOW_PATCH_*`), where a duplicate `patch_resources` or `restart_deployment` right after a restart may amplify an incident instead of resolving it.
+- You plan to scale the agent beyond a single replica (also requires loop-level changes, outside the scope of this step).
+
 ---
 
 ## Supported Remediations
