@@ -250,7 +250,20 @@ func canonicalReason(reason, message string) string {
 }
 
 func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder, notifier notify.Notifier) {
-	runLoopWithStore(ctx, cs, ollamaClient, cfg, m, notifier, dedup.NewMemoryStore())
+	store, err := dedup.NewStore(dedup.BackendConfig{
+		Backend:        cfg.DedupBackend,
+		RedisAddr:      cfg.RedisAddr,
+		RedisPassword:  cfg.RedisPassword,
+		RedisDB:        cfg.RedisDB,
+		RedisKeyPrefix: cfg.RedisKeyPrefix,
+	})
+	if err != nil {
+		slog.Error("dedup store init failed, falling back to in-memory", "error", err)
+		store = dedup.NewMemoryStore()
+	} else {
+		slog.Info("dedup store initialised", "backend", cfg.DedupBackend)
+	}
+	runLoopWithStore(ctx, cs, ollamaClient, cfg, m, notifier, store)
 }
 
 // runLoopWithStore is the injectable form of runLoop: tests and future
@@ -318,7 +331,7 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 		processed := 0
 		for _, e := range list.Items {
 			key := e.Namespace + "/" + e.Name + "/" + e.ResourceVersion
-			if !cache.MarkSeen(key, now) {
+			if !cache.MarkSeen(key, now, seenTTL) {
 				m.EventsSkipped.Add(1)
 				continue
 			}
@@ -385,7 +398,7 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 				continue
 			}
 
-			cache.MarkSignal(signal, now)
+			cache.MarkSignal(signal, now, dedupeTTL)
 			processed++
 			m.EventsProcessed.Add(1)
 

@@ -84,6 +84,22 @@ type AgentConfig struct {
 	// NotifyMinSeverity filters which decisions trigger an email.
 	// Uses the same severity vocabulary as MinSeverity. Defaults to "medium".
 	NotifyMinSeverity string
+
+	// DedupBackend selects the dedup store implementation.
+	// Accepted values: "memory" (default, in-process) or "redis" (shared,
+	// survives pod restart).
+	DedupBackend string
+	// RedisAddr is the host:port of the Redis instance used when
+	// DedupBackend=redis. Ignored otherwise.
+	RedisAddr string
+	// RedisPassword is read from REDIS_PASSWORD (typically mounted from a
+	// Secret). Leave empty for unauthenticated Redis.
+	RedisPassword string
+	// RedisDB selects the Redis logical DB number. Defaults to 0.
+	RedisDB int
+	// RedisKeyPrefix namespaces all keys written by the agent. Useful when
+	// sharing a Redis instance across services. Defaults to "k8s-remediator:".
+	RedisKeyPrefix string
 }
 
 // LoadFromEnv reads agent configuration from environment variables and
@@ -126,6 +142,11 @@ func LoadFromEnv() AgentConfig {
 		NotifyFrom:               Getenv("NOTIFY_FROM", ""),
 		NotifyTo:                 Getenv("NOTIFY_TO", ""),
 		NotifyMinSeverity:        Getenv("NOTIFY_MIN_SEVERITY", "medium"),
+		DedupBackend:             Getenv("DEDUP_BACKEND", "memory"),
+		RedisAddr:                Getenv("REDIS_ADDR", ""),
+		RedisPassword:            Getenv("REDIS_PASSWORD", ""),
+		RedisDB:                  Getint("REDIS_DB", 0),
+		RedisKeyPrefix:           Getenv("REDIS_KEY_PREFIX", "k8s-remediator:"),
 	}
 
 	// Invariant: the poll-wide context must outlive a single Ollama call,

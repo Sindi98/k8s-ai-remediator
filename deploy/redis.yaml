@@ -1,0 +1,145 @@
+## Redis backend for ai-remediator dedup state
+##
+## Small single-instance Redis used by the agent to deduplicate Kubernetes
+## events across pod restarts. Not intended for high availability: if
+## Redis goes down the agent fails open (may re-apply a remediation) but
+## will never block event processing.
+##
+## Usage:
+##   1. (optional) create a password Secret:
+##        kubectl -n ai-remediator create secret generic ai-remediator-redis \
+##          --from-literal=password="$(openssl rand -base64 32)"
+##   2. kubectl apply -f redis.yaml
+##   3. configure the agent Deployment with:
+##        DEDUP_BACKEND=redis
+##        REDIS_ADDR=ai-remediator-redis:6379
+##        REDIS_PASSWORD (valueFrom the Secret above, optional)
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ai-remediator-redis
+  namespace: ai-remediator
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-remediator-redis
+  namespace: ai-remediator
+  labels:
+    app.kubernetes.io/name: ai-remediator-redis
+    app.kubernetes.io/component: dedup-store
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  ## single-writer; avoid two pods racing on the PVC
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ai-remediator-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ai-remediator-redis
+        app.kubernetes.io/component: dedup-store
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+        - name: redis
+          image: redis:7.2-alpine
+          args:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --maxmemory
+            - 128mb
+            - --maxmemory-policy
+            - allkeys-lru
+            - --requirepass
+            - $(REDIS_PASSWORD)
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ai-remediator-redis
+                  key: password
+                  optional: true  ## empty secret => unauthenticated Redis
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: [sh, -c, "redis-cli -a \"$REDIS_PASSWORD\" ping | grep -q PONG"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 160Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: ai-remediator-redis
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-remediator-redis
+  namespace: ai-remediator
+  labels:
+    app.kubernetes.io/name: ai-remediator-redis
+spec:
+  selector:
+    app.kubernetes.io/name: ai-remediator-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+
+---
+## NetworkPolicy: only the agent ServiceAccount's pods may reach Redis.
+## Assumes the agent pod carries label app.kubernetes.io/name=ai-remediator.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-remediator-redis
+  namespace: ai-remediator
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ai-remediator-redis
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ai-remediator
+      ports:
+        - protocol: TCP
+          port: 6379

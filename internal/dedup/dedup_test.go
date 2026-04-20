@@ -9,10 +9,10 @@ func TestMemoryStore_MarkSeenIsIdempotent(t *testing.T) {
 	s := NewMemoryStore()
 	now := time.Now()
 
-	if fresh := s.MarkSeen("k", now); !fresh {
+	if fresh := s.MarkSeen("k", now, time.Hour); !fresh {
 		t.Fatal("first MarkSeen should return fresh=true")
 	}
-	if fresh := s.MarkSeen("k", now); fresh {
+	if fresh := s.MarkSeen("k", now, time.Hour); fresh {
 		t.Fatal("second MarkSeen should return fresh=false")
 	}
 }
@@ -25,7 +25,7 @@ func TestMemoryStore_SignalFreshness(t *testing.T) {
 	if s.IsSignalFresh("sig", now, ttl) {
 		t.Fatal("unseen signal should not be fresh")
 	}
-	s.MarkSignal("sig", now)
+	s.MarkSignal("sig", now, ttl)
 	if !s.IsSignalFresh("sig", now.Add(ttl/2), ttl) {
 		t.Fatal("signal within ttl should be fresh")
 	}
