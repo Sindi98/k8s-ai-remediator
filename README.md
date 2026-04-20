@@ -41,12 +41,12 @@ Agente AI in Go che osserva eventi Kubernetes di tipo `Warning` e applica remedi
                              |
                   Warning Events (poll ogni N sec)
                              |
-                    +--------v---------+
-                    |  ai-remediator   |
-                    |  (Go agent)      |
-                    +--------+---------+
+                    +--------v---------+       +------------------+
+                    |  ai-remediator   |<----->|  Dedup Store     |
+                    |  (Go agent)      |       |  memory | Redis  |
+                    +--------+---------+       +------------------+
                              |
-                  Prompt JSON strutturato
+                  Prompt JSON strutturato (solo eventi freschi)
                              |
                     +--------v---------+
                     |     Ollama       |
@@ -55,25 +55,30 @@ Agente AI in Go che osserva eventi Kubernetes di tipo `Warning` e applica remedi
                              |
                   Decision JSON (action, confidence, params)
                              |
-                    +--------v---------+
-                    |  ai-remediator   |
-                    |  Execution Engine|
-                    +------------------+
+                    +--------v---------+       +------------------+
+                    |  ai-remediator   |------>|  SMTP Notifier   |
+                    |  Execution Engine|       |  (opzionale)     |
+                    +--------+---------+       +------------------+
                              |
-              Remediation (restart, delete, scale, ...)
+              Remediation (restart, delete, scale, patch, ...)
 ```
 
 **Flusso operativo:**
 
 1. Kubernetes genera un evento `Warning` (CrashLoopBackOff, ImagePullBackOff, ecc.)
 2. L'agente elenca gli eventi via API e filtra quelli di tipo Warning non ancora processati
-3. Per ogni evento costruisce un prompt con namespace, kind, name, reason, message e uno snapshot del Deployment associato
-4. Invia il prompt a Ollama con uno schema JSON che vincola la risposta
-5. Riceve una decisione strutturata con action, confidence, parameters
-6. Valida la decisione: allowlist, policy bounds, OCI image format, confidence threshold
-7. Esegue l'azione (o logga in dry-run)
+3. Il dedup store (`internal/dedup`, memory o Redis) scarta:
+   - eventi gia visti per `resourceVersion` (`seen:`)
+   - segnali `(ns, kind, name, reason)` processati entro `DEDUPE_TTL_SECONDS` (`signal:`)
+4. Per ogni evento fresco costruisce un prompt con namespace, kind, name, reason, message e uno snapshot del Deployment associato
+5. Invia il prompt a Ollama con uno schema JSON che vincola la risposta
+6. Riceve una decisione strutturata con action, confidence, parameters
+7. Valida la decisione: allowlist, policy bounds, OCI image format, confidence threshold
+8. Esegue l'azione (o logga in dry-run) e, se configurato, invia una email via SMTP (`internal/notify`) con il riassunto decisione + esito
 
 Quando l'evento riguarda un Pod, l'agente risale al Deployment tramite `ownerReferences` (Pod -> ReplicaSet -> Deployment).
+
+Il dedup store e pluggabile: di default `memory` (in-process, si azzera al restart), opzionalmente Redis per sopravvivere ai restart del pod (vedi [Backend di deduplicazione](#backend-di-deduplicazione)). Su outage di Redis lo store fallisce aperto: l'agente torna a comportarsi come con dedup in-memory, non blocca mai la remediation.
 
 ---
 
@@ -87,9 +92,9 @@ k8s-ai-remediator/
 │       └── main_test.go         # Test di integrazione per executeDecision
 ├── internal/
 │   ├── model/
-│   │   └── model.go            # Tipi condivisi: Action, Decision, ChatRequest/Response
+│   │   └── model.go            # Tipi condivisi: Action, Decision, Severity, tipi Ollama API
 │   ├── config/
-│   │   ├── config.go           # AgentConfig, parsing variabili d'ambiente
+│   │   ├── config.go           # AgentConfig, parsing variabili d'ambiente (incluse DEDUP_* e NOTIFY_*)
 │   │   └── config_test.go
 │   ├── ollama/
 │   │   ├── client.go           # Client HTTP con rate limiting, retry, TLS
@@ -100,11 +105,23 @@ k8s-ai-remediator/
 │   ├── policy/
 │   │   ├── policy.go           # Allowlist, validazione OCI, sanitizzazione prompt
 │   │   └── policy_test.go
+│   ├── dedup/
+│   │   ├── dedup.go            # Interfaccia Store + implementazione MemoryStore (in-process)
+│   │   ├── redis.go            # RedisStore (TTL nativo, fail-open sugli errori)
+│   │   ├── factory.go          # NewStore(BackendConfig) -> memory|redis
+│   │   └── *_test.go           # Test miniredis per atomicita, TTL, isolamento del prefix
+│   ├── notify/
+│   │   ├── notify.go           # Notifier SMTP (STARTTLS, fire-and-forget con cap concorrente)
+│   │   └── notify_test.go
 │   └── metrics/
 │       ├── metrics.go          # Metriche Prometheus-compatible (zero dipendenze esterne)
 │       └── metrics_test.go
 ├── deploy/
-│   └── rbac-namespaced.yaml    # RBAC namespace-scoped di esempio
+│   ├── rbac-namespaced.yaml    # RBAC namespace-scoped di esempio
+│   └── redis.yaml              # Redis mono-istanza per il dedup (Deployment+Service+PVC+NetworkPolicy)
+├── scenarios/                   # Manifest di test: low/medium/critical/severe
+├── scripts/
+│   └── mirror-images.sh        # Mirror batch di redis/busybox/polinux sul registry locale
 ├── .github/
 │   └── workflows/
 │       └── ci.yml              # CI/CD: lint, test, build, Docker, security scan
@@ -117,11 +134,13 @@ k8s-ai-remediator/
 
 | Package | Responsabilita |
 |---------|---------------|
-| `internal/model` | Tipi condivisi tra tutti i package: costanti Action, struct Decision, tipi Ollama API |
-| `internal/config` | `AgentConfig` con tutti i parametri e helper per parsing env var con default |
+| `internal/model` | Tipi condivisi tra tutti i package: costanti Action, struct Decision, Severity, tipi Ollama API |
+| `internal/config` | `AgentConfig` con tutti i parametri e helper per parsing env var con default (include `DEDUP_BACKEND`, `REDIS_*`, `NOTIFY_*`) |
 | `internal/ollama` | Client HTTP per Ollama con rate limiting (`golang.org/x/time/rate`), retry con exponential backoff, supporto TLS |
 | `internal/kube` | Tutte le operazioni Kubernetes: risoluzione Pod->Deployment, restart, delete, scale, set image, log inspection, snapshot |
 | `internal/policy` | Allowlist delle azioni, validazione OCI image, blocco image update unsafe, sanitizzazione prompt anti-injection |
+| `internal/dedup` | Store pluggabile per la dedup: `MemoryStore` (mappa+mutex, eviction on-demand) e `RedisStore` (`SetNX`+TTL nativi, fail-open sugli errori). Factory `NewStore(BackendConfig)` |
+| `internal/notify` | Notifier SMTP fire-and-forget (PLAIN su STARTTLS). Se `HOST`/`USER`/`TO` sono vuoti restituisce un no-op; cap di concorrenza per evitare goroutine leak durante event storm |
 | `internal/metrics` | Metriche in formato Prometheus text exposition, zero dipendenze esterne |
 
 ---
