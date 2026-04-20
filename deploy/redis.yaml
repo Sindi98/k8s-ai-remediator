@@ -123,8 +123,11 @@ spec:
       targetPort: redis
 
 ---
-## NetworkPolicy: only the agent ServiceAccount's pods may reach Redis.
-## Assumes the agent pod carries label app.kubernetes.io/name=ai-remediator.
+## NetworkPolicy: restricts Redis ingress to agent pods in the same namespace.
+## Accepts both the "app.kubernetes.io/name=ai-remediator" label (manifest-
+## style deployments) and "app=ai-remediator" (kubectl create deployment
+## default). If you deploy the agent with a different label, drop this
+## NetworkPolicy or add your own matchExpressions here.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -138,8 +141,15 @@ spec:
   ingress:
     - from:
         - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: ai-remediator
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: [ai-remediator]
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [ai-remediator]
       ports:
         - protocol: TCP
           port: 6379

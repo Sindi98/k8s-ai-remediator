@@ -423,6 +423,13 @@ kubectl -n ai-remediator logs deploy/ai-remediator --tail=5 | grep 'dedup store'
 # expected: "dedup store initialised" backend=redis
 ```
 
+> **NetworkPolicy note**: the manifest accepts ingress from pods labeled
+> `app=ai-remediator` or `app.kubernetes.io/name=ai-remediator`
+> (`kubectl create deployment` default and best-practice convention,
+> respectively). If your agent uses different labels or the cluster CNI
+> does not enforce NetworkPolicies (Docker Desktop does not by default),
+> delete `networkpolicy/ai-remediator-redis` to avoid surprises.
+
 **Verify on the Redis side**:
 
 ```bash
