@@ -176,6 +176,34 @@ go mod tidy
 CGO_ENABLED=0 go build -o agent ./cmd/agent
 ```
 
+### Mirror delle immagini upstream sul registry locale
+
+Su cluster locali senza egress (Docker Desktop, kind, minikube) il kubelet
+non riesce a tirare le immagini da Docker Hub e i pod finiscono in
+`ImagePullBackOff`. Oltre a `ai-remediator`, i manifest del repo usano anche
+`redis:7.2-alpine` (backend dedup) e `busybox:1.36` / `polinux/stress:latest`
+(scenari del lab). Per pre-caricarle tutte sul registry locale usa lo
+script:
+
+```bash
+# Pull+tag+push verso host.docker.internal:5050 (default)
+scripts/mirror-images.sh
+
+# Registry diverso
+REGISTRY=kind-registry:5000 scripts/mirror-images.sh
+
+# Solo alcune immagini
+scripts/mirror-images.sh redis:7.2-alpine busybox:1.36
+```
+
+Dopo il mirror, riscrivi l'immagine del workload per puntare al registry
+locale, ad esempio:
+
+```bash
+kubectl -n ai-remediator set image deploy/ai-remediator-redis \
+  redis=host.docker.internal:5050/redis:7.2-alpine
+```
+
 ---
 
 ## Installazione su Kubernetes
@@ -1211,6 +1239,52 @@ Invariante: `POLL_CONTEXT_TIMEOUT_SECONDS > OLLAMA_HTTP_TIMEOUT_SECONDS`.
 
 Qui sta scadendo il `pollCtx`, non il client HTTP. Alza
 `POLL_CONTEXT_TIMEOUT_SECONDS` (vedi sopra).
+
+### Pod in `ImagePullBackOff` (Redis, `healable-app`, scenari)
+
+Su cluster locali senza egress Docker Hub (Docker Desktop, kind, minikube)
+il kubelet non riesce a pullare `redis:7.2-alpine`, `busybox:1.36` o
+`polinux/stress:latest`. Sintomo: `kubectl -n <ns> describe pod ...`
+mostra `Failed to pull image` verso `registry-1.docker.io`.
+
+Soluzione: esegui lo script di mirror una volta e riscrivi l'immagine del
+workload per puntare al registry locale:
+
+```bash
+scripts/mirror-images.sh
+
+# Redis
+kubectl -n ai-remediator set image deploy/ai-remediator-redis \
+  redis=host.docker.internal:5050/redis:7.2-alpine
+
+# Scenari (una volta per Deployment interessato)
+kubectl -n incident-lab set image deploy/<nome> <container>=host.docker.internal:5050/busybox:1.36
+```
+
+Dettagli nella sezione [Mirror delle immagini upstream sul registry locale](#mirror-delle-immagini-upstream-sul-registry-locale).
+
+### `notify: SMTP not configured, notifications disabled` dopo aver impostato il Secret
+
+L'agente logga `SMTP not configured` se almeno una tra
+`NOTIFY_SMTP_HOST`, `NOTIFY_SMTP_USER`, `NOTIFY_TO` e vuota nell'env del
+container. Cause frequenti:
+
+1. **Il Secret non esiste**: `kubectl set env --from=secret/ai-remediator-notify`
+   restituisce `secrets "ai-remediator-notify" not found`. Crealo prima
+   (vedi [Notifiche email](#notifiche-email)), poi riesegui il comando.
+2. **Il Secret non e stato montato sul Deployment**: il patch `envFrom`
+   non e stato applicato o lo e stato su un altro Deployment. Verifica:
+   ```bash
+   kubectl -n ai-remediator get deployment ai-remediator \
+     -o jsonpath='{.spec.template.spec.containers[0].envFrom}' | jq .
+   ```
+   Deve contenere sia `configMapRef: ai-remediator-config` sia
+   `secretRef: ai-remediator-notify`.
+3. **Manca il `rollout restart`** dopo aver montato il Secret: le env
+   esistenti nei pod restano vuote. Forza il rollout:
+   ```bash
+   kubectl -n ai-remediator rollout restart deployment/ai-remediator
+   ```
 
 ### `execute decision failed` con uno dei seguenti messaggi
 
