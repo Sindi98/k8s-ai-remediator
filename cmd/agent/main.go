@@ -10,7 +10,6 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +22,7 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 
 	"github.com/tuo-user/k8s-ai-remediator/internal/config"
+	"github.com/tuo-user/k8s-ai-remediator/internal/dedup"
 	"github.com/tuo-user/k8s-ai-remediator/internal/kube"
 	"github.com/tuo-user/k8s-ai-remediator/internal/metrics"
 	"github.com/tuo-user/k8s-ai-remediator/internal/model"
@@ -249,60 +249,14 @@ func canonicalReason(reason, message string) string {
 	return trimmed
 }
 
-// dedupCache bundles the two dedup maps with a mutex. Today poll() runs
-// single-threaded on the leader, but the mutex documents the invariant and
-// keeps the cache safe if a future change (extra goroutine, informer) makes
-// access concurrent. Both maps are TTL-bounded to prevent unbounded growth
-// on long-running agents.
-type dedupCache struct {
-	mu         sync.Mutex
-	seen       map[string]time.Time
-	signalSeen map[string]time.Time
-}
-
-func (d *dedupCache) markSeen(key string, now time.Time) (fresh bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if _, ok := d.seen[key]; ok {
-		return false
-	}
-	d.seen[key] = now
-	return true
-}
-
-func (d *dedupCache) isSignalFresh(signal string, now time.Time, ttl time.Duration) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	ts, ok := d.signalSeen[signal]
-	return ok && now.Sub(ts) < ttl
-}
-
-func (d *dedupCache) markSignal(signal string, now time.Time) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.signalSeen[signal] = now
-}
-
-func (d *dedupCache) evict(now time.Time, signalTTL, seenTTL time.Duration) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	for sig, ts := range d.signalSeen {
-		if now.Sub(ts) >= signalTTL {
-			delete(d.signalSeen, sig)
-		}
-	}
-	for key, ts := range d.seen {
-		if now.Sub(ts) >= seenTTL {
-			delete(d.seen, key)
-		}
-	}
-}
-
 func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder, notifier notify.Notifier) {
-	cache := &dedupCache{
-		seen:       map[string]time.Time{},
-		signalSeen: map[string]time.Time{},
-	}
+	runLoopWithStore(ctx, cs, ollamaClient, cfg, m, notifier, dedup.NewMemoryStore())
+}
+
+// runLoopWithStore is the injectable form of runLoop: tests and future
+// alternative backends (Redis, SQLite, ConfigMap) can pass a custom Store
+// so dedup state survives across agent restarts.
+func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder, notifier notify.Notifier, cache dedup.Store) {
 
 	dedupeTTL := time.Duration(cfg.DedupeTTLSec) * time.Second
 	seenTTL := time.Duration(cfg.EventSeenTTLSec) * time.Second
@@ -359,12 +313,12 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 		}
 
 		now := time.Now()
-		cache.evict(now, dedupeTTL, seenTTL)
+		cache.Evict(now, dedupeTTL, seenTTL)
 
 		processed := 0
 		for _, e := range list.Items {
 			key := e.Namespace + "/" + e.Name + "/" + e.ResourceVersion
-			if !cache.markSeen(key, now) {
+			if !cache.MarkSeen(key, now) {
 				m.EventsSkipped.Add(1)
 				continue
 			}
@@ -419,7 +373,7 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 			}
 
 			signal := e.Namespace + "|" + dedupKind + "|" + dedupName + "|" + canonicalReason(e.Reason, e.Message)
-			if cache.isSignalFresh(signal, now, dedupeTTL) {
+			if cache.IsSignalFresh(signal, now, dedupeTTL) {
 				m.EventsSkipped.Add(1)
 				continue
 			}
@@ -431,7 +385,7 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 				continue
 			}
 
-			cache.markSignal(signal, now)
+			cache.MarkSignal(signal, now)
 			processed++
 			m.EventsProcessed.Add(1)
 
