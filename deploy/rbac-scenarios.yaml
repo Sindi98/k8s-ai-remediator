@@ -1,0 +1,62 @@
+## RBAC for the GUI "Scenarios" feature
+##
+## The fault scenarios bundled with the GUI (internal/webui/scenarios/*.yaml)
+## create and later delete Deployments inside a sandbox namespace. The base
+## namespace-scoped Role in rbac-namespaced.yaml only allows update/patch on
+## Deployments because the core remediation loop never creates or deletes
+## them — it just mutates existing workloads. Applying a scenario therefore
+## fails with:
+##
+##   deployments.apps "memory-hog" is forbidden:
+##   User "system:serviceaccount:ai-remediator:ai-remediator" cannot
+##   create resource "deployments" in API group "apps" ...
+##
+## This manifest grants the missing create/delete verbs on a SEPARATE Role,
+## scoped only to the sandbox namespace. Apply it once for each namespace
+## listed in SCENARIO_SANDBOX_NAMESPACES (default: incident-lab):
+##
+##   kubectl -n incident-lab apply -f rbac-scenarios.yaml
+##
+## Rationale for keeping these verbs out of rbac-namespaced.yaml:
+##   - principle of least privilege: the agent never needs create/delete on
+##     Deployments outside the GUI scenarios feature.
+##   - opt-in: clusters that disable the GUI (WEBUI_ENABLED=false) or empty
+##     SCENARIO_SANDBOX_NAMESPACES never apply this Role.
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ai-remediator-scenarios
+  namespace: incident-lab
+  labels:
+    ai-remediator/managed: "true"
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [create, delete]
+  ## Future-proof: scenarios may grow to include Services, ConfigMaps and
+  ## Secrets (e.g. simulating mounted credentials). Granting them up-front
+  ## inside the sandbox namespace avoids another RBAC roundtrip when those
+  ## scenarios ship. Remove the rule if your sandbox should stay strictly
+  ## Deployment-only.
+  - apiGroups: [""]
+    resources: [services, configmaps, secrets]
+    verbs: [create, delete, get, list, patch, update]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ai-remediator-scenarios
+  namespace: incident-lab
+  labels:
+    ai-remediator/managed: "true"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ai-remediator-scenarios
+subjects:
+  - kind: ServiceAccount
+    name: ai-remediator
+    namespace: ai-remediator

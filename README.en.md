@@ -935,7 +935,12 @@ Prerequisite: the agent installed as described in [Kubernetes Installation](#kub
 # 1. GUI RBAC (namespace-scoped Role + ClusterRole for the onboarding feature)
 kubectl apply -f deploy/rbac-webui.yaml
 
-# 2. End-to-end manifest (Namespace, ConfigMap, Secret, Deployment, Service,
+# 2. (only if you plan to use the GUI "Scenarios" feature) Extra RBAC in the
+#    sandbox namespace to allow create/delete of Deployments. Apply once for
+#    each namespace listed in SCENARIO_SANDBOX_NAMESPACES.
+kubectl -n incident-lab apply -f deploy/rbac-scenarios.yaml
+
+# 3. End-to-end manifest (Namespace, ConfigMap, Secret, Deployment, Service,
 #    commented-out Ingress). Customise before applying: change WEBUI_PASSWORD in
 #    the Secret and replace the image if you don't use the default local registry.
 kubectl apply -f deploy/agent.yaml
@@ -1020,6 +1025,13 @@ kubectl -n ai-remediator port-forward svc/ai-remediator-webui 8080:80
 - **Cluster-wide**: `get/list/create/patch` on `namespaces`; `get/list/create/update/delete` on `roles` and `rolebindings`.
 
 These are the minimum permissions required to read ConfigMap/Secret values, persist updates, scale the Deployment, follow logs and onboard new namespaces via "Apply RBAC". The cluster-wide RBAC verbs are gated by basic-auth and should sit behind Ingress TLS.
+
+`deploy/rbac-scenarios.yaml` (optional) adds inside a single sandbox namespace:
+
+- `create/delete` on `apps/deployments`,
+- `create/delete/get/list/patch/update` on `services`, `configmaps`, `secrets`.
+
+Required only for the GUI "Scenarios" feature (apply + cleanup of fault manifests). Kept out of the base Role in `rbac-namespaced.yaml` on least-privilege grounds: the remediation loop itself never creates or deletes Deployments.
 
 ### Security
 
