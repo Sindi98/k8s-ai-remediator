@@ -22,6 +22,7 @@ AI agent written in Go that watches Kubernetes `Warning` events and applies cont
 - [Security](#security)
 - [High Availability (Leader Election)](#high-availability-leader-election)
 - [Namespace-scoped RBAC](#namespace-scoped-rbac)
+- [Admin GUI](#admin-gui)
 - [Test Lab](#test-lab)
 - [Error Scenarios](#error-scenarios)
 - [Development](#development)
@@ -907,6 +908,133 @@ kubectl -n <new-namespace> create rolebinding ai-remediator \
   --role=ai-remediator \
   --serviceaccount=ai-remediator:ai-remediator
 ```
+
+---
+
+## Admin GUI
+
+An optional web GUI, protected by basic-auth, lets operators run the most common tasks from the browser:
+
+- **Dashboard**: live status of the agent Deployment (desired/ready replicas), pods, ConfigMap, Secret, leader lease and a read-only view of the running configuration.
+- **Logs**: live tail of the agent pod via Server-Sent Events, with pause/clear controls.
+- **Configuration**: change the LLM model (`OLLAMA_MODEL`/`OLLAMA_BASE_URL`), SMTP credentials (with a "Send test email" button) and the agent replica count. Every change writes to ConfigMap/Secret and triggers a Deployment rollout.
+- **Scenarios**: apply and clean up the fault scenarios described in [Error Scenarios](#error-scenarios), restricted to a sandbox namespace allowlist.
+- **RBAC**: apply namespace-scoped `Role` + `RoleBinding` to onboard a new namespace without editing YAML by hand.
+
+The source of truth for every operation is a Kubernetes object (Deployment, ConfigMap, Secret, Role, RoleBinding); the GUI never holds its own state, so it is safe to scale to multiple replicas or restart at will.
+
+### Architecture
+
+The GUI runs inside the same pod as the agent (`internal/webui`), exposes a separate HTTP port (default `:8080`) and shares the agent's `ServiceAccount`. Basic-auth credentials are compared with `crypto/subtle` in constant time. **TLS must be terminated at the Ingress**: basic-auth travels in clear text and only HTTPS keeps it confidential on the wire.
+
+### Installation
+
+Prerequisite: the agent installed as described in [Kubernetes Installation](#kubernetes-installation).
+
+```bash
+# 1. GUI RBAC (namespace-scoped Role + ClusterRole for the onboarding feature)
+kubectl apply -f deploy/rbac-webui.yaml
+
+# 2. End-to-end manifest (Namespace, ConfigMap, Secret, Deployment, Service,
+#    commented-out Ingress). Customise before applying: change WEBUI_PASSWORD in
+#    the Secret and replace the ghcr.io/your-org/... image with your own.
+kubectl apply -f deploy/agent.yaml
+```
+
+> **Note**: `deploy/agent.yaml` creates the `ai-remediator` Namespace and installs
+> Deployment+Service directly. If you already have the agent installed via the
+> section 2 instructions with a different name or ConfigMap, skip
+> `agent.yaml` and apply only `rbac-webui.yaml`, then add the variables below
+> to your existing ConfigMap.
+
+### Configuration variables
+
+Add to the agent ConfigMap:
+
+| Variable | Default | Notes |
+| -------- | ------- | ----- |
+| `WEBUI_ENABLED` | `false` | Set to `true` to enable the GUI |
+| `WEBUI_ADDR` | `:8080` | Listen address (separate port from `METRICS_ADDR`) |
+| `AGENT_NAMESPACE` | `ai-remediator` | Namespace where the agent runs |
+| `AGENT_DEPLOYMENT_NAME` | `ai-remediator-agent` | Agent Deployment name |
+| `AGENT_CONFIGMAP_NAME` | `ai-remediator-config` | ConfigMap holding non-secret config |
+| `AGENT_SECRET_NAME` | `ai-remediator-secrets` | Secret for SMTP password and basic-auth |
+| `SCENARIO_SANDBOX_NAMESPACES` | `incident-lab` | CSV. Only these namespaces may receive fault scenarios. Empty = scenarios disabled |
+
+Add to the agent Secret (mandatory keys when `WEBUI_ENABLED=true`):
+
+| Key | Notes |
+| --- | ----- |
+| `WEBUI_USERNAME` | Basic-auth username |
+| `WEBUI_PASSWORD` | Basic-auth password (change from the default) |
+
+### Exposing via Ingress
+
+The `ai-remediator-webui` Service in `deploy/agent.yaml` serves the GUI on port 80, mapped to container port 8080. The `Ingress` block in the manifest is commented out; enable it after preparing:
+
+- a hostname (e.g. `ai-remediator.example.com`),
+- a TLS certificate stored in a Secret (e.g. via cert-manager).
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-remediator-webui
+  namespace: ai-remediator
+  annotations:
+    # SSE log streaming: disable proxy buffering or the live tail breaks.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [ai-remediator.example.com]
+      secretName: ai-remediator-tls
+  rules:
+    - host: ai-remediator.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ai-remediator-webui
+                port:
+                  number: 80
+```
+
+### Access without Ingress (port-forward)
+
+For quick tests, especially on local clusters (k3d/kind):
+
+```bash
+kubectl -n ai-remediator port-forward svc/ai-remediator-webui 8080:80
+# then open http://127.0.0.1:8080 and enter the basic-auth credentials
+```
+
+### RBAC permissions granted by the GUI
+
+`deploy/rbac-webui.yaml` adds the following to the `ai-remediator` ServiceAccount:
+
+- **In the agent namespace**: `get/list/watch/create/update/patch` on `configmaps` and `secrets`; `get/list/watch` on `pods`, `pods/log`; `get/update/patch` on `deployments` and `deployments/scale`; `get/list/watch` on `leases`.
+- **Cluster-wide**: `get/list/create/patch` on `namespaces`; `get/list/create/update/delete` on `roles` and `rolebindings`.
+
+These are the minimum permissions required to read ConfigMap/Secret values, persist updates, scale the Deployment, follow logs and onboard new namespaces via "Apply RBAC". The cluster-wide RBAC verbs are gated by basic-auth and should sit behind Ingress TLS.
+
+### Security
+
+- **TLS required in production**: without HTTPS the basic-auth credentials are sent in clear text.
+- **Scenario sandbox**: the "Scenarios" feature rejects both cluster-scoped objects and namespaces missing from the `SCENARIO_SANDBOX_NAMESPACES` allowlist. Keep it limited to test-only namespaces.
+- **Replicas**: the GUI is stateless and safe to scale. Internal leader election ensures that, even with multiple replicas, only one drives the remediation loop.
+- **Audit**: every mutating action logs the action, target and timestamp to stdout (visible from the Logs page).
+
+### Disabling the GUI
+
+```bash
+kubectl -n ai-remediator set env deployment/ai-remediator-agent WEBUI_ENABLED=false
+```
+
+or remove the `WEBUI_ENABLED` key from the ConfigMap and reload the Deployment. The pod will no longer open port 8080.
 
 ---
 
