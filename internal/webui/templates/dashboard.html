@@ -1,0 +1,52 @@
+{{define "content"}}
+<header class="page">
+  <h1>Dashboard</h1>
+  <button class="btn-secondary" onclick="refreshStatus()">Refresh</button>
+</header>
+
+<section class="grid">
+  <article class="card">
+    <h2>Agent</h2>
+    <dl>
+      <dt>Namespace</dt><dd id="agent-namespace">—</dd>
+      <dt>Deployment</dt><dd id="agent-deployment">—</dd>
+      <dt>Replicas</dt><dd><span id="agent-replicas">—</span> desired / <span id="agent-ready">—</span> ready</dd>
+    </dl>
+  </article>
+
+  <article class="card">
+    <h2>Dependencies</h2>
+    <dl>
+      <dt>ConfigMap</dt><dd id="dep-configmap">—</dd>
+      <dt>Secret</dt><dd id="dep-secret">—</dd>
+      <dt>Leader lease</dt><dd id="dep-lease">—</dd>
+    </dl>
+  </article>
+
+  <article class="card">
+    <h2>Sandbox namespaces</h2>
+    <p class="hint">Where scenario fault injection is allowed.</p>
+    <ul id="sandbox-list" class="chips"></ul>
+  </article>
+</section>
+
+<section>
+  <h2>Pods</h2>
+  <table class="table">
+    <thead><tr><th>Name</th><th>Phase</th><th>Ready</th><th>Restarts</th><th>Age</th></tr></thead>
+    <tbody id="pod-rows"></tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Live configuration</h2>
+  <p class="hint">Read from the agent ConfigMap. Edit in the <a href="/config">Configuration</a> page.</p>
+  <table class="table">
+    <thead><tr><th>Key</th><th>Value</th></tr></thead>
+    <tbody id="config-rows"></tbody>
+  </table>
+</section>
+
+<script>window.addEventListener('DOMContentLoaded', refreshStatus);</script>
+{{end}}
+{{template "layout" .}}

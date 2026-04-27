@@ -1,0 +1,68 @@
+# Scenario: Readiness probe flaky (severita BASSA)
+#
+# Il container gira normalmente, ma la readiness probe fallisce in modo
+# intermittente. Ogni fallimento genera un evento Warning di reason
+# Unhealthy. Il pod resta Running, e solo temporaneamente escluso dal
+# Service quando la probe e in failure.
+#
+# Impatto: rumore nei log/eventi, occasionale rimozione dagli endpoints.
+# Nessun crash, nessun restart. BASSO perche e un segnale debole che puo
+# indicare una probe troppo stringente o una flakiness da investigare
+# senza urgenza.
+# Remediation tipica dell'agente: noop o inspect_pod_logs. Un restart qui
+# sarebbe una reazione eccessiva.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flaky-probe
+  namespace: incident-lab
+  labels:
+    app: flaky-probe
+    scenario: low
+    error-type: readiness-probe-flaky
+  annotations:
+    # Opt-in a tutte le azioni patch_* (probe, resources, registry).
+    # Richiede anche ALLOW_PATCH_PROBE / ALLOW_PATCH_RESOURCES /
+    # ALLOW_PATCH_REGISTRY nella ConfigMap dell'agente.
+    ai-remediator/allow-patch: "*"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flaky-probe
+  template:
+    metadata:
+      labels:
+        app: flaky-probe
+        scenario: low
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # Crea/rimuove il marker a cicli per simulare una probe flaky.
+              # 20s ready, 10s non-ready, all'infinito.
+              while true; do
+                touch /tmp/ready
+                sleep 20
+                rm -f /tmp/ready
+                sleep 10
+              done
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -f /tmp/ready"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 2
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"

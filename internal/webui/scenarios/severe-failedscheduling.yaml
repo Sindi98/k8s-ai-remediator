@@ -1,0 +1,46 @@
+# Scenario: FailedScheduling con risorse impossibili (severita GRAVE)
+#
+# Il pod richiede quantita di CPU e memoria che nessun nodo del cluster
+# puo soddisfare. Lo scheduler fallisce ripetutamente generando eventi
+# Warning di reason FailedScheduling.
+#
+# Impatto: il workload non partira MAI senza intervento umano a meno che
+# l'agente non abbia l'opt-in "resources" per abbassare le requests a
+# valori schedulabili (vedi annotation sotto).
+# Remediation attesa: con opt-in → patch_resources; senza → mark_for_manual_fix.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unschedulable
+  namespace: incident-lab
+  labels:
+    app: unschedulable
+    scenario: severe
+    error-type: failed-scheduling
+  annotations:
+    # Opt-in a tutte le azioni patch_* (probe, resources, registry).
+    # Richiede anche ALLOW_PATCH_* nella ConfigMap dell'agente.
+    ai-remediator/allow-patch: "*"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: unschedulable
+  template:
+    metadata:
+      labels:
+        app: unschedulable
+        scenario: severe
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "sleep 3600"]
+          resources:
+            requests:
+              cpu: "500"
+              memory: "500Gi"
+            limits:
+              cpu: "500"
+              memory: "500Gi"

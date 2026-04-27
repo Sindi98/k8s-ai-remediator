@@ -1,0 +1,57 @@
+# Scenario: OOMKilled CrashLoopBackOff (severita CRITICA)
+#
+# Il container tenta di allocare piu memoria del limite impostato. Il kernel
+# lo uccide con OOMKilled, kubelet lo riavvia, si ripete ciclicamente fino
+# al CrashLoopBackOff. Gli eventi Warning includono BackOff e OOMKilling.
+#
+# Impatto: il servizio e continuamente down (rolling crash). CRITICO perche
+# ogni restart fallisce immediatamente e non esiste self-recovery.
+# Remediation tipica dell'agente: inspect_pod_logs o ask_human (i limiti
+# di risorse non possono essere modificati in autonomia dall'agente).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memory-hog
+  namespace: incident-lab
+  labels:
+    app: memory-hog
+    scenario: critical
+    error-type: oom-killed
+  annotations:
+    # Opt-in a tutte le azioni patch_* (probe, resources, registry).
+    # Richiede anche ALLOW_PATCH_* nella ConfigMap dell'agente.
+    ai-remediator/allow-patch: "*"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: memory-hog
+  template:
+    metadata:
+      labels:
+        app: memory-hog
+        scenario: critical
+    spec:
+      containers:
+        - name: app
+          image: polinux/stress:latest
+          imagePullPolicy: IfNotPresent
+          command: ["stress"]
+          # Allocates 256MB of VM (held), instantly exceeding the 32Mi limit
+          # below and triggering OOMKilled -> CrashLoopBackOff.
+          args:
+            - "--vm"
+            - "1"
+            - "--vm-bytes"
+            - "256M"
+            - "--vm-hang"
+            - "0"
+            - "--timeout"
+            - "3600s"
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "32Mi"

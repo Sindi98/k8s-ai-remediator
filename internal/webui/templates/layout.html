@@ -1,0 +1,27 @@
+{{define "layout"}}<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} · ai-remediator</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <nav class="topbar">
+    <div class="brand">ai-remediator <small>admin</small></div>
+    <ul class="nav">
+      <li class="{{if eq .Active "dashboard"}}active{{end}}"><a href="/">Dashboard</a></li>
+      <li class="{{if eq .Active "logs"}}active{{end}}"><a href="/logs">Logs</a></li>
+      <li class="{{if eq .Active "config"}}active{{end}}"><a href="/config">Configuration</a></li>
+      <li class="{{if eq .Active "scenarios"}}active{{end}}"><a href="/scenarios">Scenarios</a></li>
+      <li class="{{if eq .Active "rbac"}}active{{end}}"><a href="/rbac">RBAC</a></li>
+    </ul>
+    <div class="ctx">{{.Namespace}}/{{.Deployment}}</div>
+  </nav>
+  <main class="container">
+    {{template "content" .}}
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
+{{end}}

@@ -1,0 +1,25 @@
+{{define "content"}}
+<header class="page">
+  <h1>RBAC onboarding</h1>
+</header>
+
+<p class="hint">
+  Apply the namespace-scoped Role + RoleBinding so the agent can monitor and
+  remediate workloads in a target namespace. The binding refers to the
+  ServiceAccount <code>ai-remediator</code> in <code>{{.Namespace}}</code>.
+</p>
+
+<section class="card">
+  <form class="form" data-endpoint="/api/rbac/apply">
+    <label>Target namespace
+      <input name="namespace" placeholder="my-app" required pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?">
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="create_namespace" value="true">
+      Create the namespace if it does not exist
+    </label>
+    <button type="submit" class="btn-primary">Apply RBAC</button>
+  </form>
+</section>
+{{end}}
+{{template "layout" .}}
