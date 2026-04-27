@@ -17,6 +17,9 @@
       <li class="{{if eq .Active "rbac"}}active{{end}}"><a href="/rbac">RBAC</a></li>
     </ul>
     <div class="ctx">{{.Namespace}}/{{.Deployment}}</div>
+    <form method="post" action="/logout" class="logout">
+      <button type="submit" class="btn-link" title="Sign out">logout</button>
+    </form>
   </nav>
   <main class="container">
     {{template "content" .}}

@@ -915,15 +915,18 @@ kubectl -n <nuovo-namespace> create rolebinding ai-remediator \
 
 ## GUI di amministrazione
 
-Una GUI web opzionale, protetta da basic-auth, permette di gestire dal browser le operazioni piu comuni:
+Una GUI web opzionale, con form di login dedicato, permette di gestire dal browser le operazioni piu comuni:
 
+- **Login**: form classico (username/password) con sessione cookie HMAC-firmata di 12h. Gli endpoint `/api/*` accettano anche basic-auth header per script CLI.
 - **Dashboard**: stato del Deployment dell'agente (repliche desiderate/pronte), pod, ConfigMap, Secret, leader lease, configurazione live in lettura.
 - **Logs**: streaming live dei log del pod via Server-Sent Events, con pause/clear.
-- **Configuration**: modifica modello LLM (`OLLAMA_MODEL`/`OLLAMA_BASE_URL`), credenziali SMTP (con pulsante "Send test email") e numero di repliche dell'agente. Ogni modifica scrive su ConfigMap/Secret e forza un rollout del Deployment.
+- **Configuration** (accordion con piu sezioni): modello LLM, tuning Ollama (RPS, retry, timeout), behavior (`DRY_RUN`, severity, polling), scaling bounds, namespace filters, action policies (`ALLOW_PATCH_*`, threshold di confidence), backend di dedup + Redis, SMTP (con "Send test email"), repliche dell'agente. Ogni form scrive su ConfigMap o Secret e forza un rollout del Deployment.
 - **Scenarios**: applica e rimuove gli scenari di guasto (sezione [Scenari di errore](#scenari-di-errore)) verso un namespace sandbox in allowlist.
 - **RBAC**: applica `Role` + `RoleBinding` namespace-scoped per onboardare un nuovo namespace senza editare manualmente lo YAML.
 
 La fonte di verita di ogni operazione e un oggetto Kubernetes (Deployment, ConfigMap, Secret, Role, RoleBinding): la GUI non mantiene stato proprio, quindi e sicuro scalarla a piu repliche o riavviarla.
+
+> **NB**: la pagina Configuration **non** espone le variabili "self-trapping" (`WEBUI_*`, `AGENT_NAMESPACE`, `AGENT_DEPLOYMENT_NAME`, `AGENT_CONFIGMAP_NAME`, `AGENT_SECRET_NAME`, `METRICS_ADDR`, `LEADER_ELECTION`, `LEASE_*`): modificarle dalla GUI rischia di renderla irraggiungibile o di rompere la leader election. Per quei campi usa `kubectl edit cm` + rollout manuale.
 
 ### Architettura
 

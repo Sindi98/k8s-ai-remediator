@@ -1,0 +1,31 @@
+{{define "login.html"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · ai-remediator</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-body">
+  <main class="login-card">
+    <header>
+      <h1>ai-remediator</h1>
+      <p class="hint">Sign in to access the admin GUI.</p>
+    </header>
+    {{if eq .Error "invalid"}}
+      <div class="login-error">Invalid username or password.</div>
+    {{end}}
+    <form method="post" action="/login" class="form">
+      <input type="hidden" name="next" value="{{.Next}}">
+      <label>Username
+        <input name="username" autocomplete="username" required autofocus>
+      </label>
+      <label>Password
+        <input name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <button type="submit" class="btn-primary">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>
+{{end}}

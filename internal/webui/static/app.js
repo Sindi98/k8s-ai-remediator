@@ -41,12 +41,26 @@
   window.postForm = postForm;
 
   // Auto-bind every <form data-endpoint="...">.
+  // For each form we also collect the names of every checkbox in a hidden
+  // __bool_fields parameter. The backend uses it to distinguish
+  // "checkbox not on this form" from "checkbox unchecked" — HTML omits
+  // unchecked checkboxes from the submission entirely.
   document.addEventListener('submit', async (ev) => {
     const form = ev.target;
     if (!(form instanceof HTMLFormElement) || !form.dataset.endpoint) return;
     ev.preventDefault();
     const data = {};
     new FormData(form).forEach((v, k) => { data[k] = v; });
+    const boolFields = Array.from(form.querySelectorAll('input[type="checkbox"]'))
+      .map((el) => el.name).filter(Boolean);
+    if (boolFields.length > 0) {
+      data['__bool_fields'] = boolFields.join(',');
+      // Default unchecked checkboxes to "false" so the backend can flip
+      // them off rather than silently keeping the previous value.
+      boolFields.forEach((name) => {
+        if (!(name in data)) data[name] = 'false';
+      });
+    }
     await postForm(form.dataset.endpoint, data);
   });
 
