@@ -82,6 +82,13 @@ var pageNames = []string{
 	"rbac.html",
 }
 
+// pageNamesNoLayout lists templates that render WITHOUT the standard
+// nav/header layout (only login.html today). Parsed standalone so they
+// don't pull in {{template "layout" .}}.
+var pageNamesNoLayout = []string{
+	"login.html",
+}
+
 // New constructs a ready-to-serve Server.
 func New(opts Options) (*Server, error) {
 	if strings.TrimSpace(opts.Username) == "" || strings.TrimSpace(opts.Password) == "" {
@@ -105,13 +112,22 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("webui: parse layout: %w", err)
 	}
 
-	pages := make(map[string]*template.Template, len(pageNames))
+	pages := make(map[string]*template.Template, len(pageNames)+len(pageNamesNoLayout))
 	for _, name := range pageNames {
 		t, err := base.Clone()
 		if err != nil {
 			return nil, fmt.Errorf("webui: clone base for %s: %w", name, err)
 		}
 		t, err = t.ParseFS(templatesFS, "templates/"+name)
+		if err != nil {
+			return nil, fmt.Errorf("webui: parse %s: %w", name, err)
+		}
+		pages[name] = t
+	}
+	// No-layout templates (login) parsed standalone so they don't fight
+	// with the navbar layout that assumes an authenticated user.
+	for _, name := range pageNamesNoLayout {
+		t, err := template.New(name).Funcs(funcs).ParseFS(templatesFS, "templates/"+name)
 		if err != nil {
 			return nil, fmt.Errorf("webui: parse %s: %w", name, err)
 		}
@@ -158,7 +174,21 @@ func (s *Server) routes() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	auth := s.basicAuth
+	auth := s.requireAuth
+
+	// Login flow: GET shows the form, POST validates and sets cookie.
+	// Both are deliberately OUTSIDE the auth middleware.
+	s.mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			s.handleLoginPage(w, r)
+		case http.MethodPost:
+			s.handleLoginSubmit(w, r)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	s.mux.HandleFunc("/logout", s.handleLogout)
 
 	s.mux.Handle("/", auth(http.HandlerFunc(s.handleDashboard)))
 	s.mux.Handle("/logs", auth(http.HandlerFunc(s.handleLogsPage)))
@@ -175,4 +205,7 @@ func (s *Server) routes() {
 	s.mux.Handle("/api/scenarios/apply", auth(http.HandlerFunc(s.handleScenarioApply)))
 	s.mux.Handle("/api/scenarios/cleanup", auth(http.HandlerFunc(s.handleScenarioCleanup)))
 	s.mux.Handle("/api/rbac/apply", auth(http.HandlerFunc(s.handleRBACApply)))
+
+	s.mux.Handle("/api/config/general", auth(http.HandlerFunc(s.handleUpdateGeneral)))
+	s.mux.Handle("/api/config/redis-password", auth(http.HandlerFunc(s.handleUpdateRedisPassword)))
 }

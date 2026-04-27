@@ -913,15 +913,18 @@ kubectl -n <new-namespace> create rolebinding ai-remediator \
 
 ## Admin GUI
 
-An optional web GUI, protected by basic-auth, lets operators run the most common tasks from the browser:
+An optional web GUI with a dedicated login form lets operators run the most common tasks from the browser:
 
+- **Login**: classic username/password form, HMAC-signed session cookie valid for 12h. The `/api/*` endpoints also accept HTTP Basic auth so curl-based scripts keep working.
 - **Dashboard**: live status of the agent Deployment (desired/ready replicas), pods, ConfigMap, Secret, leader lease and a read-only view of the running configuration.
 - **Logs**: live tail of the agent pod via Server-Sent Events, with pause/clear controls.
-- **Configuration**: change the LLM model (`OLLAMA_MODEL`/`OLLAMA_BASE_URL`), SMTP credentials (with a "Send test email" button) and the agent replica count. Every change writes to ConfigMap/Secret and triggers a Deployment rollout.
+- **Configuration** (accordion with multiple sections): LLM model, Ollama tuning (RPS, retries, timeouts), behavior (`DRY_RUN`, severity, polling), scaling bounds, namespace filters, action policies (`ALLOW_PATCH_*`, confidence thresholds), dedup backend + Redis, SMTP (with "Send test email"), agent replica count. Each form writes to ConfigMap or Secret and triggers a Deployment rollout.
 - **Scenarios**: apply and clean up the fault scenarios described in [Error Scenarios](#error-scenarios), restricted to a sandbox namespace allowlist.
 - **RBAC**: apply namespace-scoped `Role` + `RoleBinding` to onboard a new namespace without editing YAML by hand.
 
 The source of truth for every operation is a Kubernetes object (Deployment, ConfigMap, Secret, Role, RoleBinding); the GUI never holds its own state, so it is safe to scale to multiple replicas or restart at will.
+
+> **Note**: the Configuration page deliberately does **not** expose self-trapping variables (`WEBUI_*`, `AGENT_NAMESPACE`, `AGENT_DEPLOYMENT_NAME`, `AGENT_CONFIGMAP_NAME`, `AGENT_SECRET_NAME`, `METRICS_ADDR`, `LEADER_ELECTION`, `LEASE_*`): editing them from the GUI risks making the GUI itself unreachable or breaking leader election. For those settings use `kubectl edit cm` + a manual rollout.
 
 ### Architecture
 

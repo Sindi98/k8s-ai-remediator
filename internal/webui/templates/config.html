@@ -4,25 +4,137 @@
 </header>
 
 <p class="hint">
-  Saving any of these forms updates the ConfigMap or Secret used by the agent and
-  triggers a Deployment rollout so the new values take effect on the next pod.
+  Saving any of these forms updates the agent ConfigMap (or Secret) and
+  triggers a Deployment rollout. Empty fields keep the current value
+  unchanged. Boolean toggles always send their current state.
 </p>
 
-<section class="card">
-  <h2>LLM model</h2>
+<details class="card" open>
+  <summary><h2>LLM (Ollama)</h2></summary>
   <form class="form" data-endpoint="/api/config/llm">
-    <label>Ollama model
-      <input name="model" placeholder="qwen2.5:14b" required>
-    </label>
-    <label>Base URL (optional)
-      <input name="base_url" placeholder="http://ollama.ollama.svc.cluster.local:11434/api">
+    <div class="grid-2">
+      <label>Model <input name="model" placeholder="qwen2.5:7b"></label>
+      <label>Base URL <input name="base_url" placeholder="http://ollama.ollama.svc.cluster.local:11434/api"></label>
+    </div>
+    <button type="submit" class="btn-primary">Save and rollout</button>
+  </form>
+  <form class="form" data-endpoint="/api/config/general">
+    <div class="grid-2">
+      <label>Requests per second <input name="OLLAMA_RPS" type="number" step="0.1" min="0.1" placeholder="2.0"></label>
+      <label>Max retries <input name="OLLAMA_MAX_RETRIES" type="number" min="0" placeholder="3"></label>
+      <label>HTTP timeout (seconds) <input name="OLLAMA_HTTP_TIMEOUT_SECONDS" type="number" min="10" placeholder="180"></label>
+      <label>Poll context timeout (seconds) <input name="POLL_CONTEXT_TIMEOUT_SECONDS" type="number" min="30" placeholder="300"></label>
+    </div>
+    <label class="checkbox">
+      <input type="checkbox" name="OLLAMA_TLS_SKIP_VERIFY" value="true"> Skip TLS verification (insecure)
     </label>
     <button type="submit" class="btn-primary">Save and rollout</button>
   </form>
-</section>
+</details>
 
-<section class="card">
-  <h2>Replicas</h2>
+<details class="card">
+  <summary><h2>Behavior</h2></summary>
+  <form class="form" data-endpoint="/api/config/general">
+    <div class="grid-2">
+      <label>Min severity
+        <select name="MIN_SEVERITY">
+          <option value="">(unchanged)</option>
+          <option>low</option><option>medium</option><option>high</option><option>critical</option>
+        </select>
+      </label>
+      <label>Poll interval (seconds) <input name="POLL_INTERVAL_SECONDS" type="number" min="5" placeholder="30"></label>
+      <label>Max events per poll <input name="MAX_EVENTS_PER_POLL" type="number" min="0" placeholder="10"></label>
+      <label>Pod log tail lines <input name="POD_LOG_TAIL_LINES" type="number" min="10" placeholder="200"></label>
+    </div>
+    <label class="checkbox">
+      <input type="checkbox" name="DRY_RUN" value="true"> Dry-run (decide but never execute)
+    </label>
+    <button type="submit" class="btn-primary">Save and rollout</button>
+  </form>
+</details>
+
+<details class="card">
+  <summary><h2>Scaling bounds</h2></summary>
+  <p class="hint">Bounds applied when the LLM proposes <code>scale_deployment</code>.</p>
+  <form class="form" data-endpoint="/api/config/general">
+    <div class="grid-2">
+      <label>SCALE_MIN <input name="SCALE_MIN" type="number" min="0" placeholder="1"></label>
+      <label>SCALE_MAX <input name="SCALE_MAX" type="number" min="1" placeholder="5"></label>
+    </div>
+    <button type="submit" class="btn-primary">Save and rollout</button>
+  </form>
+</details>
+
+<details class="card">
+  <summary><h2>Namespace filters</h2></summary>
+  <form class="form" data-endpoint="/api/config/general">
+    <label>Include namespaces (CSV, empty = all)
+      <input name="INCLUDE_NAMESPACES" placeholder="ns-a,ns-b">
+    </label>
+    <label>Exclude namespaces (CSV)
+      <input name="EXCLUDE_NAMESPACES" placeholder="kube-system,kube-public,kube-node-lease,local-path-storage,ai-remediator">
+    </label>
+    <label>Sandbox namespaces for "Scenarios" (CSV)
+      <input name="SCENARIO_SANDBOX_NAMESPACES" placeholder="incident-lab">
+    </label>
+    <button type="submit" class="btn-primary">Save and rollout</button>
+  </form>
+</details>
+
+<details class="card">
+  <summary><h2>Action policies</h2></summary>
+  <p class="hint">Per-Deployment opt-in via the <code>ai-remediator/allow-patch</code> annotation is also required.</p>
+  <form class="form" data-endpoint="/api/config/general">
+    <label class="checkbox">
+      <input type="checkbox" name="ALLOW_IMAGE_UPDATES" value="true"> Allow set_deployment_image
+    </label>
+    <label>Image-update confidence threshold (0–1)
+      <input name="IMAGE_UPDATE_CONFIDENCE_THRESHOLD" type="number" step="0.01" min="0" max="1" placeholder="0.92">
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="ALLOW_PATCH_PROBE" value="true"> Allow patch_probe
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="ALLOW_PATCH_RESOURCES" value="true"> Allow patch_resources
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="ALLOW_PATCH_REGISTRY" value="true"> Allow patch_registry
+    </label>
+    <label>Patch confidence threshold (0–1)
+      <input name="PATCH_CONFIDENCE_THRESHOLD" type="number" step="0.01" min="0" max="1" placeholder="0.85">
+    </label>
+    <button type="submit" class="btn-primary">Save and rollout</button>
+  </form>
+</details>
+
+<details class="card">
+  <summary><h2>Dedup</h2></summary>
+  <form class="form" data-endpoint="/api/config/general">
+    <div class="grid-2">
+      <label>Backend
+        <select name="DEDUP_BACKEND">
+          <option value="">(unchanged)</option>
+          <option>memory</option><option>redis</option>
+        </select>
+      </label>
+      <label>Dedupe TTL (seconds) <input name="DEDUPE_TTL_SECONDS" type="number" min="10" placeholder="300"></label>
+      <label>Event seen TTL (seconds) <input name="EVENT_SEEN_TTL_SECONDS" type="number" min="60" placeholder="3600"></label>
+      <label>Redis address <input name="REDIS_ADDR" placeholder="ai-remediator-redis:6379"></label>
+      <label>Redis DB <input name="REDIS_DB" type="number" min="0" placeholder="0"></label>
+      <label>Redis key prefix <input name="REDIS_KEY_PREFIX" placeholder="k8s-remediator:"></label>
+    </div>
+    <button type="submit" class="btn-primary">Save and rollout</button>
+  </form>
+  <form class="form" data-endpoint="/api/config/redis-password">
+    <label>Redis password (stored in Secret; empty leaves unchanged)
+      <input name="password" type="password" placeholder="leave empty to keep current">
+    </label>
+    <button type="submit" class="btn-primary">Save and rollout</button>
+  </form>
+</details>
+
+<details class="card">
+  <summary><h2>Replicas</h2></summary>
   <p class="hint">
     Scaling above 1 is safe because leader election ensures only one replica processes events.
   </p>
@@ -32,10 +144,10 @@
     </label>
     <button type="submit" class="btn-primary">Apply</button>
   </form>
-</section>
+</details>
 
-<section class="card">
-  <h2>Mail (SMTP)</h2>
+<details class="card">
+  <summary><h2>Notifications (SMTP)</h2></summary>
   <form class="form" data-endpoint="/api/config/mail">
     <div class="grid-2">
       <label>Host <input name="host" placeholder="smtp.example.com"></label>
@@ -56,6 +168,6 @@
       <button type="button" class="btn-secondary" onclick="postForm('/api/config/mail/test', {})">Send test email</button>
     </div>
   </form>
-</section>
+</details>
 {{end}}
 {{template "layout" .}}

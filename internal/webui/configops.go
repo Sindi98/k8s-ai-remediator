@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/smtp"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -290,4 +291,242 @@ func (s *Server) bumpDeploymentRollout(ctx context.Context, reason string) error
 	}
 	_, err = s.opts.Clientset.AppsV1().Deployments(s.opts.Namespace).Patch(ctx, s.opts.DeploymentName, types.StrategicMergePatchType, body, metav1.PatchOptions{})
 	return err
+}
+
+// generalKeys lists every ConfigMap key the "General" form may persist.
+// Restricting writes to this allowlist is what keeps clients from sneaking
+// in self-trapping settings (WEBUI_*, AGENT_NAMESPACE, METRICS_ADDR, etc.)
+// just by adding extra form fields. Each entry maps the form field name
+// (which equals the ConfigMap key) to the kind of validation it needs.
+var generalKeys = map[string]configKind{
+	"OLLAMA_RPS":                       kindFloat,
+	"OLLAMA_MAX_RETRIES":               kindInt,
+	"OLLAMA_HTTP_TIMEOUT_SECONDS":      kindInt,
+	"POLL_CONTEXT_TIMEOUT_SECONDS":     kindInt,
+	"OLLAMA_TLS_SKIP_VERIFY":           kindBool,
+	"MIN_SEVERITY":                     kindSeverity,
+	"POLL_INTERVAL_SECONDS":            kindInt,
+	"MAX_EVENTS_PER_POLL":              kindInt,
+	"POD_LOG_TAIL_LINES":               kindInt,
+	"DRY_RUN":                          kindBool,
+	"SCALE_MIN":                        kindInt,
+	"SCALE_MAX":                        kindInt,
+	"INCLUDE_NAMESPACES":               kindCSV,
+	"EXCLUDE_NAMESPACES":               kindCSV,
+	"SCENARIO_SANDBOX_NAMESPACES":      kindCSV,
+	"ALLOW_IMAGE_UPDATES":              kindBool,
+	"IMAGE_UPDATE_CONFIDENCE_THRESHOLD": kindUnitFloat,
+	"ALLOW_PATCH_PROBE":                kindBool,
+	"ALLOW_PATCH_RESOURCES":            kindBool,
+	"ALLOW_PATCH_REGISTRY":             kindBool,
+	"PATCH_CONFIDENCE_THRESHOLD":       kindUnitFloat,
+	"DEDUP_BACKEND":                    kindEnum, // "memory" | "redis"
+	"DEDUPE_TTL_SECONDS":               kindInt,
+	"EVENT_SEEN_TTL_SECONDS":           kindInt,
+	"REDIS_ADDR":                       kindString,
+	"REDIS_DB":                         kindInt,
+	"REDIS_KEY_PREFIX":                 kindString,
+}
+
+type configKind int
+
+const (
+	kindString configKind = iota
+	kindInt
+	kindFloat
+	kindUnitFloat // float in [0,1]
+	kindBool
+	kindCSV
+	kindSeverity
+	kindEnum
+)
+
+// boolFieldsAlwaysSent enumerates checkbox-backed fields. HTML forms omit
+// unchecked checkboxes entirely, so without this list a saved form would
+// never be able to TURN OFF a flag — the absent field would just leave
+// the existing ConfigMap value in place. We translate "field missing in
+// the POST" into "value=false".
+var boolFieldsAlwaysSent = []string{
+	"OLLAMA_TLS_SKIP_VERIFY",
+	"DRY_RUN",
+	"ALLOW_IMAGE_UPDATES",
+	"ALLOW_PATCH_PROBE",
+	"ALLOW_PATCH_RESOURCES",
+	"ALLOW_PATCH_REGISTRY",
+}
+
+// handleUpdateGeneral persists the subset of ConfigMap keys listed in
+// generalKeys. Any field whose value is an empty string is treated as
+// "leave unchanged"; checkbox fields are coerced to "true"/"false" based
+// on whether they appear in the form.
+func (s *Server) handleUpdateGeneral(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// Determine which boolean fields participate in this submit by looking
+	// at a hidden marker that the JS sends. Without the marker we cannot
+	// tell "checkbox not on this form" from "checkbox unchecked".
+	checkboxesPresent := map[string]bool{}
+	for _, name := range r.Form["__bool_fields"] {
+		for _, n := range strings.Split(name, ",") {
+			n = strings.TrimSpace(n)
+			if n != "" {
+				checkboxesPresent[n] = true
+			}
+		}
+	}
+
+	updates := map[string]string{}
+	for key, kind := range generalKeys {
+		raw := r.FormValue(key)
+		isBoolField := false
+		for _, b := range boolFieldsAlwaysSent {
+			if b == key {
+				isBoolField = true
+				break
+			}
+		}
+		if isBoolField {
+			if !checkboxesPresent[key] {
+				continue // checkbox not on the submitted form
+			}
+			if raw == "true" || raw == "on" || raw == "1" {
+				updates[key] = "true"
+			} else {
+				updates[key] = "false"
+			}
+			continue
+		}
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if err := validateConfigValue(kind, raw); err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Errorf("%s: %w", key, err))
+			return
+		}
+		updates[key] = raw
+	}
+
+	if len(updates) == 0 {
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status":  "ok",
+			"message": "No changes to persist",
+		})
+		return
+	}
+
+	if err := s.patchConfigMap(r.Context(), updates); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.bumpDeploymentRollout(r.Context(), "general"); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"message": fmt.Sprintf("Updated %d settings; Deployment rollout triggered", len(updates)),
+		"updated": keysOf(updates),
+	})
+}
+
+// handleUpdateRedisPassword stores the Redis password in the Secret. Empty
+// password is rejected here (unlike the SMTP form) because there is no
+// good reason to "leave it unchanged" via this dedicated endpoint — the
+// user explicitly clicked Save on the password row.
+func (s *Server) handleUpdateRedisPassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	password := r.FormValue("password")
+	if password == "" {
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status":  "ok",
+			"message": "Empty password ignored",
+		})
+		return
+	}
+	if err := s.patchSecret(r.Context(), map[string][]byte{
+		"REDIS_PASSWORD": []byte(password),
+	}); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.bumpDeploymentRollout(r.Context(), "redis-password"); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":  "ok",
+		"message": "Redis password saved; Deployment rollout triggered",
+	})
+}
+
+func validateConfigValue(kind configKind, raw string) error {
+	switch kind {
+	case kindString:
+		return nil
+	case kindInt:
+		_, err := strconv.Atoi(raw)
+		if err != nil {
+			return fmt.Errorf("not an integer: %v", err)
+		}
+		return nil
+	case kindFloat:
+		_, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return fmt.Errorf("not a number: %v", err)
+		}
+		return nil
+	case kindUnitFloat:
+		f, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return fmt.Errorf("not a number: %v", err)
+		}
+		if f < 0 || f > 1 {
+			return fmt.Errorf("must be in [0,1]")
+		}
+		return nil
+	case kindBool:
+		switch strings.ToLower(raw) {
+		case "true", "false", "1", "0", "yes", "no", "on", "off":
+			return nil
+		}
+		return fmt.Errorf("not a boolean")
+	case kindCSV:
+		return nil // ParseCSV is lenient by design
+	case kindSeverity:
+		switch strings.ToLower(raw) {
+		case "low", "medium", "high", "critical":
+			return nil
+		}
+		return fmt.Errorf("must be one of low, medium, high, critical")
+	case kindEnum:
+		switch raw {
+		case "memory", "redis":
+			return nil
+		}
+		return fmt.Errorf("invalid backend, expected memory or redis")
+	}
+	return nil
+}
+
+func keysOf(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
