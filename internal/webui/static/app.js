@@ -132,4 +132,10 @@
   window.startLogStream = startLogStream;
   window.toggleLogStream = toggleLogStream;
   window.clearLogs = clearLogs;
+
+  // Auto-init: feature-detect which page we are on and run the right
+  // bootstrap. The script tag is at the end of <body> in layout.html so
+  // every form/element already exists by the time we run.
+  if (document.getElementById('agent-namespace')) refreshStatus();
+  if (document.getElementById('log-view')) startLogStream();
 })();
