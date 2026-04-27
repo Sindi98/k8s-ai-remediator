@@ -1,0 +1,87 @@
+## Extra RBAC required by the admin GUI (webui). Apply this on top of
+## rbac-namespaced.yaml when you set WEBUI_ENABLED=true.
+##
+## What this grants, scoped to the agent's own namespace unless noted:
+##   - get/update/patch ConfigMaps and Secrets so the GUI can persist
+##     LLM model and SMTP changes.
+##   - get/patch/scale Deployments so the GUI can roll out config changes
+##     and adjust replica count.
+##   - get pods/log so the SSE log stream can read the agent's own logs.
+##
+## Cluster-wide:
+##   - get/list/create on Namespaces (RBAC onboarding feature can create new
+##     namespaces with the "ai-remediator/managed" label).
+##   - create/get/list/update/delete Roles and RoleBindings cluster-wide so
+##     the GUI can apply the namespace-scoped Role to onboarded namespaces.
+##   - patch on any cluster-scoped resource is intentionally NOT granted; the
+##     scenarios feature is sandboxed via the SCENARIO_SANDBOX_NAMESPACES
+##     allowlist and only needs namespaced object permissions, which are
+##     already available via the per-namespace Role.
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ai-remediator-webui-self
+  namespace: ai-remediator
+rules:
+  - apiGroups: [""]
+    resources: [configmaps, secrets]
+    verbs: [get, list, watch, create, update, patch]
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, update, patch]
+  - apiGroups: [apps]
+    resources: [deployments/scale]
+    verbs: [get, update, patch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ai-remediator-webui-self
+  namespace: ai-remediator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ai-remediator-webui-self
+subjects:
+  - kind: ServiceAccount
+    name: ai-remediator
+    namespace: ai-remediator
+
+---
+## Cluster-wide RBAC management for the onboarding feature. The GUI uses
+## these verbs only when an operator clicks "Apply RBAC" on the form, so
+## the privilege is gated by basic-auth + (recommended) TLS at the Ingress.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ai-remediator-webui-rbac-admin
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, create, patch]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [roles, rolebindings]
+    verbs: [get, list, create, update, delete]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ai-remediator-webui-rbac-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ai-remediator-webui-rbac-admin
+subjects:
+  - kind: ServiceAccount
+    name: ai-remediator
+    namespace: ai-remediator

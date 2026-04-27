@@ -1,0 +1,168 @@
+## ai-remediator agent + admin GUI
+##
+## End-to-end manifest: ConfigMap (non-secret config), Secret (SMTP password
+## and webui basic-auth credentials), Deployment, Service, optional Ingress.
+##
+## Customise the placeholder values below before applying. The admin GUI is
+## opt-in: set WEBUI_ENABLED=true and provide WEBUI_USERNAME/PASSWORD via the
+## Secret to expose it.
+##
+##   kubectl apply -f rbac-namespaced.yaml
+##   kubectl apply -f agent.yaml
+##
+## After the rollout, point your browser at https://<ingress-host>/ and log in
+## with the basic-auth credentials from the Secret.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai-remediator
+  labels:
+    ai-remediator/managed: "true"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-remediator-config
+  namespace: ai-remediator
+data:
+  OLLAMA_BASE_URL: "http://ollama.ollama.svc.cluster.local:11434/api"
+  OLLAMA_MODEL: "qwen2.5:14b"
+  DRY_RUN: "false"
+  MIN_SEVERITY: "medium"
+  POLL_INTERVAL_SECONDS: "30"
+  SCALE_MIN: "1"
+  SCALE_MAX: "5"
+  ALLOW_PATCH_PROBE: "false"
+  ALLOW_PATCH_RESOURCES: "false"
+  ALLOW_PATCH_REGISTRY: "false"
+  EXCLUDE_NAMESPACES: "kube-system,kube-public,kube-node-lease,local-path-storage,ai-remediator"
+  DEDUP_BACKEND: "memory"
+  LEADER_ELECTION: "true"
+  LEASE_NAME: "ai-remediator-leader"
+  LEASE_NAMESPACE: "ai-remediator"
+
+  WEBUI_ENABLED: "true"
+  WEBUI_ADDR: ":8080"
+  AGENT_NAMESPACE: "ai-remediator"
+  AGENT_DEPLOYMENT_NAME: "ai-remediator-agent"
+  AGENT_CONFIGMAP_NAME: "ai-remediator-config"
+  AGENT_SECRET_NAME: "ai-remediator-secrets"
+  SCENARIO_SANDBOX_NAMESPACES: "incident-lab"
+
+  NOTIFY_SMTP_HOST: ""
+  NOTIFY_SMTP_PORT: "587"
+  NOTIFY_SMTP_USER: ""
+  NOTIFY_FROM: ""
+  NOTIFY_TO: ""
+  NOTIFY_MIN_SEVERITY: "medium"
+
+---
+## Replace the placeholder values before applying. The webui credentials are
+## the only authentication layer in front of mutating endpoints, so use a
+## strong password and front the GUI with TLS at the Ingress.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ai-remediator-secrets
+  namespace: ai-remediator
+type: Opaque
+stringData:
+  WEBUI_USERNAME: "admin"
+  WEBUI_PASSWORD: "change-me-please"
+  NOTIFY_SMTP_PASSWORD: ""
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-remediator-agent
+  namespace: ai-remediator
+  labels:
+    app: ai-remediator-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ai-remediator-agent
+  template:
+    metadata:
+      labels:
+        app: ai-remediator-agent
+    spec:
+      serviceAccountName: ai-remediator
+      containers:
+        - name: agent
+          image: ghcr.io/your-org/k8s-ai-remediator:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: ai-remediator-config
+            - secretRef:
+                name: ai-remediator-secrets
+          ports:
+            - name: metrics
+              containerPort: 9090
+            - name: webui
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-remediator-webui
+  namespace: ai-remediator
+spec:
+  selector:
+    app: ai-remediator-agent
+  ports:
+    - name: http
+      port: 80
+      targetPort: webui
+
+---
+## Optional: expose the GUI via Ingress. TLS termination at the Ingress is
+## strongly recommended — basic-auth credentials are sent in clear text and
+## only HTTPS protects them on the wire.
+##
+## Uncomment and customise host/tls fields, then apply.
+##
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: ai-remediator-webui
+#   namespace: ai-remediator
+#   annotations:
+#     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"  # SSE log stream
+#     nginx.ingress.kubernetes.io/proxy-buffering: "off"
+# spec:
+#   ingressClassName: nginx
+#   tls:
+#     - hosts: [ai-remediator.example.com]
+#       secretName: ai-remediator-tls
+#   rules:
+#     - host: ai-remediator.example.com
+#       http:
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: ai-remediator-webui
+#                 port:
+#                   number: 80

@@ -1,0 +1,61 @@
+{{define "content"}}
+<header class="page">
+  <h1>Configuration</h1>
+</header>
+
+<p class="hint">
+  Saving any of these forms updates the ConfigMap or Secret used by the agent and
+  triggers a Deployment rollout so the new values take effect on the next pod.
+</p>
+
+<section class="card">
+  <h2>LLM model</h2>
+  <form class="form" data-endpoint="/api/config/llm">
+    <label>Ollama model
+      <input name="model" placeholder="qwen2.5:14b" required>
+    </label>
+    <label>Base URL (optional)
+      <input name="base_url" placeholder="http://ollama.ollama.svc.cluster.local:11434/api">
+    </label>
+    <button type="submit" class="btn-primary">Save and rollout</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Replicas</h2>
+  <p class="hint">
+    Scaling above 1 is safe because leader election ensures only one replica processes events.
+  </p>
+  <form class="form inline" data-endpoint="/api/config/replicas">
+    <label>Replicas
+      <input type="number" name="replicas" min="0" max="10" required>
+    </label>
+    <button type="submit" class="btn-primary">Apply</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Mail (SMTP)</h2>
+  <form class="form" data-endpoint="/api/config/mail">
+    <div class="grid-2">
+      <label>Host <input name="host" placeholder="smtp.example.com"></label>
+      <label>Port <input name="port" placeholder="587"></label>
+      <label>User <input name="user" placeholder="alerts@example.com"></label>
+      <label>Password <input name="password" type="password" placeholder="leave empty to keep current"></label>
+      <label>From <input name="from" placeholder="alerts@example.com"></label>
+      <label>To <input name="to" placeholder="ops@example.com"></label>
+      <label>Min severity
+        <select name="min_severity">
+          <option value="">(unchanged)</option>
+          <option>low</option><option>medium</option><option>high</option><option>critical</option>
+        </select>
+      </label>
+    </div>
+    <div class="actions">
+      <button type="submit" class="btn-primary">Save and rollout</button>
+      <button type="button" class="btn-secondary" onclick="postForm('/api/config/mail/test', {})">Send test email</button>
+    </div>
+  </form>
+</section>
+{{end}}
+{{template "layout" .}}

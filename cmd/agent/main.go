@@ -16,8 +16,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/discovery"
+	memcached "k8s.io/client-go/discovery/cached/memory"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 
@@ -29,6 +33,7 @@ import (
 	"github.com/tuo-user/k8s-ai-remediator/internal/notify"
 	"github.com/tuo-user/k8s-ai-remediator/internal/ollama"
 	"github.com/tuo-user/k8s-ai-remediator/internal/policy"
+	"github.com/tuo-user/k8s-ai-remediator/internal/webui"
 )
 
 func executeDecision(
@@ -549,6 +554,43 @@ func main() {
 	// Graceful shutdown: cancel context on SIGTERM/SIGINT
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+
+	// Optional admin GUI. Runs alongside the polling loop and is independent
+	// of leader election: every replica serves the GUI so the dashboard stays
+	// reachable even when the active leader is elsewhere.
+	if cfg.WebUIEnabled {
+		dynClient, err := dynamic.NewForConfig(restCfg)
+		if err != nil {
+			slog.Error("webui: dynamic client init failed", "error", err)
+		} else {
+			discoveryClient := memcached.NewMemCacheClient(discovery.NewDiscoveryClientForConfigOrDie(restCfg))
+			mapper := restmapper.NewDeferredDiscoveryRESTMapper(discoveryClient)
+			webuiSrv, err := webui.New(webui.Options{
+				Addr:              cfg.WebUIAddr,
+				Username:          cfg.WebUIUsername,
+				Password:          cfg.WebUIPassword,
+				Namespace:         cfg.AgentNamespace,
+				DeploymentName:    cfg.AgentDeploymentName,
+				ConfigMapName:     cfg.AgentConfigMapName,
+				SecretName:        cfg.AgentSecretName,
+				SandboxNamespaces: cfg.ScenarioSandboxNamespaces,
+				PodLogTailLines:   cfg.PodLogTailLines,
+				Clientset:         cs,
+				DynamicClient:     dynClient,
+				RESTMapper:        mapper,
+				RESTConfig:        restCfg,
+			})
+			if err != nil {
+				slog.Error("webui: init failed", "error", err)
+			} else {
+				go func() {
+					if err := webuiSrv.ListenAndServe(ctx); err != nil {
+						slog.Error("webui: server stopped", "error", err)
+					}
+				}()
+			}
+		}
+	}
 
 	run := func(ctx context.Context) {
 		runLoop(ctx, cs, ollamaClient, cfg, m, notifier)

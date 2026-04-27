@@ -100,6 +100,31 @@ type AgentConfig struct {
 	// RedisKeyPrefix namespaces all keys written by the agent. Useful when
 	// sharing a Redis instance across services. Defaults to "k8s-remediator:".
 	RedisKeyPrefix string
+
+	// WebUIEnabled toggles the admin GUI. Disabled by default so air-gapped
+	// or non-admin deployments do not unexpectedly expose a control plane.
+	WebUIEnabled bool
+	// WebUIAddr is the listen address for the admin GUI (separate from
+	// MetricsAddr so basic-auth credentials never share a port with the
+	// public Prometheus scraper).
+	WebUIAddr string
+	// WebUIUsername / WebUIPassword are the basic-auth credentials.
+	// Mounted from a Secret in production.
+	WebUIUsername string
+	WebUIPassword string
+	// AgentNamespace and AgentDeploymentName tell the GUI which Deployment
+	// to scale and patch when the operator changes config from the browser.
+	// Defaults match deploy/agent.yaml.
+	AgentNamespace      string
+	AgentDeploymentName string
+	// AgentConfigMapName / AgentSecretName name the K8s objects holding
+	// the agent's runtime configuration. Updates from the GUI are written
+	// here and a rollout is triggered on the Deployment.
+	AgentConfigMapName string
+	AgentSecretName    string
+	// ScenarioSandboxNamespaces caps where the scenarios feature may apply
+	// faulty workloads. Empty list disables the feature entirely.
+	ScenarioSandboxNamespaces []string
 }
 
 // LoadFromEnv reads agent configuration from environment variables and
@@ -147,6 +172,16 @@ func LoadFromEnv() AgentConfig {
 		RedisPassword:            Getenv("REDIS_PASSWORD", ""),
 		RedisDB:                  Getint("REDIS_DB", 0),
 		RedisKeyPrefix:           Getenv("REDIS_KEY_PREFIX", "k8s-remediator:"),
+
+		WebUIEnabled:              Getbool("WEBUI_ENABLED", false),
+		WebUIAddr:                 Getenv("WEBUI_ADDR", ":8080"),
+		WebUIUsername:             Getenv("WEBUI_USERNAME", ""),
+		WebUIPassword:             Getenv("WEBUI_PASSWORD", ""),
+		AgentNamespace:            Getenv("AGENT_NAMESPACE", "ai-remediator"),
+		AgentDeploymentName:       Getenv("AGENT_DEPLOYMENT_NAME", "ai-remediator-agent"),
+		AgentConfigMapName:        Getenv("AGENT_CONFIGMAP_NAME", "ai-remediator-config"),
+		AgentSecretName:           Getenv("AGENT_SECRET_NAME", "ai-remediator-secrets"),
+		ScenarioSandboxNamespaces: ParseCSV(Getenv("SCENARIO_SANDBOX_NAMESPACES", "incident-lab")),
 	}
 
 	// Invariant: the poll-wide context must outlive a single Ollama call,

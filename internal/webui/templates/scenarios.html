@@ -1,0 +1,29 @@
+{{define "content"}}
+<header class="page">
+  <h1>Scenarios</h1>
+</header>
+
+<p class="hint">
+  Apply a fault-injection scenario to a sandbox namespace, observe the agent's
+  reaction in the Logs page, then clean up.
+  Sandbox allowlist: <strong>{{join .SandboxNamespaces ", "}}</strong>.
+</p>
+
+{{if not .Scenarios}}
+  <p class="warn">No scenarios available.</p>
+{{else}}
+<div class="grid">
+  {{range .Scenarios}}
+  <article class="card">
+    <h2>{{.Name}}</h2>
+    <pre class="desc">{{.Description}}</pre>
+    <div class="actions">
+      <button class="btn-primary" onclick="postForm('/api/scenarios/apply', {scenario: '{{.Name}}'})">Apply</button>
+      <button class="btn-danger"  onclick="postForm('/api/scenarios/cleanup', {scenario: '{{.Name}}'})">Cleanup</button>
+    </div>
+  </article>
+  {{end}}
+</div>
+{{end}}
+{{end}}
+{{template "layout" .}}
