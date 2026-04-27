@@ -3,9 +3,16 @@
 ## End-to-end manifest: ConfigMap (non-secret config), Secret (SMTP password
 ## and webui basic-auth credentials), Deployment, Service, optional Ingress.
 ##
-## Customise the placeholder values below before applying. The admin GUI is
-## opt-in: set WEBUI_ENABLED=true and provide WEBUI_USERNAME/PASSWORD via the
-## Secret to expose it.
+## Customise BEFORE applying:
+##   - container image (search "CUSTOMISE BEFORE APPLYING" below): defaults to
+##     host.docker.internal:5050/k8s-ai-remediator:latest, matching the local
+##     registry used in the README "Build" section. Replace with your own
+##     registry path if you push elsewhere.
+##   - WEBUI_PASSWORD in the Secret: the default "change-me-please" is just a
+##     placeholder. Pick a strong password and front the GUI with TLS.
+##
+## The admin GUI is opt-in: set WEBUI_ENABLED=true and provide
+## WEBUI_USERNAME/PASSWORD via the Secret to expose it.
 ##
 ##   kubectl apply -f rbac-namespaced.yaml
 ##   kubectl apply -f agent.yaml
@@ -95,7 +102,14 @@ spec:
       serviceAccountName: ai-remediator
       containers:
         - name: agent
-          image: ghcr.io/your-org/k8s-ai-remediator:latest
+          # !!! CUSTOMISE BEFORE APPLYING !!!
+          # Default points to the local registry used throughout the README
+          # ("Build and push to the local registry"). If you build/push to a
+          # different registry (private GHCR, ECR, your-org/...), update the
+          # value here OR override after apply with:
+          #   kubectl -n ai-remediator set image deployment/ai-remediator-agent \
+          #     agent=<your-registry>/k8s-ai-remediator:<tag>
+          image: host.docker.internal:5050/k8s-ai-remediator:latest
           imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef:

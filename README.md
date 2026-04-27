@@ -939,7 +939,7 @@ kubectl apply -f deploy/rbac-webui.yaml
 
 # 2. Manifest end-to-end (Namespace, ConfigMap, Secret, Deployment, Service, Ingress
 #    commentato). Personalizza prima dell'apply: cambia WEBUI_PASSWORD nel Secret e
-#    sostituisci l'immagine ghcr.io/your-org/... con la tua.
+#    sostituisci l'immagine se non usi il registry locale di default.
 kubectl apply -f deploy/agent.yaml
 ```
 
