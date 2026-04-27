@@ -21,6 +21,7 @@ REGISTRY="${REGISTRY:-host.docker.internal:5050}"
 DEFAULT_IMAGES="
 redis:7.2-alpine
 busybox:1.36
+busybox:latest
 polinux/stress:latest
 "
 
