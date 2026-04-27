@@ -930,59 +930,114 @@ La fonte di verita di ogni operazione e un oggetto Kubernetes (Deployment, Confi
 
 ### Architettura
 
-La GUI gira nello stesso pod dell'agente (`internal/webui`), espone una porta HTTP separata (`:8080` di default) e condivide il `ServiceAccount` dell'agente. Le credenziali basic-auth sono confrontate con `crypto/subtle` a tempo costante. **TLS deve essere terminato all'Ingress**: la basic-auth viaggia in chiaro e solo HTTPS la protegge sulla rete.
+La GUI gira nello stesso pod dell'agente (`internal/webui`), espone una porta HTTP separata (`:8080` di default) e condivide il `ServiceAccount` dell'agente. Il login usa una sessione cookie HMAC-firmata SHA-256 (TTL 12h, chiave derivata da `WEBUI_PASSWORD`); cambiare la password invalida tutte le sessioni in un colpo solo. Gli endpoint accettano in alternativa l'header HTTP Basic per gli script CLI, confrontato con `crypto/subtle` a tempo costante. **TLS deve essere terminato all'Ingress**: senza HTTPS le credenziali del form viaggiano in chiaro sulla rete.
 
-### Installazione
+### Quick install
 
-Requisiti: l'agente gia installato secondo la sezione [Installazione su Kubernetes](#installazione-su-kubernetes).
+Due percorsi a seconda di cosa hai gia nel cluster.
+
+#### A. Installazione da zero (senza agente preesistente)
+
+`deploy/agent.yaml` crea Namespace, ConfigMap, Secret, Deployment e Service. Personalizza prima dell'apply: cambia `WEBUI_PASSWORD` nel Secret e, se non usi il registry locale di default, l'`image:` nel Deployment.
 
 ```bash
-# 1. RBAC della GUI (Role nel namespace dell'agente + ClusterRole per onboarding)
-kubectl apply -f deploy/rbac-webui.yaml
-
-# 2. (solo se userai la feature "Scenarios" della GUI) RBAC aggiuntivo nel
-#    namespace sandbox per permettere create/delete di Deployments. Va
-#    applicato per ogni namespace elencato in SCENARIO_SANDBOX_NAMESPACES.
-kubectl -n incident-lab apply -f deploy/rbac-scenarios.yaml
-
-# 3. Manifest end-to-end (Namespace, ConfigMap, Secret, Deployment, Service, Ingress
-#    commentato). Personalizza prima dell'apply: cambia WEBUI_PASSWORD nel Secret e
-#    sostituisci l'immagine se non usi il registry locale di default.
-kubectl apply -f deploy/agent.yaml
+kubectl apply -f deploy/rbac-namespaced.yaml      # Role base per l'agente
+kubectl apply -f deploy/rbac-webui.yaml           # Role/ClusterRole per la GUI
+kubectl apply -f deploy/rbac-scenarios.yaml       # opzionale, solo se userai "Scenarios"
+kubectl apply -f deploy/agent.yaml                # Namespace + CM + Secret + Deployment + Service
 ```
 
-> **NB**: `deploy/agent.yaml` crea il Namespace `ai-remediator` e installa direttamente
-> Deployment+Service. Se hai gia l'agente installato col metodo della sezione 2 con un
-> nome o ConfigMap diverso, salta l'apply di `agent.yaml` e applica solo
-> `rbac-webui.yaml`, quindi aggiungi le variabili sotto alla tua ConfigMap esistente.
+#### B. Aggiunta della GUI a un agente gia installato
+
+Se l'agente lo hai gia installato seguendo [Installazione su Kubernetes](#installazione-su-kubernetes) con tuoi nomi di Deployment/ConfigMap, **non** applicare `agent.yaml`: configuri solo gli RBAC della GUI e aggiungi le variabili sotto.
+
+```bash
+kubectl apply -f deploy/rbac-webui.yaml
+kubectl apply -f deploy/rbac-scenarios.yaml       # opzionale
+```
+
+Poi aggiungi le variabili al tuo ConfigMap esistente, crea/aggiorna il Secret con le credenziali di login e fai rollout.
 
 ### Variabili di configurazione
 
-Aggiungi alla ConfigMap dell'agente:
+Aggiungi alla ConfigMap dell'agente (i `AGENT_*` puntano la GUI al Deployment/ConfigMap/Secret giusti — modificali solo se hai nomi diversi dal default):
 
 | Variabile | Default | Note |
 | --------- | ------- | ---- |
 | `WEBUI_ENABLED` | `false` | Imposta a `true` per attivare la GUI |
-| `WEBUI_ADDR` | `:8080` | Porta in ascolto (porta separata da `METRICS_ADDR`) |
+| `WEBUI_ADDR` | `:8080` | Porta in ascolto (separata da `METRICS_ADDR`) |
 | `AGENT_NAMESPACE` | `ai-remediator` | Namespace dell'agente |
-| `AGENT_DEPLOYMENT_NAME` | `ai-remediator-agent` | Nome del Deployment dell'agente |
+| `AGENT_DEPLOYMENT_NAME` | `ai-remediator-agent` | Nome del Deployment |
 | `AGENT_CONFIGMAP_NAME` | `ai-remediator-config` | ConfigMap dei valori non-segreti |
-| `AGENT_SECRET_NAME` | `ai-remediator-secrets` | Secret per password SMTP e basic-auth |
+| `AGENT_SECRET_NAME` | `ai-remediator-secrets` | Secret per password SMTP, login, Redis |
 | `SCENARIO_SANDBOX_NAMESPACES` | `incident-lab` | CSV. Solo questi namespace possono ricevere scenari di guasto. Vuoto = scenari disabilitati |
 
-Aggiungi al Secret dell'agente (chiavi obbligatorie quando `WEBUI_ENABLED=true`):
+Aggiungi al Secret dell'agente (obbligatorie quando `WEBUI_ENABLED=true`):
 
 | Chiave | Note |
 | ------ | ---- |
-| `WEBUI_USERNAME` | Username basic-auth |
-| `WEBUI_PASSWORD` | Password basic-auth (cambiala dal default) |
+| `WEBUI_USERNAME` | Username del login |
+| `WEBUI_PASSWORD` | Password del login (cambiala dal default) |
 
-### Esposizione via Ingress
+One-liner per impostare le credenziali e abilitare la GUI senza editare YAML:
 
-Lo `Service` `ai-remediator-webui` in `deploy/agent.yaml` serve la GUI sulla porta 80 verso il container 8080. La sezione `Ingress` nel manifest e commentata; abilitala dopo aver predisposto:
+```bash
+kubectl -n ai-remediator create secret generic ai-remediator-secrets \
+  --from-literal=WEBUI_USERNAME=admin \
+  --from-literal=WEBUI_PASSWORD="$(openssl rand -base64 24)" \
+  --dry-run=client -o yaml | kubectl apply -f -
 
-- un nome host (es. `ai-remediator.example.com`),
-- un certificato TLS in un Secret (es. tramite cert-manager).
+kubectl -n ai-remediator patch cm ai-remediator-config --type merge -p '{
+  "data": { "WEBUI_ENABLED": "true" }
+}'
+```
+
+### Build, push e rollout
+
+Il binario contiene template HTML, CSS, JS e gli scenari come file embeddati: ogni cambio della GUI richiede un nuovo build. La sequenza completa:
+
+```bash
+# Allinea il working tree
+git checkout master
+git pull origin master
+
+# Build + push multi-arch (copre amd64 e arm64; sostituisci il registry se usi un altro)
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t host.docker.internal:5050/k8s-ai-remediator:latest \
+  --push .
+
+# Rollout
+kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
+kubectl -n ai-remediator rollout status deployment/ai-remediator-agent --timeout=180s
+
+# Verifica che il pod usi davvero la nuova immagine: l'Image ID (sha256) deve cambiare
+kubectl -n ai-remediator describe pod -l app=ai-remediator-agent | grep -E 'Image:|Image ID:'
+```
+
+Se l'`Image ID` non cambia (la cache di `:latest` sul nodo puo ingannare), forza con un tag univoco per build:
+
+```bash
+TAG="dev-$(git rev-parse --short HEAD)"
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t host.docker.internal:5050/k8s-ai-remediator:$TAG --push .
+kubectl -n ai-remediator set image deployment/ai-remediator-agent \
+  agent=host.docker.internal:5050/k8s-ai-remediator:$TAG
+kubectl -n ai-remediator rollout status deployment/ai-remediator-agent
+```
+
+### Accesso
+
+#### Port-forward (test locali)
+
+```bash
+kubectl -n ai-remediator port-forward svc/ai-remediator-webui 8080:80
+# apri http://127.0.0.1:8080 e accedi col form di login
+```
+
+#### Ingress (produzione)
+
+Lo `Service` `ai-remediator-webui` in `deploy/agent.yaml` serve la GUI sulla porta 80 -> container 8080. La sezione `Ingress` nel manifest e commentata; abilitala dopo aver predisposto un nome host e un certificato TLS (es. tramite cert-manager). Le annotation no-buffer sotto sono **necessarie** per lo streaming SSE della pagina Logs:
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -991,7 +1046,6 @@ metadata:
   name: ai-remediator-webui
   namespace: ai-remediator
   annotations:
-    # Streaming SSE: niente buffering proxy o il tail dei log non funziona.
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-buffering: "off"
 spec:
@@ -1012,15 +1066,6 @@ spec:
                   number: 80
 ```
 
-### Accesso senza Ingress (port-forward)
-
-Per test rapidi, in particolare in cluster locali (k3d/kind):
-
-```bash
-kubectl -n ai-remediator port-forward svc/ai-remediator-webui 8080:80
-# poi apri http://127.0.0.1:8080 e inserisci le credenziali basic-auth
-```
-
 ### Permessi RBAC concessi dalla GUI
 
 `deploy/rbac-webui.yaml` aggiunge al ServiceAccount `ai-remediator`:
@@ -1028,7 +1073,7 @@ kubectl -n ai-remediator port-forward svc/ai-remediator-webui 8080:80
 - **Nel namespace dell'agente**: `get/list/watch/create/update/patch` su `configmaps` e `secrets`; `get/list/watch` su `pods`, `pods/log`; `get/update/patch` su `deployments` e `deployments/scale`; `get/list/watch` su `leases`.
 - **Cluster-wide**: `get/list/create/patch` su `namespaces`; `get/list/create/update/delete` su `roles` e `rolebindings`.
 
-Sono i permessi minimi per scaricare ConfigMap/Secret in lettura, riapplicarli, scalare il Deployment, leggere i log e onboardare nuovi namespace via "Apply RBAC". I permessi cluster-wide su `roles`/`rolebindings` sono protetti dalla basic-auth e dovrebbero stare dietro Ingress TLS.
+Sono i permessi minimi per scaricare ConfigMap/Secret in lettura, riapplicarli, scalare il Deployment, leggere i log e onboardare nuovi namespace via "Apply RBAC". I permessi cluster-wide su `roles`/`rolebindings` sono protetti dal login e dovrebbero stare dietro Ingress TLS.
 
 `deploy/rbac-scenarios.yaml` (opzionale) aggiunge nel singolo namespace sandbox:
 
@@ -1039,7 +1084,8 @@ Necessari solo per la feature "Scenarios" della GUI (apply + cleanup dei manifes
 
 ### Sicurezza
 
-- **TLS obbligatorio in produzione**: senza HTTPS le credenziali basic-auth viaggiano in chiaro.
+- **TLS obbligatorio in produzione**: senza HTTPS le credenziali del form di login viaggiano in chiaro.
+- **Rotazione password**: la chiave HMAC del cookie e derivata da `WEBUI_PASSWORD`. Cambiare la password (`kubectl patch secret`) invalida ogni sessione esistente in un colpo solo.
 - **Sandbox scenari**: la feature "Scenarios" rifiuta sia oggetti cluster-scoped sia namespace fuori dall'allowlist `SCENARIO_SANDBOX_NAMESPACES`. Tienila ristretta ai soli namespace di test.
 - **Repliche**: la GUI e stateless e safe a scalare. La leader election interna garantisce che, anche con piu repliche, una sola esegua il loop di remediation.
 - **Audit**: ogni azione mutating logga azione, target e timestamp su stdout (visibili dalla pagina Logs).
@@ -1048,6 +1094,7 @@ Necessari solo per la feature "Scenarios" della GUI (apply + cleanup dei manifes
 
 ```bash
 kubectl -n ai-remediator set env deployment/ai-remediator-agent WEBUI_ENABLED=false
+kubectl -n ai-remediator rollout status deployment/ai-remediator-agent
 ```
 
 oppure rimuovi la chiave `WEBUI_ENABLED` dalla ConfigMap e ricarica il Deployment. La porta 8080 non viene piu aperta dal pod.
