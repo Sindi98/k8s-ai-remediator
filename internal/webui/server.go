@@ -64,9 +64,22 @@ type Options struct {
 
 // Server is the HTTP server that exposes the admin GUI.
 type Server struct {
-	opts Options
-	mux  *http.ServeMux
-	tmpl *template.Template
+	opts  Options
+	mux   *http.ServeMux
+	pages map[string]*template.Template
+}
+
+// pageNames lists the per-page templates the GUI knows how to render.
+// Each page file defines its own {{define "content"}}; parsing them all
+// into the same namespace would let later definitions clobber earlier
+// ones, so we build one template tree per page (each with its own copy
+// of "layout") and look up by filename at render time.
+var pageNames = []string{
+	"dashboard.html",
+	"logs.html",
+	"config.html",
+	"scenarios.html",
+	"rbac.html",
 }
 
 // New constructs a ready-to-serve Server.
@@ -78,17 +91,37 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("webui: kubernetes clientset is required")
 	}
 
-	tmpl, err := template.New("").Funcs(template.FuncMap{
+	funcs := template.FuncMap{
 		"join": strings.Join,
-	}).ParseFS(templatesFS, "templates/*.html")
+	}
+
+	// Parse the layout once into a base template. Each page then clones
+	// the base (so it starts with "layout" already defined) and overlays
+	// its own {{define "content"}}. This keeps the layout DRY without the
+	// shared-namespace overwrite bug that caused every page to render the
+	// last-alphabetical "content" block.
+	base, err := template.New("base").Funcs(funcs).ParseFS(templatesFS, "templates/layout.html")
 	if err != nil {
-		return nil, fmt.Errorf("webui: parse templates: %w", err)
+		return nil, fmt.Errorf("webui: parse layout: %w", err)
+	}
+
+	pages := make(map[string]*template.Template, len(pageNames))
+	for _, name := range pageNames {
+		t, err := base.Clone()
+		if err != nil {
+			return nil, fmt.Errorf("webui: clone base for %s: %w", name, err)
+		}
+		t, err = t.ParseFS(templatesFS, "templates/"+name)
+		if err != nil {
+			return nil, fmt.Errorf("webui: parse %s: %w", name, err)
+		}
+		pages[name] = t
 	}
 
 	s := &Server{
-		opts: opts,
-		mux:  http.NewServeMux(),
-		tmpl: tmpl,
+		opts:  opts,
+		mux:   http.NewServeMux(),
+		pages: pages,
 	}
 	s.routes()
 	return s, nil

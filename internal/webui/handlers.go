@@ -21,7 +21,13 @@ type pageData struct {
 
 func (s *Server) renderPage(w http.ResponseWriter, name string, data pageData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.tmpl.ExecuteTemplate(w, name, data); err != nil {
+	tmpl, ok := s.pages[name]
+	if !ok {
+		slog.Error("webui: unknown template", "name", name)
+		http.Error(w, "render error", http.StatusInternalServerError)
+		return
+	}
+	if err := tmpl.ExecuteTemplate(w, name, data); err != nil {
 		slog.Error("webui: render template", "name", name, "error", err)
 		http.Error(w, "render error", http.StatusInternalServerError)
 	}
