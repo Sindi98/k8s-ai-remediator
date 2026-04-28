@@ -918,8 +918,9 @@ kubectl -n <nuovo-namespace> create rolebinding ai-remediator \
 Una GUI web opzionale, con form di login dedicato, permette di gestire dal browser le operazioni piu comuni:
 
 - **Login**: form classico (username/password) con sessione cookie HMAC-firmata di 12h. Gli endpoint `/api/*` accettano anche basic-auth header per script CLI.
-- **Dashboard**: stato del Deployment dell'agente (repliche desiderate/pronte), pod, ConfigMap, Secret, leader lease, configurazione live in lettura.
+- **Dashboard**: stato del Deployment dell'agente (repliche desiderate/pronte), pod, ConfigMap, Secret, leader lease, **probe live di Ollama (lista modelli + latenza) e Redis (TCP ping)**, **feed delle ultime decisioni** del loop di remediation (action / severity / outcome), configurazione live in lettura.
 - **Logs**: streaming live dei log del pod via Server-Sent Events, con pause/clear.
+- **Cluster**: tabella dei pod nei namespace listati in `INCLUDE_NAMESPACES`, con filtro per phase e ricerca per nome, restart count, last-termination reason, e bottone "logs" che apre un pannello con tail (anche `previous`).
 - **Configuration** (accordion con piu sezioni): modello LLM, tuning Ollama (RPS, retry, timeout), behavior (`DRY_RUN`, severity, polling), scaling bounds, namespace filters, action policies (`ALLOW_PATCH_*`, threshold di confidence), backend di dedup + Redis, SMTP (con "Send test email"), repliche dell'agente. Ogni form scrive su ConfigMap o Secret e forza un rollout del Deployment.
 - **Scenarios**: applica e rimuove gli scenari di guasto (sezione [Scenari di errore](#scenari-di-errore)) verso un namespace sandbox in allowlist.
 - **RBAC**: applica `Role` + `RoleBinding` namespace-scoped per onboardare un nuovo namespace senza editare manualmente lo YAML.
@@ -1071,9 +1072,9 @@ spec:
 `deploy/rbac-webui.yaml` aggiunge al ServiceAccount `ai-remediator`:
 
 - **Nel namespace dell'agente**: `get/list/watch/create/update/patch` su `configmaps` e `secrets`; `get/list/watch` su `pods`, `pods/log`; `get/update/patch` su `deployments` e `deployments/scale`; `get/list/watch` su `leases`.
-- **Cluster-wide**: `get/list/create/patch` su `namespaces`; `get/list/create/update/delete` su `roles` e `rolebindings`.
+- **Cluster-wide**: `get/list/create/patch` su `namespaces`; `get/list/create/update/delete` su `roles` e `rolebindings`; `get/list/watch` su `pods` e `get` su `pods/log` (per la pagina Cluster — gli accessi sono ulteriormente filtrati a livello applicativo dall'allowlist `INCLUDE_NAMESPACES`).
 
-Sono i permessi minimi per scaricare ConfigMap/Secret in lettura, riapplicarli, scalare il Deployment, leggere i log e onboardare nuovi namespace via "Apply RBAC". I permessi cluster-wide su `roles`/`rolebindings` sono protetti dal login e dovrebbero stare dietro Ingress TLS.
+Sono i permessi minimi per scaricare ConfigMap/Secret in lettura, riapplicarli, scalare il Deployment, leggere i log dell'agente e dei pod monitorati, e onboardare nuovi namespace via "Apply RBAC". I permessi cluster-wide su `roles`/`rolebindings` sono protetti dal login e dovrebbero stare dietro Ingress TLS.
 
 `deploy/rbac-scenarios.yaml` (opzionale) aggiunge nel singolo namespace sandbox:
 

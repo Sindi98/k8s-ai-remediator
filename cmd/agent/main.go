@@ -254,7 +254,7 @@ func canonicalReason(reason, message string) string {
 	return trimmed
 }
 
-func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder, notifier notify.Notifier) {
+func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder, notifier notify.Notifier, recorder *webui.RecentDecisionRecorder) {
 	store, err := dedup.NewStore(dedup.BackendConfig{
 		Backend:        cfg.DedupBackend,
 		RedisAddr:      cfg.RedisAddr,
@@ -268,13 +268,13 @@ func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.
 	} else {
 		slog.Info("dedup store initialised", "backend", cfg.DedupBackend)
 	}
-	runLoopWithStore(ctx, cs, ollamaClient, cfg, m, notifier, store)
+	runLoopWithStore(ctx, cs, ollamaClient, cfg, m, notifier, store, recorder)
 }
 
 // runLoopWithStore is the injectable form of runLoop: tests and future
 // alternative backends (Redis, SQLite, ConfigMap) can pass a custom Store
 // so dedup state survives across agent restarts.
-func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder, notifier notify.Notifier, cache dedup.Store) {
+func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder, notifier notify.Notifier, cache dedup.Store, recorder *webui.RecentDecisionRecorder) {
 
 	dedupeTTL := time.Duration(cfg.DedupeTTLSec) * time.Second
 	seenTTL := time.Duration(cfg.EventSeenTTLSec) * time.Second
@@ -466,6 +466,7 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 					"action", d.Action,
 				)
 				m.EventsSkipped.Add(1)
+				recorder.Record(e.Namespace, e.InvolvedObject.Kind, e.InvolvedObject.Name, e.Reason, d, "skipped", "below minSeverity")
 				continue
 			}
 
@@ -474,6 +475,24 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 				m.ExecutionErrors.Add(1)
 				slog.Error("execute decision failed", "action", d.Action, "error", execErr)
 			}
+
+			// Classify the outcome for the dashboard ring buffer. Policy
+			// validators (the ones in internal/policy) signal the agent
+			// declined to act with non-error returns shaped like "blocked
+			// by policy"; we surface that distinct from a real failure.
+			outcome := "success"
+			outcomeErr := ""
+			if execErr != nil {
+				if strings.Contains(strings.ToLower(execErr.Error()), "policy") ||
+					strings.Contains(strings.ToLower(execErr.Error()), "blocked") ||
+					strings.Contains(strings.ToLower(execErr.Error()), "opt in") {
+					outcome = "blocked"
+				} else {
+					outcome = "error"
+				}
+				outcomeErr = execErr.Error()
+			}
+			recorder.Record(e.Namespace, e.InvolvedObject.Kind, e.InvolvedObject.Name, e.Reason, d, outcome, outcomeErr)
 
 			// Fire-and-forget notification so SMTP latency never blocks
 			// the poll loop. The notifier filters on NOTIFY_MIN_SEVERITY
@@ -555,6 +574,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	// Ring buffer of recent decisions, surfaced by the GUI dashboard.
+	// Allocated unconditionally so runLoop can call Record() without nil
+	// checks; size is small (20 entries ~few KB).
+	decisionRecorder := webui.NewRecentDecisionRecorder(20)
+
 	// Optional admin GUI. Runs alongside the polling loop and is independent
 	// of leader election: every replica serves the GUI so the dashboard stays
 	// reachable even when the active leader is elsewhere.
@@ -575,6 +599,13 @@ func main() {
 				SecretName:        cfg.AgentSecretName,
 				SandboxNamespaces: cfg.ScenarioSandboxNamespaces,
 				PodLogTailLines:   cfg.PodLogTailLines,
+				IncludeNamespaces: cfg.IncludeNamespaces,
+				OllamaBaseURL:     cfg.BaseURL,
+				DedupBackend:      cfg.DedupBackend,
+				RedisAddr:         cfg.RedisAddr,
+				RedisPassword:     cfg.RedisPassword,
+				RedisDB:           cfg.RedisDB,
+				Decisions:         decisionRecorder,
 				Clientset:         cs,
 				DynamicClient:     dynClient,
 				RESTMapper:        mapper,
@@ -593,7 +624,7 @@ func main() {
 	}
 
 	run := func(ctx context.Context) {
-		runLoop(ctx, cs, ollamaClient, cfg, m, notifier)
+		runLoop(ctx, cs, ollamaClient, cfg, m, notifier, decisionRecorder)
 	}
 
 	if cfg.LeaderElection {

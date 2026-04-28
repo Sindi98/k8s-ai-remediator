@@ -56,6 +56,29 @@ type Options struct {
 	// PodLogTailLines bounds the SSE log stream initial buffer.
 	PodLogTailLines int64
 
+	// IncludeNamespaces is the same allowlist the remediation loop uses.
+	// The Cluster page restricts /api/cluster/pods + /api/cluster/pods/logs
+	// to these namespaces. Empty list disables the Cluster page.
+	IncludeNamespaces []string
+
+	// OllamaBaseURL is hit by the dependency probe on the dashboard to
+	// surface model availability without requiring the operator to shell
+	// into the agent pod.
+	OllamaBaseURL string
+
+	// DedupBackend / RedisAddr / RedisPassword / RedisDB feed the Redis
+	// PING probe shown on the dashboard. When DedupBackend != "redis"
+	// the probe is skipped.
+	DedupBackend  string
+	RedisAddr     string
+	RedisPassword string
+	RedisDB       int
+
+	// Decisions, when set, is consulted by /api/decisions/recent for the
+	// dashboard widget. Pass nil in tests where the recorder is not
+	// wired up.
+	Decisions *RecentDecisionRecorder
+
 	Clientset     kubernetes.Interface
 	DynamicClient dynamic.Interface
 	RESTMapper    *restmapper.DeferredDiscoveryRESTMapper
@@ -77,6 +100,7 @@ type Server struct {
 var pageNames = []string{
 	"dashboard.html",
 	"logs.html",
+	"cluster.html",
 	"config.html",
 	"scenarios.html",
 	"rbac.html",
@@ -192,6 +216,7 @@ func (s *Server) routes() {
 
 	s.mux.Handle("/", auth(http.HandlerFunc(s.handleDashboard)))
 	s.mux.Handle("/logs", auth(http.HandlerFunc(s.handleLogsPage)))
+	s.mux.Handle("/cluster", auth(http.HandlerFunc(s.handleClusterPage)))
 	s.mux.Handle("/config", auth(http.HandlerFunc(s.handleConfigPage)))
 	s.mux.Handle("/scenarios", auth(http.HandlerFunc(s.handleScenariosPage)))
 	s.mux.Handle("/rbac", auth(http.HandlerFunc(s.handleRBACPage)))
@@ -208,4 +233,9 @@ func (s *Server) routes() {
 
 	s.mux.Handle("/api/config/general", auth(http.HandlerFunc(s.handleUpdateGeneral)))
 	s.mux.Handle("/api/config/redis-password", auth(http.HandlerFunc(s.handleUpdateRedisPassword)))
+
+	s.mux.Handle("/api/cluster/namespaces", auth(http.HandlerFunc(s.handleClusterNamespaces)))
+	s.mux.Handle("/api/cluster/pods", auth(http.HandlerFunc(s.handleClusterPods)))
+	s.mux.Handle("/api/cluster/pods/logs", auth(http.HandlerFunc(s.handleClusterPodLogs)))
+	s.mux.Handle("/api/decisions/recent", auth(http.HandlerFunc(s.handleRecentDecisions)))
 }

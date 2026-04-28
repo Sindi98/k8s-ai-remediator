@@ -60,6 +60,11 @@ subjects:
 ## Cluster-wide RBAC management for the onboarding feature. The GUI uses
 ## these verbs only when an operator clicks "Apply RBAC" on the form, so
 ## the privilege is gated by basic-auth + (recommended) TLS at the Ingress.
+##
+## The pods + pods/log verbs power the "Cluster" page (cross-namespace
+## pod inspection). They are restricted at the application layer by the
+## INCLUDE_NAMESPACES allowlist; the GUI rejects requests for any
+## namespace outside that list before even hitting the Kubernetes API.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -71,6 +76,12 @@ rules:
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [roles, rolebindings]
     verbs: [get, list, create, update, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

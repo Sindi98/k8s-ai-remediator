@@ -84,6 +84,15 @@ func (s *Server) handleRBACPage(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+func (s *Server) handleClusterPage(w http.ResponseWriter, _ *http.Request) {
+	s.renderPage(w, "cluster.html", pageData{
+		Title:      "Cluster",
+		Active:     "cluster",
+		Namespace:  s.opts.Namespace,
+		Deployment: s.opts.DeploymentName,
+	})
+}
+
 // writeJSON serialises v as JSON with the given status code. Slimmer than
 // pulling a router library, kept inline so handler code stays linear.
 func writeJSON(w http.ResponseWriter, status int, v any) {

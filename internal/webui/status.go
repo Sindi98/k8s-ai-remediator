@@ -2,7 +2,11 @@ package webui
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,9 +39,17 @@ type podStatus struct {
 }
 
 type dependencyStatus struct {
-	ConfigMap string `json:"configmap"`
-	Secret    string `json:"secret"`
-	Lease     string `json:"lease"`
+	ConfigMap string         `json:"configmap"`
+	Secret    string         `json:"secret"`
+	Lease     string         `json:"lease"`
+	Ollama    *probeResult   `json:"ollama,omitempty"`
+	Redis     *probeResult   `json:"redis,omitempty"`
+}
+
+type probeResult struct {
+	OK        bool          `json:"ok"`
+	Detail    string        `json:"detail"`
+	LatencyMs time.Duration `json:"latency_ms"`
 }
 
 // handleStatus fans out the per-component checks in parallel and returns a
@@ -165,8 +177,82 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		rep.Dependencies.Lease = "leader=" + holder
 	}()
 
+	if s.opts.OllamaBaseURL != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res := probeOllama(ctx, s.opts.OllamaBaseURL)
+			mu.Lock()
+			rep.Dependencies.Ollama = res
+			mu.Unlock()
+		}()
+	}
+
+	if strings.EqualFold(s.opts.DedupBackend, "redis") && s.opts.RedisAddr != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res := probeRedis(ctx, s.opts.RedisAddr)
+			mu.Lock()
+			rep.Dependencies.Redis = res
+			mu.Unlock()
+		}()
+	}
+
 	wg.Wait()
 	writeJSON(w, http.StatusOK, rep)
+}
+
+// probeOllama hits the model registry endpoint and returns a short OK/KO
+// summary plus the list of locally-available model names. Useful to
+// catch the "model not found" 404 before triggering an actual decision.
+func probeOllama(ctx context.Context, baseURL string) *probeResult {
+	start := time.Now()
+	url := strings.TrimRight(baseURL, "/") + "/tags"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return &probeResult{OK: false, Detail: err.Error()}
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return &probeResult{OK: false, Detail: err.Error(), LatencyMs: time.Since(start) / time.Millisecond}
+	}
+	defer resp.Body.Close()
+	latency := time.Since(start) / time.Millisecond
+	if resp.StatusCode != http.StatusOK {
+		return &probeResult{OK: false, Detail: fmt.Sprintf("HTTP %d", resp.StatusCode), LatencyMs: latency}
+	}
+	var payload struct {
+		Models []struct{ Name string } `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return &probeResult{OK: true, Detail: "ok (no model list)", LatencyMs: latency}
+	}
+	names := make([]string, 0, len(payload.Models))
+	for _, m := range payload.Models {
+		names = append(names, m.Name)
+	}
+	if len(names) == 0 {
+		return &probeResult{OK: true, Detail: "ok, 0 models installed", LatencyMs: latency}
+	}
+	return &probeResult{OK: true, Detail: "models: " + strings.Join(names, ", "), LatencyMs: latency}
+}
+
+// probeRedis runs a TCP-level connectivity check. We deliberately avoid
+// importing the redis client here just for a probe — full PING+AUTH would
+// pull the same dependency the agent already has, but keeping the webui
+// boundary thin pays off in unit-test isolation.
+func probeRedis(ctx context.Context, addr string) *probeResult {
+	start := time.Now()
+	d := &net.Dialer{Timeout: 3 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	latency := time.Since(start) / time.Millisecond
+	if err != nil {
+		return &probeResult{OK: false, Detail: err.Error(), LatencyMs: latency}
+	}
+	_ = conn.Close()
+	return &probeResult{OK: true, Detail: "tcp connect ok", LatencyMs: latency}
 }
 
 // humanAge renders a duration as a compact human string ("3h", "2d").

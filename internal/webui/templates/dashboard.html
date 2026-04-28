@@ -20,6 +20,8 @@
       <dt>ConfigMap</dt><dd id="dep-configmap">—</dd>
       <dt>Secret</dt><dd id="dep-secret">—</dd>
       <dt>Leader lease</dt><dd id="dep-lease">—</dd>
+      <dt>Ollama</dt><dd id="dep-ollama">—</dd>
+      <dt>Redis</dt><dd id="dep-redis">—</dd>
     </dl>
   </article>
 
@@ -35,6 +37,15 @@
   <table class="table">
     <thead><tr><th>Name</th><th>Phase</th><th>Ready</th><th>Restarts</th><th>Age</th></tr></thead>
     <tbody id="pod-rows"></tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Recent decisions</h2>
+  <p class="hint">Ultime decisioni del loop di remediation (ring buffer in-memory).</p>
+  <table class="table">
+    <thead><tr><th>When</th><th>Namespace</th><th>Target</th><th>Reason</th><th>Action</th><th>Sev</th><th>Conf</th><th>Outcome</th></tr></thead>
+    <tbody id="decisions-rows"></tbody>
   </table>
 </section>
 
