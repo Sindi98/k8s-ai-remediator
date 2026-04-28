@@ -109,11 +109,61 @@
           cfgRows.appendChild(tr);
         });
       }
+
+      // Probe details
+      function fmtProbe(p) {
+        if (!p) return '—';
+        const dot = p.ok ? '✓' : '✗';
+        const lat = (p.latency_ms != null) ? ` (${p.latency_ms} ms)` : '';
+        return `${dot} ${p.detail || ''}${lat}`;
+      }
+      setText('dep-ollama', fmtProbe(s.dependencies.ollama));
+      setText('dep-redis',  fmtProbe(s.dependencies.redis));
     } catch (e) {
       flash(String(e), false);
     }
+    refreshDecisions();
   }
   window.refreshStatus = refreshStatus;
+
+  // -------- Recent decisions feed --------
+  function severityClass(sev) {
+    return 'sev-' + (String(sev || '').toLowerCase() || 'unknown');
+  }
+  function outcomeClass(o) {
+    return 'oc-' + (String(o || '').toLowerCase() || 'unknown');
+  }
+  async function refreshDecisions() {
+    const tbody = document.getElementById('decisions-rows');
+    if (!tbody) return;
+    try {
+      const res = await fetch('/api/decisions/recent');
+      if (!res.ok) return;
+      const j = await res.json();
+      tbody.innerHTML = '';
+      (j.decisions || []).forEach((d) => {
+        const tr = document.createElement('tr');
+        const t = new Date(d.time).toLocaleTimeString();
+        const target = `${d.kind}/${d.name}`;
+        const conf = (d.confidence != null) ? d.confidence.toFixed(2) : '';
+        tr.innerHTML = `
+          <td>${t}</td>
+          <td>${d.namespace}</td>
+          <td>${target}</td>
+          <td>${d.event_reason || ''}</td>
+          <td>${d.action}</td>
+          <td><span class="chip ${severityClass(d.severity)}">${d.severity || '?'}</span></td>
+          <td>${conf}</td>
+          <td><span class="chip ${outcomeClass(d.outcome)}">${d.outcome}</span>${d.outcome_error ? ` <span class="hint">${d.outcome_error}</span>` : ''}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+      if ((j.decisions || []).length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" class="hint">Nessuna decisione ancora registrata.</td></tr>';
+      }
+    } catch (_e) {}
+  }
+  window.refreshDecisions = refreshDecisions;
 
   // -------- Logs (SSE) --------
   let logSource = null;
@@ -147,9 +197,120 @@
   window.toggleLogStream = toggleLogStream;
   window.clearLogs = clearLogs;
 
+  // -------- Cluster page --------
+  let clusterDebounceTimer = null;
+  let clusterLastPodMeta = null;
+
+  async function loadClusterNamespaces() {
+    const sel = document.getElementById('cluster-ns');
+    if (!sel) return;
+    try {
+      const res = await fetch('/api/cluster/namespaces');
+      if (!res.ok) { flash('namespaces: HTTP ' + res.status, false); return; }
+      const j = await res.json();
+      const list = j.namespaces || [];
+      sel.innerHTML = '';
+      if (list.length === 0) {
+        sel.innerHTML = '<option value="">(no INCLUDE_NAMESPACES configured)</option>';
+        return;
+      }
+      list.forEach((n) => {
+        const o = document.createElement('option');
+        o.value = n; o.textContent = n;
+        sel.appendChild(o);
+      });
+      refreshClusterPods();
+    } catch (e) { flash(String(e), false); }
+  }
+
+  function podPhaseClass(p) { return 'phase-' + String(p || '').toLowerCase(); }
+
+  async function refreshClusterPods() {
+    const ns = document.getElementById('cluster-ns')?.value;
+    if (!ns) return;
+    const phase = document.getElementById('cluster-phase')?.value || '';
+    const name = document.getElementById('cluster-name')?.value || '';
+    const url = `/api/cluster/pods?namespace=${encodeURIComponent(ns)}` +
+      (phase ? `&phase=${encodeURIComponent(phase)}` : '') +
+      (name  ? `&name=${encodeURIComponent(name)}`   : '');
+    try {
+      const res = await fetch(url);
+      if (!res.ok) {
+        let msg = 'HTTP ' + res.status;
+        try { const j = await res.json(); msg = j.error || msg; } catch (_e) {}
+        flash('pods: ' + msg, false); return;
+      }
+      const j = await res.json();
+      const tbody = document.getElementById('cluster-pod-rows');
+      if (!tbody) return;
+      tbody.innerHTML = '';
+      (j.pods || []).forEach((p) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${p.name}</td>
+          <td><span class="chip ${podPhaseClass(p.phase)}">${p.phase}</span></td>
+          <td>${p.ready ? '✓' : '✗'}</td>
+          <td>${p.restarts}</td>
+          <td>${p.last_term_reason || ''}</td>
+          <td>${(p.containers || []).join(', ')}</td>
+          <td>${p.age}</td>
+          <td>${p.node || ''}</td>
+          <td><button class="btn-link" data-pod="${p.name}" data-ns="${p.namespace}" data-c="${(p.containers || [])[0] || ''}">logs</button></td>
+        `;
+        tr.querySelector('button').addEventListener('click', (e) => {
+          const b = e.currentTarget;
+          openLogModal(b.dataset.ns, b.dataset.pod, b.dataset.c);
+        });
+        tbody.appendChild(tr);
+      });
+      const counts = j.counts || {};
+      const summary = Object.entries(counts).map(([k, v]) => `${k}:${v}`).join(' · ');
+      const cEl = document.getElementById('cluster-counts');
+      if (cEl) cEl.textContent = `${(j.pods || []).length} pods (${summary || 'none'})`;
+    } catch (e) { flash(String(e), false); }
+  }
+  function refreshClusterPodsDebounced() {
+    clearTimeout(clusterDebounceTimer);
+    clusterDebounceTimer = setTimeout(refreshClusterPods, 250);
+  }
+
+  function openLogModal(ns, pod, container) {
+    clusterLastPodMeta = { ns, pod, container };
+    document.getElementById('log-modal-title').textContent = `${ns}/${pod} (${container || 'default'})`;
+    document.getElementById('log-modal-previous').checked = false;
+    document.getElementById('log-modal').style.display = 'flex';
+    reloadModalLogs();
+  }
+  function closeLogModal() {
+    document.getElementById('log-modal').style.display = 'none';
+  }
+  async function reloadModalLogs() {
+    if (!clusterLastPodMeta) return;
+    const { ns, pod, container } = clusterLastPodMeta;
+    const previous = document.getElementById('log-modal-previous').checked;
+    const url = `/api/cluster/pods/logs?namespace=${encodeURIComponent(ns)}&pod=${encodeURIComponent(pod)}` +
+      (container ? `&container=${encodeURIComponent(container)}` : '') +
+      `&previous=${previous}&tail=500`;
+    const body = document.getElementById('log-modal-body');
+    body.textContent = 'loading...';
+    try {
+      const res = await fetch(url);
+      const text = await res.text();
+      body.textContent = res.ok ? (text || '(empty)') : `[error] ${text}`;
+      body.scrollTop = body.scrollHeight;
+    } catch (e) {
+      body.textContent = `[error] ${e}`;
+    }
+  }
+  window.refreshClusterPods = refreshClusterPods;
+  window.refreshClusterPodsDebounced = refreshClusterPodsDebounced;
+  window.closeLogModal = closeLogModal;
+  window.reloadModalLogs = reloadModalLogs;
+
   // Auto-init: feature-detect which page we are on and run the right
   // bootstrap. The script tag is at the end of <body> in layout.html so
   // every form/element already exists by the time we run.
   if (document.getElementById('agent-namespace')) refreshStatus();
   if (document.getElementById('log-view')) startLogStream();
+  if (document.getElementById('cluster-ns')) loadClusterNamespaces();
 })();
