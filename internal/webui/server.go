@@ -229,6 +229,7 @@ func (s *Server) routes() {
 	s.mux.Handle("/api/config/replicas", auth(http.HandlerFunc(s.handleScaleReplicas)))
 	s.mux.Handle("/api/scenarios/apply", auth(http.HandlerFunc(s.handleScenarioApply)))
 	s.mux.Handle("/api/scenarios/cleanup", auth(http.HandlerFunc(s.handleScenarioCleanup)))
+	s.mux.Handle("/api/scenarios/status", auth(http.HandlerFunc(s.handleScenariosStatus)))
 	s.mux.Handle("/api/rbac/apply", auth(http.HandlerFunc(s.handleRBACApply)))
 
 	s.mux.Handle("/api/config/general", auth(http.HandlerFunc(s.handleUpdateGeneral)))

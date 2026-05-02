@@ -1,11 +1,14 @@
 {{define "content"}}
 <header class="page">
   <h1>Scenarios</h1>
+  <span id="scenarios-monitor-info" class="hint">Monitoring…</span>
 </header>
 
 <p class="hint">
   Apply a fault-injection scenario to a sandbox namespace, observe the agent's
-  reaction in the Logs page, then clean up.
+  reaction in the Logs page, then clean up. Each card has its own monitor:
+  it stays red while the error is reproducing and flips to green once the
+  underlying condition is resolved.
   Sandbox allowlist: <strong>{{join .SandboxNamespaces ", "}}</strong>.
 </p>
 
@@ -14,12 +17,17 @@
 {{else}}
 <div class="grid">
   {{range .Scenarios}}
-  <article class="card">
-    <h2>{{.Name}}</h2>
+  <article class="card scenario-card" data-scenario="{{.Name}}">
+    <header class="scenario-head">
+      <h2>{{.Name}}</h2>
+      <span class="chip scn-state state-not_applied" data-role="state">not applied</span>
+    </header>
+    <p class="scn-summary hint" data-role="summary">Loading status…</p>
     <pre class="desc">{{.Description}}</pre>
+    <ul class="scn-pods" data-role="pods"></ul>
     <div class="actions">
-      <button class="btn-primary" onclick="postForm('/api/scenarios/apply', {scenario: '{{.Name}}'})">Apply</button>
-      <button class="btn-danger"  onclick="postForm('/api/scenarios/cleanup', {scenario: '{{.Name}}'})">Cleanup</button>
+      <button class="btn-primary" onclick="postForm('/api/scenarios/apply', {scenario: '{{.Name}}'}).then(refreshScenariosStatus)">Apply</button>
+      <button class="btn-danger"  onclick="postForm('/api/scenarios/cleanup', {scenario: '{{.Name}}'}).then(refreshScenariosStatus)">Cleanup</button>
     </div>
   </article>
   {{end}}
