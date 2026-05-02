@@ -197,6 +197,23 @@ details.card .form + .form { margin-top: 16px; padding-top: 16px; border-top: 1p
 .chip.oc-error        { color: var(--danger); border-color: var(--danger); }
 .chip.oc-skipped      { color: var(--text-dim); }
 
+/* Per-scenario monitor chips on the Scenarios page. */
+.scenario-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin-bottom: 6px;
+}
+.scenario-head h2 { margin: 0; }
+.scn-summary { margin: 0 0 8px; font-size: 12px; }
+.scn-pods {
+  list-style: none; padding: 0; margin: 0 0 12px;
+  font-family: var(--mono); font-size: 12px; color: var(--text-dim);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.chip.scn-state.state-resolved    { color: var(--ok); border-color: var(--ok); }
+.chip.scn-state.state-error       { color: var(--danger); border-color: var(--danger); }
+.chip.scn-state.state-pending     { color: var(--warn); border-color: var(--warn); }
+.chip.scn-state.state-not_applied { color: var(--text-dim); }
+
 /* Pop-up log panel for the Cluster page. */
 .modal {
   position: fixed; inset: 0;

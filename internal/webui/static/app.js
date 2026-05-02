@@ -307,10 +307,79 @@
   window.closeLogModal = closeLogModal;
   window.reloadModalLogs = reloadModalLogs;
 
+  // -------- Scenarios monitor --------
+  // Per-card live state: each scenario card has a chip + summary + pod
+  // list that flips between not_applied / pending / error / resolved as
+  // the underlying pods come up, fail, and (hopefully) recover.
+  const SCENARIO_STATES = ['not_applied', 'pending', 'error', 'resolved'];
+  function scenarioStateLabel(state) {
+    switch (state) {
+      case 'resolved':    return 'resolved';
+      case 'error':       return 'error';
+      case 'pending':     return 'pending';
+      case 'not_applied': return 'not applied';
+      default:            return state || 'unknown';
+    }
+  }
+  function applyScenarioStatus(card, status) {
+    const chip = card.querySelector('[data-role="state"]');
+    const sum  = card.querySelector('[data-role="summary"]');
+    const pods = card.querySelector('[data-role="pods"]');
+    if (chip) {
+      SCENARIO_STATES.forEach((s) => chip.classList.remove('state-' + s));
+      const st = status.state || 'not_applied';
+      chip.classList.add('state-' + st);
+      chip.textContent = scenarioStateLabel(st);
+    }
+    if (sum) sum.textContent = status.summary || '';
+    if (pods) {
+      pods.innerHTML = '';
+      (status.pods || []).forEach((p) => {
+        const li = document.createElement('li');
+        const ready = p.ready ? '✓' : '✗';
+        const reason = p.reason ? ` · ${p.reason}` : '';
+        const restarts = p.restarts ? ` · restarts=${p.restarts}` : '';
+        li.textContent = `${ready} ${p.name} (${p.phase})${reason}${restarts}`;
+        pods.appendChild(li);
+      });
+    }
+  }
+  async function refreshScenariosStatus() {
+    const cards = document.querySelectorAll('.scenario-card');
+    if (cards.length === 0) return;
+    const info = document.getElementById('scenarios-monitor-info');
+    try {
+      const res = await fetch('/api/scenarios/status');
+      if (!res.ok) {
+        if (info) info.textContent = 'monitor: HTTP ' + res.status;
+        return;
+      }
+      const j = await res.json();
+      const byName = {};
+      (j.scenarios || []).forEach((s) => { byName[s.name] = s; });
+      cards.forEach((card) => {
+        const name = card.dataset.scenario;
+        const st = byName[name];
+        if (st) applyScenarioStatus(card, st);
+      });
+      if (info) {
+        const now = new Date().toLocaleTimeString();
+        info.textContent = `Last update ${now}`;
+      }
+    } catch (e) {
+      if (info) info.textContent = 'monitor: ' + String(e);
+    }
+  }
+  window.refreshScenariosStatus = refreshScenariosStatus;
+
   // Auto-init: feature-detect which page we are on and run the right
   // bootstrap. The script tag is at the end of <body> in layout.html so
   // every form/element already exists by the time we run.
   if (document.getElementById('agent-namespace')) refreshStatus();
   if (document.getElementById('log-view')) startLogStream();
   if (document.getElementById('cluster-ns')) loadClusterNamespaces();
+  if (document.querySelector('.scenario-card')) {
+    refreshScenariosStatus();
+    setInterval(refreshScenariosStatus, 5000);
+  }
 })();
