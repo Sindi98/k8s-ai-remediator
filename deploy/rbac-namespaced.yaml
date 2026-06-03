@@ -32,9 +32,16 @@ metadata:
   name: ai-remediator
   namespace: incident-lab
 rules:
+  # Read-only on pods/logs/events; delete only on pods (delete_failed_pod).
+  # The agent never deletes events, and granting events:delete here would also
+  # trip the privilege-escalation guard when the GUI applies this Role, since
+  # the agent ServiceAccount only holds events get/list/watch.
   - apiGroups: [""]
     resources: [pods, pods/log, events]
-    verbs: [get, list, watch, delete]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [delete]
   - apiGroups: [""]
     resources: [namespaces]
     verbs: [get, list]

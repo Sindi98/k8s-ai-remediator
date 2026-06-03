@@ -22,7 +22,12 @@ var dns1123 = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 // so the GUI never silently goes out of sync with the YAML — adding a
 // rule must be a deliberate code change reviewed alongside the manifest.
 var remediatorRoleRules = []rbacv1.PolicyRule{
-	{APIGroups: []string{""}, Resources: []string{"pods", "pods/log", "events"}, Verbs: []string{"get", "list", "watch", "delete"}},
+	// Read-only on pods/logs/events; delete is granted on pods only below.
+	// The agent never deletes events (it just lists them), so granting
+	// events:delete here would also trip Kubernetes' privilege-escalation
+	// guard: the agent ServiceAccount itself only holds events get/list/watch.
+	{APIGroups: []string{""}, Resources: []string{"pods", "pods/log", "events"}, Verbs: []string{"get", "list", "watch"}},
+	{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"delete"}},
 	{APIGroups: []string{""}, Resources: []string{"namespaces"}, Verbs: []string{"get", "list"}},
 	{APIGroups: []string{"apps"}, Resources: []string{"deployments", "replicasets"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
 }
