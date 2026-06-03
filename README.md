@@ -351,6 +351,24 @@ kubectl -n ollama exec -it deploy/ollama -- ollama list
 > - **minikube**: `minikube start --memory=6144 --cpus=4` (14b: `--memory=10240`)
 > - **kind**: configura le risorse del container Docker sottostante
 
+#### Cambiare il modello dopo l'installazione
+
+Il default (codice e `deploy/agent.yaml`) è `qwen2.5:7b`. Se l'agente usa il
+modello sbagliato (es. `qwen2.5:14b`), è perché la ConfigMap lo imposta
+esplicitamente: aggiornala e ricarica il Deployment, oppure usa la pagina
+**Configuration → LLM (Ollama)** della GUI (scrive la ConfigMap e fa il rollout).
+
+```bash
+# Imposta il modello e ricarica l'agente
+kubectl -n ai-remediator patch configmap ai-remediator-config --type merge \
+  -p '{"data":{"OLLAMA_MODEL":"qwen2.5:7b"}}'
+kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
+
+# Assicurati che il modello sia scaricato in Ollama (il nome deve combaciare)
+kubectl -n ollama exec deploy/ollama -- ollama pull qwen2.5:7b
+kubectl -n ollama exec deploy/ollama -- ollama list
+```
+
 #### 2. Agente (manifest)
 
 I manifest in `deploy/` sono la fonte di verità: applicali nell'ordine
@@ -402,12 +420,12 @@ Tutte le variabili sono lette da environment (tipicamente via ConfigMap).
 | Variabile | Default | Descrizione |
 |-----------|---------|-------------|
 | `OLLAMA_BASE_URL` | `http://ollama.ollama.svc.cluster.local:11434/api` | URL base dell'API Ollama |
-| `OLLAMA_MODEL` | `qwen2.5:14b` (default di codice). Consigliato per CPU locale: `qwen2.5:7b` | Nome del modello LLM (deve corrispondere a `ollama list`). Con CPU usa `7b`: ~30-90s per chiamata. Con GPU o per alta qualita, `14b`: ~3-6min su CPU |
+| `OLLAMA_MODEL` | `qwen2.5:7b` | Nome del modello LLM (deve corrispondere a `ollama list`). `7b` (default, consigliato per CPU): ~30-90s per chiamata. Per GPU o massima qualita imposta `qwen2.5:14b`: ~3-6min su CPU |
 | `DRY_RUN` | `false` | Se `true`, logga le decisioni senza applicare remediation |
 | `POLL_INTERVAL_SECONDS` | `30` | Intervallo di polling degli eventi (secondi) |
 | `DEDUPE_TTL_SECONDS` | `300` | TTL di deduplicazione per `(ns, kind, name, reason)`: eventi identici entro la finestra non generano una nuova chiamata LLM |
 | `MAX_EVENTS_PER_POLL` | `10` | Numero massimo di eventi che attivano una chiamata LLM per ciclo di polling; gli eccessi sono rinviati al polling successivo |
-| `INCLUDE_NAMESPACES` | *(vuoto)* | Allowlist di namespace, comma-separated. Se valorizzato, l'agente reagisce **solo** a eventi di quei namespace. Vuoto = tutti i namespace tranne quelli esclusi |
+| `INCLUDE_NAMESPACES` | *(vuoto)* | Allowlist di namespace, comma-separated. Se valorizzato, l'agente reagisce **solo** a eventi di quei namespace; popola anche il selettore della pagina **Cluster** della GUI. Vuoto = tutti i namespace tranne quelli esclusi. Impostabile dalla GUI: **Configuration → Namespace filters → Include namespaces** |
 | `EXCLUDE_NAMESPACES` | `kube-system,kube-public,kube-node-lease,local-path-storage` | Denylist di namespace di sistema. Eventi qui non vengono mai inviati al LLM. Vince sempre sull'allowlist (un namespace listato in entrambi viene escluso) |
 
 ### Variabili di policy
@@ -555,7 +573,26 @@ consenso:
 In piu ogni `patch_*` e bloccato se la confidence dell'LLM e sotto
 `PATCH_CONFIDENCE_THRESHOLD` (default `0.85`).
 
-Esempio di opt-in sul Deployment target:
+**Passo 1 — abilita i feature flag globali** (li porta da `false` a `true`
+nella ConfigMap, poi ricarica il Deployment):
+
+```bash
+kubectl -n ai-remediator patch configmap ai-remediator-config --type merge -p '{
+  "data": {
+    "ALLOW_PATCH_PROBE": "true",
+    "ALLOW_PATCH_RESOURCES": "true",
+    "ALLOW_PATCH_REGISTRY": "true"
+  }
+}'
+kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
+```
+
+> In alternativa puoi attivarli dalla pagina **Configuration** della GUI
+> (sezione "action policies"), che scrive sulla ConfigMap e fa il rollout.
+> Da soli i flag non bastano: ogni Deployment target deve avere **anche**
+> l'annotation `ai-remediator/allow-patch` (passo 2).
+
+**Passo 2 — opt-in sul Deployment target:**
 
 ```bash
 kubectl -n myns annotate deployment myapp \
@@ -948,7 +985,7 @@ Una GUI web opzionale, con form di login dedicato, permette di gestire dal brows
 - **Login**: form classico (username/password) con sessione cookie HMAC-firmata di 12h. Gli endpoint `/api/*` accettano anche basic-auth header per script CLI.
 - **Dashboard**: stato del Deployment dell'agente (repliche desiderate/pronte), pod, ConfigMap, Secret, leader lease, **probe live di Ollama (lista modelli + latenza) e Redis (TCP ping)**, **feed delle ultime decisioni** del loop di remediation (action / severity / outcome), configurazione live in lettura.
 - **Logs**: streaming live dei log del pod via Server-Sent Events, con pause/clear.
-- **Cluster**: tabella dei pod nei namespace listati in `INCLUDE_NAMESPACES`, con filtro per phase e ricerca per nome, restart count, last-termination reason, e bottone "logs" che apre un pannello con tail (anche `previous`).
+- **Cluster**: tabella dei pod nei namespace listati in `INCLUDE_NAMESPACES`, con filtro per phase e ricerca per nome, restart count, last-termination reason, e bottone "logs" che apre un pannello con tail (anche `previous`). Il selettore di namespace si popola da `INCLUDE_NAMESPACES`: per aggiungere il namespace desiderato impostalo da **Configuration → Namespace filters → Include namespaces** (scrive la ConfigMap e fa il rollout); se la lista è vuota il selettore mostra "(no INCLUDE_NAMESPACES configured)".
 - **Configuration** (accordion con piu sezioni): modello LLM, tuning Ollama (RPS, retry, timeout), behavior (`DRY_RUN`, severity, polling), scaling bounds, namespace filters, action policies (`ALLOW_PATCH_*`, threshold di confidence), backend di dedup + Redis, SMTP (con "Send test email"), repliche dell'agente. Ogni form scrive su ConfigMap o Secret e forza un rollout del Deployment.
 - **Scenarios**: applica e rimuove gli scenari di guasto (sezione [Scenari di errore](#scenari-di-errore)) verso un namespace sandbox in allowlist.
 - **RBAC**: applica `Role` + `RoleBinding` namespace-scoped per onboardare un nuovo namespace senza editare manualmente lo YAML.

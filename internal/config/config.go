@@ -136,7 +136,7 @@ type AgentConfig struct {
 func LoadFromEnv() AgentConfig {
 	cfg := AgentConfig{
 		BaseURL:                  Getenv("OLLAMA_BASE_URL", "http://ollama.ollama.svc.cluster.local:11434/api"),
-		Model:                    Getenv("OLLAMA_MODEL", "qwen2.5:14b"),
+		Model:                    Getenv("OLLAMA_MODEL", "qwen2.5:7b"),
 		DryRun:                   Getbool("DRY_RUN", false),
 		MinScale:                 int32(Getint("SCALE_MIN", 1)),
 		MaxScale:                 int32(Getint("SCALE_MAX", 5)),

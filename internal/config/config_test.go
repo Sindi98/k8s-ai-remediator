@@ -162,8 +162,8 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	}
 
 	cfg := LoadFromEnv()
-	if cfg.Model != "qwen2.5:14b" {
-		t.Errorf("expected default model qwen2.5:14b, got %s", cfg.Model)
+	if cfg.Model != "qwen2.5:7b" {
+		t.Errorf("expected default model qwen2.5:7b, got %s", cfg.Model)
 	}
 	if cfg.DryRun {
 		t.Error("expected default dryRun=false")
