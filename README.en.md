@@ -983,7 +983,7 @@ An optional web GUI with a dedicated login form lets operators run the most comm
 - **Login**: classic username/password form, HMAC-signed session cookie valid for 12h. The `/api/*` endpoints also accept HTTP Basic auth so curl-based scripts keep working.
 - **Dashboard**: live status of the agent Deployment (desired/ready replicas), pods, ConfigMap, Secret, leader lease, **live probes for Ollama (model list + latency) and Redis (TCP ping)**, **recent decisions feed** from the remediation loop (action / severity / outcome), and a read-only view of the running configuration.
 - **Logs**: live tail of the agent pod via Server-Sent Events, with pause/clear controls.
-- **Cluster**: pod table for the namespaces listed in `INCLUDE_NAMESPACES`, with phase filter and name search, restart count, last-termination reason and a "logs" button that opens a tail panel (with `previous` checkbox). The namespace selector is populated from `INCLUDE_NAMESPACES`: to add the desired namespace set it from **Configuration → Namespace filters → Include namespaces** (writes the ConfigMap and rolls out); if the list is empty the selector shows "(no INCLUDE_NAMESPACES configured)".
+- **Cluster**: pod table for the namespaces listed in `INCLUDE_NAMESPACES`, with phase filter and name search, restart count, last-termination reason and a "logs" button that opens a tail panel (with `previous` checkbox). The namespace selector is populated from `INCLUDE_NAMESPACES`, read **live from the ConfigMap**: to add the desired namespace set it from **Configuration → Namespace filters → Include namespaces** and the Cluster page shows it immediately, without waiting for the pod restart (the agent, instead, applies the new scope on its next rollout). If the list is empty the selector shows "(no INCLUDE_NAMESPACES configured)".
 - **Configuration** (accordion with multiple sections): LLM model, Ollama tuning (RPS, retries, timeouts), behavior (`DRY_RUN`, severity, polling), scaling bounds, namespace filters, action policies (`ALLOW_PATCH_*`, confidence thresholds), dedup backend + Redis, SMTP (with "Send test email"), agent replica count. Each form writes to ConfigMap or Secret and triggers a Deployment rollout.
 - **Scenarios**: apply and clean up the fault scenarios described in [Error Scenarios](#error-scenarios), restricted to a sandbox namespace allowlist.
 - **RBAC**: apply namespace-scoped `Role` + `RoleBinding` to onboard a new namespace without editing YAML by hand.
@@ -1107,6 +1107,17 @@ kubectl -n ai-remediator rollout status deployment/ai-remediator-agent
 kubectl -n ai-remediator port-forward svc/ai-remediator-webui 8080:80
 # open http://127.0.0.1:8080 and sign in via the login form
 ```
+
+> **Config saves and port-forward**: every GUI "Save and rollout" restarts the
+> Deployment so the agent re-reads the config. With `replicas: 1` the single
+> pod is replaced and an open `kubectl port-forward` prints `lost connection to
+> pod`: this is expected (kubectl stays bound to the original pod) — just
+> **re-run the port-forward**. To never lose the GUI during rollouts run
+> `replicas: 2`: leader election still guarantees a single active remediator
+> and the `Service` stays continuously served (see
+> [High Availability](#high-availability-leader-election)). Note: for the
+> **Cluster** page you don't need to wait for the rollout — `INCLUDE_NAMESPACES`
+> is read live from the ConfigMap.
 
 #### Ingress (production)
 

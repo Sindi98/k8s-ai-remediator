@@ -985,7 +985,7 @@ Una GUI web opzionale, con form di login dedicato, permette di gestire dal brows
 - **Login**: form classico (username/password) con sessione cookie HMAC-firmata di 12h. Gli endpoint `/api/*` accettano anche basic-auth header per script CLI.
 - **Dashboard**: stato del Deployment dell'agente (repliche desiderate/pronte), pod, ConfigMap, Secret, leader lease, **probe live di Ollama (lista modelli + latenza) e Redis (TCP ping)**, **feed delle ultime decisioni** del loop di remediation (action / severity / outcome), configurazione live in lettura.
 - **Logs**: streaming live dei log del pod via Server-Sent Events, con pause/clear.
-- **Cluster**: tabella dei pod nei namespace listati in `INCLUDE_NAMESPACES`, con filtro per phase e ricerca per nome, restart count, last-termination reason, e bottone "logs" che apre un pannello con tail (anche `previous`). Il selettore di namespace si popola da `INCLUDE_NAMESPACES`: per aggiungere il namespace desiderato impostalo da **Configuration → Namespace filters → Include namespaces** (scrive la ConfigMap e fa il rollout); se la lista è vuota il selettore mostra "(no INCLUDE_NAMESPACES configured)".
+- **Cluster**: tabella dei pod nei namespace listati in `INCLUDE_NAMESPACES`, con filtro per phase e ricerca per nome, restart count, last-termination reason, e bottone "logs" che apre un pannello con tail (anche `previous`). Il selettore di namespace si popola da `INCLUDE_NAMESPACES`, letto **live dalla ConfigMap**: per aggiungere il namespace desiderato impostalo da **Configuration → Namespace filters → Include namespaces** e la pagina Cluster lo mostra subito, senza attendere il riavvio del pod (l'agente, invece, applica il nuovo scope al prossimo rollout). Se la lista è vuota il selettore mostra "(no INCLUDE_NAMESPACES configured)".
 - **Configuration** (accordion con piu sezioni): modello LLM, tuning Ollama (RPS, retry, timeout), behavior (`DRY_RUN`, severity, polling), scaling bounds, namespace filters, action policies (`ALLOW_PATCH_*`, threshold di confidence), backend di dedup + Redis, SMTP (con "Send test email"), repliche dell'agente. Ogni form scrive su ConfigMap o Secret e forza un rollout del Deployment.
 - **Scenarios**: applica e rimuove gli scenari di guasto (sezione [Scenari di errore](#scenari-di-errore)) verso un namespace sandbox in allowlist.
 - **RBAC**: applica `Role` + `RoleBinding` namespace-scoped per onboardare un nuovo namespace senza editare manualmente lo YAML.
@@ -1109,6 +1109,17 @@ kubectl -n ai-remediator rollout status deployment/ai-remediator-agent
 kubectl -n ai-remediator port-forward svc/ai-remediator-webui 8080:80
 # apri http://127.0.0.1:8080 e accedi col form di login
 ```
+
+> **Salvataggi config e port-forward**: ogni "Save and rollout" della GUI
+> riavvia il Deployment per far rileggere la config all'agente. Con `replicas: 1`
+> il singolo pod viene sostituito e un `kubectl port-forward` aperto stampa
+> `lost connection to pod`: è atteso (kubectl resta legato al pod iniziale),
+> basta **rilanciare il port-forward**. Per non perdere mai la GUI durante i
+> rollout, gira con `replicas: 2`: la leader election garantisce comunque un
+> solo remediator attivo, e il `Service` resta sempre servito (vedi
+> [Alta disponibilita](#alta-disponibilita-leader-election)). Nota: per la sola
+> pagina **Cluster** non serve attendere il rollout — `INCLUDE_NAMESPACES` è
+> letto live dalla ConfigMap.
 
 #### Ingress (produzione)
 
