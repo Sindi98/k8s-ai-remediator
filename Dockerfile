@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Stage 1: build a static binary.
-FROM golang:1.25 AS build
+FROM golang:1.25.11 AS build
 WORKDIR /src
 
 # Download dependencies first so this layer is cached until go.mod/go.sum

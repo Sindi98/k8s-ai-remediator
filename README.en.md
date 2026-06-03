@@ -159,7 +159,7 @@ k8s-ai-remediator/
 - A running Kubernetes cluster (Docker Desktop, minikube, kind, k3s, EKS, GKE, AKS, ...)
 - `kubectl` configured for the correct cluster
 - Docker for building the image
-- Go 1.25+ for local development (optional, the build happens in Docker)
+- Go 1.25.11+ for local development (optional, the build happens in Docker)
 
 ---
 
@@ -186,7 +186,7 @@ docker push "$IMAGE"
 ```
 
 The Dockerfile uses a multi-stage build:
-- **Stage 1**: Go 1.25 compiles a static binary (`CGO_ENABLED=0`, `-trimpath -ldflags="-s -w"`). Dependencies are downloaded in a separate layer (`go mod download`) so the cache holds until `go.mod`/`go.sum` change
+- **Stage 1**: Go 1.25.11 compiles a static binary (`CGO_ENABLED=0`, `-trimpath -ldflags="-s -w"`). Dependencies are downloaded in a separate layer (`go mod download`) so the cache holds until `go.mod`/`go.sum` change
 - **Stage 2**: `gcr.io/distroless/static:nonroot` as the base image (no shell, non-root user)
 
 > **Linux note**: `host.docker.internal` is available by default with
