@@ -1,3 +1,6 @@
+// Package config loads the agent's runtime configuration from environment
+// variables, applying sensible defaults and enforcing cross-field invariants
+// (for example, that the poll context outlives a single Ollama request).
 package config
 
 import (
@@ -30,11 +33,11 @@ type AgentConfig struct {
 	// and produces "context deadline exceeded" before the HTTP client can
 	// fail with its own timeout. Defaults to 300s.
 	PollContextTimeoutSec int
-	MetricsAddr          string
-	LeaderElection       bool
-	LeaseName            string
-	LeaseNamespace       string
-	MinSeverity          string
+	MetricsAddr           string
+	LeaderElection        bool
+	LeaseName             string
+	LeaseNamespace        string
+	MinSeverity           string
 	// DedupeTTLSec suppresses repeated decisions for the same
 	// (namespace, kind, name, reason) signal within the given window.
 	// Prevents event storms (e.g. flaky readiness probes) from saturating Ollama.
@@ -132,24 +135,24 @@ type AgentConfig struct {
 // failures (e.g. a poll context that expires before the HTTP timeout).
 func LoadFromEnv() AgentConfig {
 	cfg := AgentConfig{
-		BaseURL:              Getenv("OLLAMA_BASE_URL", "http://ollama.ollama.svc.cluster.local:11434/api"),
-		Model:                Getenv("OLLAMA_MODEL", "qwen2.5:14b"),
-		DryRun:               Getbool("DRY_RUN", false),
-		MinScale:             int32(Getint("SCALE_MIN", 1)),
-		MaxScale:             int32(Getint("SCALE_MAX", 5)),
-		PollSec:              Getint("POLL_INTERVAL_SECONDS", 30),
-		AllowImageUpdates:    Getbool("ALLOW_IMAGE_UPDATES", false),
-		ImageUpdateThreshold: Getfloat("IMAGE_UPDATE_CONFIDENCE_THRESHOLD", 0.92),
-		PodLogTailLines:      int64(Getint("POD_LOG_TAIL_LINES", 200)),
-		OllamaRPS:            Getfloat("OLLAMA_RPS", 2.0),
-		OllamaMaxRetries:     Getint("OLLAMA_MAX_RETRIES", 3),
-		OllamaTLSSkipVerify:  Getbool("OLLAMA_TLS_SKIP_VERIFY", false),
-		OllamaHTTPTimeoutSec:  Getint("OLLAMA_HTTP_TIMEOUT_SECONDS", 180),
-		PollContextTimeoutSec: Getint("POLL_CONTEXT_TIMEOUT_SECONDS", 300),
-		MetricsAddr:          Getenv("METRICS_ADDR", ":9090"),
-		LeaderElection:       Getbool("LEADER_ELECTION", false),
-		LeaseName:            Getenv("LEASE_NAME", "ai-remediator-leader"),
-		LeaseNamespace:       Getenv("LEASE_NAMESPACE", "ai-remediator"),
+		BaseURL:                  Getenv("OLLAMA_BASE_URL", "http://ollama.ollama.svc.cluster.local:11434/api"),
+		Model:                    Getenv("OLLAMA_MODEL", "qwen2.5:14b"),
+		DryRun:                   Getbool("DRY_RUN", false),
+		MinScale:                 int32(Getint("SCALE_MIN", 1)),
+		MaxScale:                 int32(Getint("SCALE_MAX", 5)),
+		PollSec:                  Getint("POLL_INTERVAL_SECONDS", 30),
+		AllowImageUpdates:        Getbool("ALLOW_IMAGE_UPDATES", false),
+		ImageUpdateThreshold:     Getfloat("IMAGE_UPDATE_CONFIDENCE_THRESHOLD", 0.92),
+		PodLogTailLines:          int64(Getint("POD_LOG_TAIL_LINES", 200)),
+		OllamaRPS:                Getfloat("OLLAMA_RPS", 2.0),
+		OllamaMaxRetries:         Getint("OLLAMA_MAX_RETRIES", 3),
+		OllamaTLSSkipVerify:      Getbool("OLLAMA_TLS_SKIP_VERIFY", false),
+		OllamaHTTPTimeoutSec:     Getint("OLLAMA_HTTP_TIMEOUT_SECONDS", 180),
+		PollContextTimeoutSec:    Getint("POLL_CONTEXT_TIMEOUT_SECONDS", 300),
+		MetricsAddr:              Getenv("METRICS_ADDR", ":9090"),
+		LeaderElection:           Getbool("LEADER_ELECTION", false),
+		LeaseName:                Getenv("LEASE_NAME", "ai-remediator-leader"),
+		LeaseNamespace:           Getenv("LEASE_NAMESPACE", "ai-remediator"),
 		MinSeverity:              Getenv("MIN_SEVERITY", "medium"),
 		DedupeTTLSec:             Getint("DEDUPE_TTL_SECONDS", 300),
 		MaxEventsPerPoll:         Getint("MAX_EVENTS_PER_POLL", 10),

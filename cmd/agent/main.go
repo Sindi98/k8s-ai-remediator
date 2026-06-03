@@ -25,15 +25,15 @@ import (
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 
-	"github.com/tuo-user/k8s-ai-remediator/internal/config"
-	"github.com/tuo-user/k8s-ai-remediator/internal/dedup"
-	"github.com/tuo-user/k8s-ai-remediator/internal/kube"
-	"github.com/tuo-user/k8s-ai-remediator/internal/metrics"
-	"github.com/tuo-user/k8s-ai-remediator/internal/model"
-	"github.com/tuo-user/k8s-ai-remediator/internal/notify"
-	"github.com/tuo-user/k8s-ai-remediator/internal/ollama"
-	"github.com/tuo-user/k8s-ai-remediator/internal/policy"
-	"github.com/tuo-user/k8s-ai-remediator/internal/webui"
+	"github.com/sindi98/k8s-ai-remediator/internal/config"
+	"github.com/sindi98/k8s-ai-remediator/internal/dedup"
+	"github.com/sindi98/k8s-ai-remediator/internal/kube"
+	"github.com/sindi98/k8s-ai-remediator/internal/metrics"
+	"github.com/sindi98/k8s-ai-remediator/internal/model"
+	"github.com/sindi98/k8s-ai-remediator/internal/notify"
+	"github.com/sindi98/k8s-ai-remediator/internal/ollama"
+	"github.com/sindi98/k8s-ai-remediator/internal/policy"
+	"github.com/sindi98/k8s-ai-remediator/internal/webui"
 )
 
 func executeDecision(
@@ -236,6 +236,7 @@ func toSet(in []string) map[string]bool {
 // represent the same underlying incident. Examples:
 //   - "Failed" (on image pull), "ErrImagePull", "ImagePullBackOff" all
 //     describe one failed pull sequence — dedup them as "ImagePullFailure".
+//
 // Keep the original reason in the event/prompt; only the dedup key uses
 // this canonical form.
 func canonicalReason(reason, message string) string {
@@ -546,6 +547,14 @@ func main() {
 	ollamaClient := ollama.NewClient(cfg.BaseURL, cfg.Model, cfg.OllamaRPS, cfg.OllamaMaxRetries, cfg.OllamaTLSSkipVerify, cfg.OllamaHTTPTimeoutSec)
 	m := metrics.New()
 
+	// Wire the Ollama client's rate-limit and error counters into the metrics
+	// recorder so remediator_ollama_rate_limited_total and
+	// remediator_ollama_errors_total reflect real traffic instead of staying 0.
+	ollamaClient.SetMetricsHooks(
+		func() { m.OllamaRateLimited.Add(1) },
+		func() { m.OllamaErrors.Add(1) },
+	)
+
 	notifier := notify.New(notify.SMTPConfig{
 		Host:        cfg.NotifySMTPHost,
 		Port:        cfg.NotifySMTPPort,
@@ -561,7 +570,7 @@ func main() {
 	mux.Handle("/metrics", m.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	go func() {
 		slog.Info("metrics server starting", "addr", cfg.MetricsAddr)

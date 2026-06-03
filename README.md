@@ -114,11 +114,15 @@ k8s-ai-remediator/
 │   ├── notify/
 │   │   ├── notify.go           # Notifier SMTP (STARTTLS, fire-and-forget con cap concorrente)
 │   │   └── notify_test.go
-│   └── metrics/
-│       ├── metrics.go          # Metriche Prometheus-compatible (zero dipendenze esterne)
-│       └── metrics_test.go
+│   ├── metrics/
+│   │   ├── metrics.go          # Metriche Prometheus-compatible (zero dipendenze esterne)
+│   │   └── metrics_test.go
+│   └── webui/                   # GUI di amministrazione opzionale (handler, auth, template+asset embeddati)
 ├── deploy/
-│   ├── rbac-namespaced.yaml    # RBAC namespace-scoped di esempio
+│   ├── agent.yaml              # Manifest end-to-end: Namespace+ConfigMap+Secret+Deployment+Service (+Ingress)
+│   ├── rbac-namespaced.yaml    # RBAC namespace-scoped di esempio per il loop di remediation
+│   ├── rbac-webui.yaml         # RBAC aggiuntivo per la GUI (configmap/secret/deploy + namespaces/roles)
+│   ├── rbac-scenarios.yaml     # RBAC opzionale per la feature "Scenarios" nel namespace sandbox
 │   └── redis.yaml              # Redis mono-istanza per il dedup (Deployment+Service+PVC+NetworkPolicy)
 ├── scenarios/                   # Manifest di test: low/medium/critical/severe
 ├── scripts/
@@ -126,6 +130,9 @@ k8s-ai-remediator/
 ├── .github/
 │   └── workflows/
 │       └── ci.yml              # CI/CD: lint, test, build, Docker, security scan
+├── .golangci.yml                # Config golangci-lint v2 (set standard + esclusioni idiomatiche)
+├── .dockerignore                # Riduce il context di build (no .git/.idea/docs/deploy)
+├── .gitignore                   # Artefatti di build/test esclusi dal versioning
 ├── Dockerfile                   # Multi-stage build (distroless, non-root)
 ├── go.mod
 └── go.sum
@@ -143,6 +150,7 @@ k8s-ai-remediator/
 | `internal/dedup` | Store pluggabile per la dedup: `MemoryStore` (mappa+mutex, eviction on-demand) e `RedisStore` (`SetNX`+TTL nativi, fail-open sugli errori). Factory `NewStore(BackendConfig)` |
 | `internal/notify` | Notifier SMTP fire-and-forget (PLAIN su STARTTLS). Se `HOST`/`USER`/`TO` sono vuoti restituisce un no-op; cap di concorrenza per evitare goroutine leak durante event storm |
 | `internal/metrics` | Metriche in formato Prometheus text exposition, zero dipendenze esterne |
+| `internal/webui` | GUI di amministrazione opzionale (login HMAC, dashboard, logs SSE, cluster, configuration, scenarios, RBAC). Template HTML, CSS/JS e scenari sono embeddati nel binario via `go:embed` |
 
 ---
 
@@ -151,7 +159,7 @@ k8s-ai-remediator/
 - Cluster Kubernetes funzionante (Docker Desktop, minikube, kind, k3s, EKS, GKE, AKS, ...)
 - `kubectl` configurato sul cluster corretto
 - Docker per la build dell'immagine
-- Go 1.21+ per sviluppo locale (opzionale, la build avviene in Docker)
+- Go 1.25+ per sviluppo locale (opzionale, la build avviene in Docker)
 
 ---
 
@@ -178,7 +186,7 @@ docker push "$IMAGE"
 ```
 
 Il Dockerfile usa un multi-stage build:
-- **Stage 1**: Go 1.26.1 compila un binary statico (`CGO_ENABLED=0`)
+- **Stage 1**: Go 1.25 compila un binary statico (`CGO_ENABLED=0`, `-trimpath -ldflags="-s -w"`). Le dipendenze sono scaricate in un layer separato (`go mod download`) cosi la cache regge finche `go.mod`/`go.sum` non cambiano
 - **Stage 2**: `gcr.io/distroless/static:nonroot` come base (nessuna shell, utente non-root)
 
 > **Nota su Linux**: `host.docker.internal` e disponibile di default con
@@ -726,7 +734,7 @@ L'agente espone due endpoint HTTP sulla porta configurata in `METRICS_ADDR` (def
 | Metrica | Tipo | Descrizione |
 |---------|------|-------------|
 | `remediator_events_processed_total` | Counter | Totale eventi Warning processati |
-| `remediator_events_skipped_total` | Gauge | Eventi saltati (dedup o non-Warning) |
+| `remediator_events_skipped_total` | Counter | Eventi saltati (dedup o non-Warning) |
 | `remediator_decisions_total{action}` | Counter | Decisioni per tipo di azione |
 | `remediator_decision_errors_total` | Counter | Errori nella chiamata a Ollama |
 | `remediator_execution_errors_total` | Counter | Errori nell'esecuzione della remediation |

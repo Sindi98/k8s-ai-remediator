@@ -1,0 +1,25 @@
+# Keep the build context small and the dependency layer cache stable. Only Go
+# sources, go.mod/go.sum and the embedded webui assets (under internal/webui)
+# are needed to build the agent.
+
+# VCS / editor / CI metadata
+.git
+.github
+.gitignore
+.dockerignore
+.idea
+
+# Docs and license (not consumed by the build)
+**/*.md
+LICENSE
+
+# Build / test artifacts that must never leak into a layer
+agent
+coverage.out
+*.test
+*.out
+
+# Top-level dirs not consumed by the build (webui assets live under internal/)
+deploy
+scenarios
+scripts

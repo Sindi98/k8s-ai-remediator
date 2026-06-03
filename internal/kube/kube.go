@@ -1,3 +1,7 @@
+// Package kube wraps the Kubernetes operations the agent performs:
+// resolving Pods to their owning Deployment, restarting/scaling/patching
+// workloads, inspecting container logs, and building event snapshots for
+// the prompt. All mutations honour the dry-run flag.
 package kube
 
 import (

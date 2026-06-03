@@ -1,0 +1,35 @@
+# golangci-lint v2 configuration.
+# Runs the standard linter set (errcheck, govet, ineffassign, staticcheck,
+# unused) and restores the idiomatic error-handling exclusions that v2 no
+# longer applies by default.
+version: "2"
+
+linters:
+  default: standard
+  settings:
+    staticcheck:
+      checks:
+        - all
+        # QF1012: WriteString(fmt.Sprintf(...)) reads clearly in the notify
+        # body builder; not worth the churn of converting every line.
+        - "-QF1012"
+        # ST1011: the latency_ms JSON field intentionally names its unit.
+        - "-ST1011"
+  exclusions:
+    # Restore the well-known "safe to ignore" error patterns (deferred Close,
+    # fmt.Fprint* to writers, os.Setenv, ...) that golangci-lint v1 excluded
+    # out of the box.
+    presets:
+      - std-error-handling
+    rules:
+      # Test helpers legitimately ignore errors from env setup and fixture
+      # encoders; failures there surface as test failures anyway.
+      - linters:
+          - errcheck
+        path: _test\.go
+      # go-redis' SetNX is the current client primitive for atomic SET NX EX.
+      # The SA1019 note refers to the raw Redis command, not this method.
+      - linters:
+          - staticcheck
+        path: internal/dedup/redis\.go
+        text: "SA1019"

@@ -72,7 +72,7 @@ func makePod(ns, name, phase string, ready bool, restarts int32) *corev1.Pod {
 func TestClusterPodsRequiresIncludeNamespacesAllowlist(t *testing.T) {
 	s := newTestServer(t, []string{"allowed-ns"},
 		makePod("allowed-ns", "p1", "Running", true, 0),
-		makePod("other-ns",   "p2", "Running", true, 0),
+		makePod("other-ns", "p2", "Running", true, 0),
 	)
 
 	// allowed namespace returns the pod
@@ -103,9 +103,9 @@ func TestClusterPodsRequiresIncludeNamespacesAllowlist(t *testing.T) {
 
 func TestClusterPodsPhaseAndNameFilters(t *testing.T) {
 	s := newTestServer(t, []string{"ns"},
-		makePod("ns", "alpha-running",   "Running", true, 0),
-		makePod("ns", "alpha-pending",   "Pending", false, 0),
-		makePod("ns", "beta-running",    "Running", true, 0),
+		makePod("ns", "alpha-running", "Running", true, 0),
+		makePod("ns", "alpha-pending", "Pending", false, 0),
+		makePod("ns", "beta-running", "Running", true, 0),
 	)
 
 	rr := httptest.NewRecorder()

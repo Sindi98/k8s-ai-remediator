@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tuo-user/k8s-ai-remediator/internal/model"
+	"github.com/sindi98/k8s-ai-remediator/internal/model"
 )
 
 func sampleResult() DecisionResult {
@@ -87,10 +87,10 @@ func TestBuildMessage_HasHeaders(t *testing.T) {
 
 func TestNew_FallsBackToNoop(t *testing.T) {
 	cases := []SMTPConfig{
-		{},                                                 // all empty
-		{Host: "smtp.mail.me.com", User: "u@icloud.com"},   // missing To
-		{Host: "smtp.mail.me.com", To: "r@icloud.com"},     // missing User
-		{User: "u@icloud.com", To: "r@icloud.com"},         // missing Host
+		{}, // all empty
+		{Host: "smtp.mail.me.com", User: "u@icloud.com"}, // missing To
+		{Host: "smtp.mail.me.com", To: "r@icloud.com"},   // missing User
+		{User: "u@icloud.com", To: "r@icloud.com"},       // missing Host
 	}
 	for i, c := range cases {
 		n := New(c)

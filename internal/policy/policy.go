@@ -1,3 +1,6 @@
+// Package policy enforces the safety rules around LLM decisions: the action
+// allowlist, confidence thresholds, OCI image validation, prompt
+// sanitisation, and the guards that block counter-productive remediations.
 package policy
 
 import (
@@ -5,7 +8,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/tuo-user/k8s-ai-remediator/internal/model"
+	"github.com/sindi98/k8s-ai-remediator/internal/model"
 )
 
 // MaybeBlockUnsafeImageUpdate enforces safety checks for image update decisions.
@@ -153,7 +156,7 @@ func BuildPrompt(ns, kind, name, etype, reason, message, extra string) string {
 	// and resource names can be user-controlled (e.g. CRD-managed workloads)
 	// and must be stripped of control chars and known injection phrases
 	// before reaching the LLM.
-	ns = SanitizeForPrompt(ns, 253)      // k8s name hard limit
+	ns = SanitizeForPrompt(ns, 253) // k8s name hard limit
 	kind = SanitizeForPrompt(kind, 64)
 	name = SanitizeForPrompt(name, 253)
 	etype = SanitizeForPrompt(etype, 32)

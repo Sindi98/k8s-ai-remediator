@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master, main]
   pull_request:
-    branches: [main]
+    branches: [master, main]
 
 permissions:
   contents: read
@@ -18,9 +18,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          # Action v7+ is required for golangci-lint v2 (matches .golangci.yml).
+          # Pinned to the version verified locally so CI mirrors the green run.
+          version: v2.12.2
 
   test:
     name: Test

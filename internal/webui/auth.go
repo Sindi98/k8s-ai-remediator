@@ -113,7 +113,7 @@ func (s *Server) unauthorized(w http.ResponseWriter, r *http.Request) {
 	// Browser navigation: redirect to /login, preserving the original URL
 	// so the user lands back on the page they wanted after signing in.
 	next := r.URL.RequestURI()
-	http.Redirect(w, r, "/login?next="+url_QueryEscape(next), http.StatusSeeOther)
+	http.Redirect(w, r, "/login?next="+urlQueryEscape(next), http.StatusSeeOther)
 }
 
 // isAPIRequest detects fetch/EventSource/curl-style callers so we return
@@ -130,10 +130,10 @@ func isAPIRequest(r *http.Request) bool {
 	return false
 }
 
-// url_QueryEscape avoids importing net/url just for one call. Equivalent
+// urlQueryEscape avoids importing net/url just for one call. Equivalent
 // behaviour to net/url.QueryEscape but inlined to keep this file
 // dependency-light.
-func url_QueryEscape(s string) string {
+func urlQueryEscape(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for i := 0; i < len(s); i++ {

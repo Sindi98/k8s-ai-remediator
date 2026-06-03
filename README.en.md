@@ -114,11 +114,15 @@ k8s-ai-remediator/
 │   ├── notify/
 │   │   ├── notify.go           # SMTP notifier (STARTTLS, fire-and-forget with concurrency cap)
 │   │   └── notify_test.go
-│   └── metrics/
-│       ├── metrics.go          # Prometheus-compatible metrics (zero external deps)
-│       └── metrics_test.go
+│   ├── metrics/
+│   │   ├── metrics.go          # Prometheus-compatible metrics (zero external deps)
+│   │   └── metrics_test.go
+│   └── webui/                   # Optional admin GUI (handlers, auth, embedded templates+assets)
 ├── deploy/
-│   ├── rbac-namespaced.yaml    # Example namespace-scoped RBAC
+│   ├── agent.yaml              # End-to-end manifest: Namespace+ConfigMap+Secret+Deployment+Service (+Ingress)
+│   ├── rbac-namespaced.yaml    # Example namespace-scoped RBAC for the remediation loop
+│   ├── rbac-webui.yaml         # Extra RBAC for the GUI (configmap/secret/deploy + namespaces/roles)
+│   ├── rbac-scenarios.yaml     # Optional RBAC for the "Scenarios" feature in the sandbox namespace
 │   └── redis.yaml              # Single-instance Redis for dedup (Deployment+Service+PVC+NetworkPolicy)
 ├── scenarios/                   # Test manifests: low/medium/critical/severe
 ├── scripts/
@@ -126,6 +130,9 @@ k8s-ai-remediator/
 ├── .github/
 │   └── workflows/
 │       └── ci.yml              # CI/CD: lint, test, build, Docker, security scan
+├── .golangci.yml                # golangci-lint v2 config (standard set + idiomatic exclusions)
+├── .dockerignore                # Shrinks the build context (no .git/.idea/docs/deploy)
+├── .gitignore                   # Build/test artifacts excluded from version control
 ├── Dockerfile                   # Multi-stage build (distroless, non-root)
 ├── go.mod
 └── go.sum
@@ -143,6 +150,7 @@ k8s-ai-remediator/
 | `internal/dedup` | Pluggable dedup store: `MemoryStore` (map+mutex, on-demand eviction) and `RedisStore` (native `SetNX`+TTL, fail-open on errors). Factory `NewStore(BackendConfig)` |
 | `internal/notify` | Fire-and-forget SMTP notifier (PLAIN over STARTTLS). Returns a no-op if `HOST`/`USER`/`TO` are empty; concurrency cap prevents goroutine leaks during event storms |
 | `internal/metrics` | Metrics in Prometheus text exposition format, zero external dependencies |
+| `internal/webui` | Optional admin GUI (HMAC login, dashboard, SSE logs, cluster, configuration, scenarios, RBAC). HTML templates, CSS/JS and scenarios are embedded into the binary via `go:embed` |
 
 ---
 
@@ -151,7 +159,7 @@ k8s-ai-remediator/
 - A running Kubernetes cluster (Docker Desktop, minikube, kind, k3s, EKS, GKE, AKS, ...)
 - `kubectl` configured for the correct cluster
 - Docker for building the image
-- Go 1.21+ for local development (optional, the build happens in Docker)
+- Go 1.25+ for local development (optional, the build happens in Docker)
 
 ---
 
@@ -178,7 +186,7 @@ docker push "$IMAGE"
 ```
 
 The Dockerfile uses a multi-stage build:
-- **Stage 1**: Go 1.26.1 compiles a static binary (`CGO_ENABLED=0`)
+- **Stage 1**: Go 1.25 compiles a static binary (`CGO_ENABLED=0`, `-trimpath -ldflags="-s -w"`). Dependencies are downloaded in a separate layer (`go mod download`) so the cache holds until `go.mod`/`go.sum` change
 - **Stage 2**: `gcr.io/distroless/static:nonroot` as the base image (no shell, non-root user)
 
 > **Linux note**: `host.docker.internal` is available by default with
@@ -724,7 +732,7 @@ The agent exposes two HTTP endpoints on the port configured in `METRICS_ADDR` (d
 | Metric | Type | Description |
 |--------|------|-------------|
 | `remediator_events_processed_total` | Counter | Total Warning events processed |
-| `remediator_events_skipped_total` | Gauge | Events skipped (dedup or non-Warning) |
+| `remediator_events_skipped_total` | Counter | Events skipped (dedup or non-Warning) |
 | `remediator_decisions_total{action}` | Counter | Decisions by action type |
 | `remediator_decision_errors_total` | Counter | Errors calling Ollama |
 | `remediator_execution_errors_total` | Counter | Errors executing remediation |

@@ -1,6 +1,6 @@
-module github.com/tuo-user/k8s-ai-remediator
+module github.com/sindi98/k8s-ai-remediator
 
-go 1.26.1
+go 1.25
 
 require (
 	github.com/alicebob/miniredis/v2 v2.37.0
