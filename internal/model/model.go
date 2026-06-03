@@ -1,3 +1,6 @@
+// Package model holds the types shared across the agent: the action
+// allowlist, the Decision returned by the LLM, severity levels, and the
+// Ollama chat request/response shapes.
 package model
 
 import "strings"

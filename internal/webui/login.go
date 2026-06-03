@@ -52,7 +52,7 @@ func (s *Server) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 	userMatch := subtle.ConstantTimeCompare([]byte(user), expectedUser) == 1
 	passMatch := subtle.ConstantTimeCompare([]byte(pass), expectedPass) == 1
 	if !userMatch || !passMatch {
-		http.Redirect(w, r, "/login?error=invalid&next="+url_QueryEscape(next), http.StatusSeeOther)
+		http.Redirect(w, r, "/login?error=invalid&next="+urlQueryEscape(next), http.StatusSeeOther)
 		return
 	}
 

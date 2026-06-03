@@ -10,9 +10,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/tuo-user/k8s-ai-remediator/internal/config"
-	"github.com/tuo-user/k8s-ai-remediator/internal/kube"
-	"github.com/tuo-user/k8s-ai-remediator/internal/model"
+	"github.com/sindi98/k8s-ai-remediator/internal/config"
+	"github.com/sindi98/k8s-ai-remediator/internal/kube"
+	"github.com/sindi98/k8s-ai-remediator/internal/model"
 )
 
 func int32Ptr(i int32) *int32 { return &i }
@@ -210,12 +210,12 @@ func TestComputeBumpedMemoryLimit(t *testing.T) {
 		current string
 		want    string
 	}{
-		{"", "256Mi"},    // nothing set → floor
-		{"16Mi", "256Mi"}, // doubled (32Mi) < floor → floor wins
-		{"32Mi", "256Mi"}, // doubled (64Mi) < floor → floor wins
-		{"256Mi", "512Mi"},   // exact 2x above floor
-		{"1Gi", "2Gi"},       // 2x scaling
-		{"16Gi", "16Gi"},     // capped at MaxMemoryQuantity (16Gi)
+		{"", "256Mi"},      // nothing set → floor
+		{"16Mi", "256Mi"},  // doubled (32Mi) < floor → floor wins
+		{"32Mi", "256Mi"},  // doubled (64Mi) < floor → floor wins
+		{"256Mi", "512Mi"}, // exact 2x above floor
+		{"1Gi", "2Gi"},     // 2x scaling
+		{"16Gi", "16Gi"},   // capped at MaxMemoryQuantity (16Gi)
 	}
 	for _, c := range cases {
 		var current resource.Quantity

@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/tuo-user/k8s-ai-remediator/internal/model"
+	"github.com/sindi98/k8s-ai-remediator/internal/model"
 )
 
 func validDecisionJSON() []byte {
@@ -196,5 +196,64 @@ func TestDecide_TLSSkipVerify(t *testing.T) {
 	client := NewClient("https://localhost:99999", "test", 100, 0, true, 0)
 	if client.http.Transport == nil {
 		t.Error("expected custom transport for TLS skip verify")
+	}
+}
+
+func TestSetMetricsHooks_OnErrorPerAttempt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("unavailable"))
+	}))
+	defer srv.Close()
+
+	var errHookCalls int32
+	client := NewClient(srv.URL, "test-model", 100, 1, false, 0)
+	client.SetMetricsHooks(nil, func() { atomic.AddInt32(&errHookCalls, 1) })
+
+	if _, err := client.Decide(context.Background(), "test"); err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	// 1 initial attempt + 1 retry = 2 failed attempts → 2 error hook calls.
+	if got := atomic.LoadInt32(&errHookCalls); got != 2 {
+		t.Errorf("expected onError to fire twice, got %d", got)
+	}
+}
+
+func TestSetMetricsHooks_OnRateLimited(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := model.ChatResponse{}
+		resp.Message.Content = string(validDecisionJSON())
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	var rlHookCalls int32
+	// rps=2 with burst 1: the first call passes instantly, the second has to
+	// wait ~500ms for a token, which must trigger the rate-limited hook.
+	client := NewClient(srv.URL, "test-model", 2, 0, false, 0)
+	client.SetMetricsHooks(func() { atomic.AddInt32(&rlHookCalls, 1) }, nil)
+
+	for i := 0; i < 2; i++ {
+		if _, err := client.Decide(context.Background(), "test"); err != nil {
+			t.Fatalf("unexpected error on call %d: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(&rlHookCalls); got < 1 {
+		t.Errorf("expected onRateLimited to fire at least once, got %d", got)
+	}
+}
+
+func TestDecide_NilHooks_NoPanic(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := model.ChatResponse{}
+		resp.Message.Content = string(validDecisionJSON())
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	// No SetMetricsHooks call: both hooks stay nil and must be skipped safely.
+	client := NewClient(srv.URL, "test-model", 100, 0, false, 0)
+	if _, err := client.Decide(context.Background(), "test"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

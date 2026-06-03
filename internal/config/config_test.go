@@ -104,10 +104,10 @@ func TestLoadFromEnv_NamespaceDefaults(t *testing.T) {
 		t.Errorf("expected empty include by default, got %v", cfg.IncludeNamespaces)
 	}
 	expected := map[string]bool{
-		"kube-system":         true,
-		"kube-public":         true,
-		"kube-node-lease":     true,
-		"local-path-storage":  true,
+		"kube-system":        true,
+		"kube-public":        true,
+		"kube-node-lease":    true,
+		"local-path-storage": true,
 	}
 	if len(cfg.ExcludeNamespaces) != len(expected) {
 		t.Errorf("expected %d default exclude namespaces, got %v", len(expected), cfg.ExcludeNamespaces)

@@ -1,3 +1,5 @@
+// Package metrics records agent counters and gauges and serves them in
+// Prometheus text exposition format, with no external dependencies.
 package metrics
 
 import (
@@ -14,14 +16,14 @@ import (
 type Recorder struct {
 	mu sync.Mutex
 
-	EventsProcessed  atomic.Int64
-	EventsSkipped    atomic.Int64
+	EventsProcessed   atomic.Int64
+	EventsSkipped     atomic.Int64
 	DecisionsByAction map[string]*atomic.Int64
-	DecisionErrors   atomic.Int64
-	ExecutionErrors  atomic.Int64
-	OllamaRequests   atomic.Int64
-	OllamaErrors     atomic.Int64
-	OllamaLatencySum atomic.Int64 // microseconds
+	DecisionErrors    atomic.Int64
+	ExecutionErrors   atomic.Int64
+	OllamaRequests    atomic.Int64
+	OllamaErrors      atomic.Int64
+	OllamaLatencySum  atomic.Int64 // microseconds
 	OllamaRateLimited atomic.Int64
 }
 
@@ -57,15 +59,12 @@ func (r *Recorder) Handler() http.Handler {
 
 		var b strings.Builder
 
-		writeGauge := func(name, help string, val int64) {
-			fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s gauge\n%s %d\n", name, help, name, name, val)
-		}
 		writeCounter := func(name, help string, val int64) {
 			fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s counter\n%s %d\n", name, help, name, name, val)
 		}
 
 		writeCounter("remediator_events_processed_total", "Total warning events processed", r.EventsProcessed.Load())
-		writeGauge("remediator_events_skipped_total", "Total events skipped (dedup or non-warning)", r.EventsSkipped.Load())
+		writeCounter("remediator_events_skipped_total", "Total events skipped (dedup or non-warning)", r.EventsSkipped.Load())
 		writeCounter("remediator_decision_errors_total", "Total Ollama decision errors", r.DecisionErrors.Load())
 		writeCounter("remediator_execution_errors_total", "Total execution errors", r.ExecutionErrors.Load())
 		writeCounter("remediator_ollama_requests_total", "Total Ollama requests", r.OllamaRequests.Load())
@@ -100,6 +99,6 @@ func (r *Recorder) Handler() http.Handler {
 			}
 		}
 
-		w.Write([]byte(b.String()))
+		_, _ = w.Write([]byte(b.String()))
 	})
 }

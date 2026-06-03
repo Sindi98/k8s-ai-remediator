@@ -1,3 +1,6 @@
+// Package ollama is the HTTP client for the Ollama chat API: it enforces
+// rate limiting, retries transient failures with exponential backoff,
+// constrains responses to a JSON schema, and validates the returned action.
 package ollama
 
 import (
@@ -15,7 +18,7 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"github.com/tuo-user/k8s-ai-remediator/internal/model"
+	"github.com/sindi98/k8s-ai-remediator/internal/model"
 )
 
 // Client communicates with the Ollama API and enforces rate limiting.
@@ -25,6 +28,22 @@ type Client struct {
 	http       *http.Client
 	limiter    *rate.Limiter
 	maxRetries int
+
+	// onRateLimited and onError are optional metric hooks invoked when a
+	// request is delayed by the rate limiter or when an attempt fails. Both
+	// may be nil; wire them via SetMetricsHooks. Kept as callbacks rather
+	// than importing the metrics package so the client stays decoupled and
+	// trivially testable.
+	onRateLimited func()
+	onError       func()
+}
+
+// SetMetricsHooks wires optional counters invoked on rate-limit waits and
+// per-attempt request errors. Both callbacks may be nil. Call once right
+// after NewClient, before the first Decide.
+func (c *Client) SetMetricsHooks(onRateLimited, onError func()) {
+	c.onRateLimited = onRateLimited
+	c.onError = onError
 }
 
 // NewClient creates an Ollama client with rate limiting, TLS support, and retry config.
@@ -56,8 +75,15 @@ func NewClient(baseURL, mdl string, rps float64, maxRetries int, tlsSkipVerify b
 // Decide sends the prompt to Ollama and returns a validated Decision.
 // Transient errors (network, 5xx) are retried with exponential backoff.
 func (c *Client) Decide(ctx context.Context, prompt string) (model.Decision, error) {
+	waitStart := time.Now()
 	if err := c.limiter.Wait(ctx); err != nil {
 		return model.Decision{}, fmt.Errorf("ollama rate limiter: %w", err)
+	}
+	// Count the call as rate-limited only when the limiter actually made us
+	// wait (a token was not immediately available). The sub-millisecond
+	// threshold filters out the trivial "token ready" fast path.
+	if c.onRateLimited != nil && time.Since(waitStart) > time.Millisecond {
+		c.onRateLimited()
 	}
 
 	slog.Debug("sending prompt to ollama", "model", c.model, "prompt_len", len(prompt))
@@ -107,6 +133,9 @@ func (c *Client) Decide(ctx context.Context, prompt string) (model.Decision, err
 		d, err := c.doRequest(ctx, b)
 		if err != nil {
 			lastErr = err
+			if c.onError != nil {
+				c.onError()
+			}
 			if isRetryable(err) {
 				continue
 			}

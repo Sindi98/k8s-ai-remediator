@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tuo-user/k8s-ai-remediator/internal/model"
+	"github.com/sindi98/k8s-ai-remediator/internal/model"
 )
 
 // DecisionRecord captures a single remediation cycle for the dashboard

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tuo-user/k8s-ai-remediator/internal/model"
+	"github.com/sindi98/k8s-ai-remediator/internal/model"
 )
 
 func TestMaybeBlockUnsafeImageUpdate(t *testing.T) {

@@ -39,11 +39,11 @@ type podStatus struct {
 }
 
 type dependencyStatus struct {
-	ConfigMap string         `json:"configmap"`
-	Secret    string         `json:"secret"`
-	Lease     string         `json:"lease"`
-	Ollama    *probeResult   `json:"ollama,omitempty"`
-	Redis     *probeResult   `json:"redis,omitempty"`
+	ConfigMap string       `json:"configmap"`
+	Secret    string       `json:"secret"`
+	Lease     string       `json:"lease"`
+	Ollama    *probeResult `json:"ollama,omitempty"`
+	Redis     *probeResult `json:"redis,omitempty"`
 }
 
 type probeResult struct {
