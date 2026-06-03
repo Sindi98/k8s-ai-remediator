@@ -1,12 +1,20 @@
-## Namespace-scoped RBAC for ai-remediator
+## Namespace-scoped RBAC for ai-remediator (ADVANCED — read the caveat).
 ##
-## Use this instead of ClusterRole/ClusterRoleBinding when you want to restrict
-## the agent to specific namespaces. Create one Role + RoleBinding per namespace.
+## Use this to scope the agent's WRITE access (remediation) to specific
+## namespaces. Create one Role + RoleBinding per namespace.
+##
+## CAVEAT: this file alone is NOT sufficient. The agent lists Warning events
+## across ALL namespaces in a single call (Events("").List), which needs a
+## CLUSTER-scoped read on events/pods/namespaces. So even for a namespace-
+## restricted setup you must also apply deploy/rbac-cluster.yaml (for the
+## cluster-wide reads) and set INCLUDE_NAMESPACES to limit where the agent
+## acts. For the common "watch the whole cluster" case just use
+## deploy/rbac-cluster.yaml on its own.
 ##
 ## Usage:
-##   kubectl apply -f rbac-namespaced.yaml
-##   # Repeat for each additional namespace:
-##   kubectl -n <other-ns> apply -f rbac-namespaced.yaml
+##   kubectl apply -f rbac-cluster.yaml        # cluster-wide reads (required)
+##   kubectl apply -f rbac-namespaced.yaml     # plus namespaced writes
+##   # Repeat the namespaced Role/RoleBinding for each additional namespace.
 
 ---
 apiVersion: v1
