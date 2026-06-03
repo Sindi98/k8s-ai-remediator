@@ -13,8 +13,8 @@ Agente AI in Go che osserva eventi Kubernetes di tipo `Warning` e applica remedi
 - [Prerequisiti](#prerequisiti)
 - [Build](#build)
 - [Installazione su Kubernetes](#installazione-su-kubernetes)
-  - [1. Installazione di Ollama](#1-installazione-di-ollama)
-  - [2. Installazione dell'agente](#2-installazione-dellagente)
+  - [Installazione con lo script (consigliata)](#installazione-con-lo-script-consigliata)
+  - [Installazione manuale](#installazione-manuale)
 - [Configurazione](#configurazione)
 - [Remediation supportate](#remediation-supportate)
 - [Notifiche email](#notifiche-email)
@@ -120,12 +120,14 @@ k8s-ai-remediator/
 │   └── webui/                   # GUI di amministrazione opzionale (handler, auth, template+asset embeddati)
 ├── deploy/
 │   ├── agent.yaml              # Manifest end-to-end: Namespace+ConfigMap+Secret+Deployment+Service (+Ingress)
-│   ├── rbac-namespaced.yaml    # RBAC namespace-scoped di esempio per il loop di remediation
+│   ├── rbac-cluster.yaml       # RBAC cluster-wide (default): SA+ClusterRole+lease — events su tutto il cluster
+│   ├── rbac-namespaced.yaml    # RBAC namespace-scoped (avanzato, vedi nota nel file)
 │   ├── rbac-webui.yaml         # RBAC aggiuntivo per la GUI (configmap/secret/deploy + namespaces/roles)
 │   ├── rbac-scenarios.yaml     # RBAC opzionale per la feature "Scenarios" nel namespace sandbox
 │   └── redis.yaml              # Redis mono-istanza per il dedup (Deployment+Service+PVC+NetworkPolicy)
 ├── scenarios/                   # Manifest di test: low/medium/critical/severe
 ├── scripts/
+│   ├── install.sh              # Installer idempotente: Ollama + RBAC + agente + GUI, nell'ordine corretto
 │   └── mirror-images.sh        # Mirror batch di redis/busybox/polinux sul registry locale
 ├── .github/
 │   └── workflows/
@@ -178,12 +180,15 @@ su runtime diversi da Docker (containerd, CRI-O) o su cluster multi-node.
 # Avvia il registry locale (una volta sola)
 docker run -d --restart=always -p 5050:5000 --name registry registry:2
 
-# Build e push
+# Build e push (stesso tag usato da deploy/agent.yaml e da install.sh --build)
 REGISTRY=host.docker.internal:5050
-IMAGE=$REGISTRY/ai-remediator:0.2.0
+IMAGE=$REGISTRY/k8s-ai-remediator:latest
 docker build -t "$IMAGE" .
 docker push "$IMAGE"
 ```
+
+> In alternativa, `scripts/install.sh --build` esegue build, push e deploy in
+> un colpo solo (vedi [Installazione su Kubernetes](#installazione-su-kubernetes)).
 
 Il Dockerfile usa un multi-stage build:
 - **Stage 1**: Go 1.25.11 compila un binary statico (`CGO_ENABLED=0`, `-trimpath -ldflags="-s -w"`). Le dipendenze sono scaricate in un layer separato (`go mod download`) cosi la cache regge finche `go.mod`/`go.sum` non cambiano
@@ -236,7 +241,62 @@ kubectl -n ai-remediator set image deploy/ai-remediator-redis \
 
 ## Installazione su Kubernetes
 
-### 1. Installazione di Ollama
+Il modo consigliato è lo script **`scripts/install.sh`**: predispone tutto
+nell'ordine corretto (Ollama → RBAC → agente → GUI), è idempotente (puoi
+rilanciarlo senza errori) e verifica il rollout. Sotto trovi anche
+l'equivalente manuale a manifest.
+
+### Installazione con lo script (consigliata)
+
+```bash
+# Setup completo su cluster locale: build immagine + Ollama + modello + agente + GUI
+scripts/install.sh --build
+
+# Cluster che ha già Ollama e un'immagine pubblicata altrove
+scripts/install.sh --skip-ollama --image <registry>/k8s-ai-remediator:<tag>
+
+# Agente headless, senza GUI di amministrazione
+scripts/install.sh --no-webui
+
+# Anteprima delle azioni senza toccare il cluster / rimozione completa
+scripts/install.sh --dry-run
+scripts/install.sh --uninstall
+```
+
+**Cosa fa, nell'ordine:**
+
+1. **Preflight** — verifica `kubectl` e che il cluster sia raggiungibile
+2. **`--build`** (opzionale) — `docker build` + `docker push` dell'immagine
+3. **Ollama** (default, salta con `--skip-ollama`) — Deployment + Service nel namespace `ollama` e `ollama pull` del modello
+4. **RBAC cluster-wide** — `deploy/rbac-cluster.yaml` (ServiceAccount + ClusterRole + Role per le lease). Necessario perché l'agente lista gli eventi di **tutti** i namespace in un'unica chiamata: un Role namespaced non basta
+5. **Agente** — `deploy/agent.yaml` (Namespace, ConfigMap, Secret, Deployment, Service); con GUI attiva applica anche `deploy/rbac-webui.yaml` e `deploy/rbac-scenarios.yaml`
+6. **Override** di immagine, modello e credenziali GUI, poi `rollout` e verifica (pod + log)
+
+**Flag principali** (default sensati; `scripts/install.sh --help` per l'elenco completo):
+
+| Flag | Default | Effetto |
+|------|---------|---------|
+| `--build` | off | build & push dell'immagine prima del deploy (richiede Docker) |
+| `--image` / `--registry` | `host.docker.internal:5050/k8s-ai-remediator:latest` | immagine da deployare |
+| `--model` | `qwen2.5:7b` | modello Ollama da scaricare e usare |
+| `--skip-ollama` | off | non installa Ollama (lo dai per già presente) |
+| `--no-webui` | off | installa l'agente senza GUI (niente RBAC della GUI) |
+| `--webui-user` / `--webui-password` | `admin` / generata | credenziali di login della GUI |
+| `--sandbox-ns` | `incident-lab` | namespace abilitato agli scenari di guasto |
+| `--dry-run` / `--uninstall` | — | anteprima senza modifiche / rimozione di namespace e RBAC creati |
+
+> Se non passi `--webui-password`, lo script ne genera una casuale e la stampa
+> a fine installazione: **salvala** (mostrata una sola volta). In produzione
+> metti la GUI dietro un Ingress con TLS.
+
+### Installazione manuale
+
+Stesso risultato dello script, applicando i manifest a mano.
+
+#### 1. Ollama
+
+> Lo script installa Ollama automaticamente; questo blocco serve solo per il
+> setup manuale o per un Ollama standalone.
 
 ```bash
 # Crea il namespace
@@ -291,85 +351,45 @@ kubectl -n ollama exec -it deploy/ollama -- ollama list
 > - **minikube**: `minikube start --memory=6144 --cpus=4` (14b: `--memory=10240`)
 > - **kind**: configura le risorse del container Docker sottostante
 
-### 2. Installazione dell'agente
+#### 2. Agente (manifest)
+
+I manifest in `deploy/` sono la fonte di verità: applicali nell'ordine
+namespace → RBAC → agente.
 
 ```bash
-# Crea il namespace
+# Namespace
 kubectl create namespace ai-remediator
 
-# Crea il service account
-kubectl create serviceaccount ai-remediator -n ai-remediator
+# RBAC cluster-wide: lettura eventi/pod su tutto il cluster + remediation + lease
+kubectl apply -f deploy/rbac-cluster.yaml
 
-# Crea il ClusterRole
-kubectl create clusterrole ai-remediator \
-  --verb=get,list,watch,delete \
-  --resource=pods,pods/log,events,namespaces
+# (opzionale) RBAC della GUI e degli scenari di guasto
+kubectl apply -f deploy/rbac-webui.yaml
+kubectl apply -f deploy/rbac-scenarios.yaml      # sandbox: namespace incident-lab
 
-# Aggiungi le regole per deployments e replicasets
-kubectl patch clusterrole ai-remediator --type='json' -p='[
-  {"op":"add","path":"/rules/-","value":{
-    "apiGroups":["apps"],
-    "resources":["deployments","replicasets"],
-    "verbs":["get","list","watch","update","patch"]
-  }}
-]'
+# Agente: Namespace + ConfigMap + Secret + Deployment + Service
+kubectl apply -f deploy/agent.yaml
 
-# Crea il ClusterRoleBinding
-kubectl create clusterrolebinding ai-remediator \
-  --clusterrole=ai-remediator \
-  --serviceaccount=ai-remediator:ai-remediator
+# Personalizza immagine e password della GUI (il manifest ha un placeholder)
+kubectl -n ai-remediator set image deployment/ai-remediator-agent \
+  agent=host.docker.internal:5050/k8s-ai-remediator:latest
+kubectl -n ai-remediator patch secret ai-remediator-secrets --type merge \
+  -p '{"stringData":{"WEBUI_PASSWORD":"<scegli-una-password>"}}'
 
-# Crea la ConfigMap (set completo: auto-fix per probe, resources, registry,
-# timeouts estesi per modelli locali lenti, dedup TTL)
-kubectl create configmap ai-remediator-config \
-  -n ai-remediator \
-  --from-literal=OLLAMA_BASE_URL=http://ollama.ollama.svc.cluster.local:11434/api \
-  --from-literal=OLLAMA_MODEL=qwen2.5:7b \
-  --from-literal=DRY_RUN=false \
-  --from-literal=POLL_INTERVAL_SECONDS=30 \
-  --from-literal=MIN_SEVERITY=low \
-  --from-literal=SCALE_MIN=1 \
-  --from-literal=SCALE_MAX=5 \
-  --from-literal=ALLOW_IMAGE_UPDATES=true \
-  --from-literal=IMAGE_UPDATE_CONFIDENCE_THRESHOLD=0.92 \
-  --from-literal=ALLOW_PATCH_PROBE=true \
-  --from-literal=ALLOW_PATCH_RESOURCES=true \
-  --from-literal=ALLOW_PATCH_REGISTRY=true \
-  --from-literal=PATCH_CONFIDENCE_THRESHOLD=0.85 \
-  --from-literal=POD_LOG_TAIL_LINES=200 \
-  --from-literal=OLLAMA_RPS=2.0 \
-  --from-literal=OLLAMA_MAX_RETRIES=3 \
-  --from-literal=OLLAMA_HTTP_TIMEOUT_SECONDS=360 \
-  --from-literal=POLL_CONTEXT_TIMEOUT_SECONDS=480 \
-  --from-literal=DEDUPE_TTL_SECONDS=300 \
-  --from-literal=MAX_EVENTS_PER_POLL=10 \
-  --from-literal=METRICS_ADDR=:9090
-
-# Crea il deployment usando l'immagine del registry locale
-kubectl -n ai-remediator create deployment ai-remediator \
-  --image=host.docker.internal:5050/ai-remediator:0.2.0
-
-# Collega service account, ConfigMap e porta metrics
-kubectl -n ai-remediator patch deployment ai-remediator --type='json' -p='[
-  {"op":"add","path":"/spec/template/spec/serviceAccountName","value":"ai-remediator"},
-  {"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"},
-  {"op":"add","path":"/spec/template/spec/containers/0/envFrom","value":[
-    {"configMapRef":{"name":"ai-remediator-config"}}
-  ]},
-  {"op":"add","path":"/spec/template/spec/containers/0/ports","value":[
-    {"containerPort":9090,"name":"metrics"}
-  ]}
-]'
-
-# Verifica il rollout
-kubectl -n ai-remediator rollout status deployment/ai-remediator --timeout=180s
-kubectl -n ai-remediator logs deploy/ai-remediator --tail=20
+# Rollout e verifica
+kubectl -n ai-remediator rollout status deployment/ai-remediator-agent --timeout=180s
+kubectl -n ai-remediator logs deploy/ai-remediator-agent --tail=20
 ```
 
-> **Nota**: `host.docker.internal:5050` presuppone che il kubelet possa
-> risolvere `host.docker.internal` verso il gateway dell'host (default su
-> Docker Desktop). Su kind/minikube adatta l'hostname come descritto nella
-> sezione [Build](#build).
+> **Nota**: `host.docker.internal:5050` presuppone che il kubelet risolva
+> `host.docker.internal` verso il gateway dell'host (default su Docker
+> Desktop). Su kind/minikube adatta l'hostname come nella sezione
+> [Build](#build).
+>
+> Per limitare l'agente a namespace specifici usa `INCLUDE_NAMESPACES` (filtro
+> applicativo). `deploy/rbac-namespaced.yaml` da solo **non basta**: l'elenco
+> eventi è cluster-wide e richiede comunque la lettura concessa da
+> `rbac-cluster.yaml`. Vedi [RBAC namespace-scoped](#rbac-namespace-scoped).
 
 ---
 
@@ -467,15 +487,15 @@ kubectl -n ai-remediator patch configmap ai-remediator-config --type=merge -p '{
 }'
 
 # 5. Inietta REDIS_PASSWORD dal Secret (se creato al passo 1)
-kubectl -n ai-remediator patch deployment ai-remediator --type='json' -p='[
+kubectl -n ai-remediator patch deployment ai-remediator-agent --type='json' -p='[
   {"op":"add","path":"/spec/template/spec/containers/0/env","value":[
     {"name":"REDIS_PASSWORD","valueFrom":{"secretKeyRef":{"name":"ai-remediator-redis","key":"password"}}}
   ]}
 ]'
 
 # 6. Ricarica e verifica
-kubectl -n ai-remediator rollout restart deployment/ai-remediator
-kubectl -n ai-remediator logs deploy/ai-remediator --tail=5 | grep 'dedup store'
+kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
+kubectl -n ai-remediator logs deploy/ai-remediator-agent --tail=5 | grep 'dedup store'
 # atteso: "dedup store initialised" backend=redis
 ```
 
@@ -607,12 +627,12 @@ kubectl -n ai-remediator patch configmap ai-remediator-config \
   }}'
 
 # Monta il Secret come envFrom (si somma alla ConfigMap gia presente)
-kubectl -n ai-remediator patch deployment ai-remediator --type='json' -p='[
+kubectl -n ai-remediator patch deployment ai-remediator-agent --type='json' -p='[
   {"op":"add","path":"/spec/template/spec/containers/0/envFrom/-","value":
     {"secretRef":{"name":"ai-remediator-notify"}}}
 ]'
 
-kubectl -n ai-remediator rollout restart deployment/ai-remediator
+kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
 ```
 
 ### Setup con Gmail (alternativa)
@@ -672,7 +692,7 @@ mail per `(ns, Deployment, reason)` dentro la finestra.
 
 ```bash
 # Dopo il rollout restart, la riga deve riportare tutti i campi valorizzati
-kubectl -n ai-remediator logs deploy/ai-remediator --tail=30 \
+kubectl -n ai-remediator logs deploy/ai-remediator-agent --tail=30 \
   | grep 'notify: SMTP configured'
 ```
 
@@ -683,7 +703,7 @@ notify: SMTP configured host=smtp.mail.me.com port=587 from=alerts-bot@icloud.co
 
 Se vedi invece `notify: SMTP not configured, notifications disabled`, il
 Secret non e stato montato: controlla `envFrom` del Deployment con
-`kubectl -n ai-remediator get deployment ai-remediator -o jsonpath='{.spec.template.spec.containers[0].envFrom}'`.
+`kubectl -n ai-remediator get deployment ai-remediator-agent -o jsonpath='{.spec.template.spec.containers[0].envFrom}'`.
 
 ### Corpo dell'email
 
@@ -754,7 +774,7 @@ L'agente produce log in formato JSON (via `log/slog`) su stdout, compatibili con
 ### Configurare il Service per lo scraping Prometheus
 
 ```bash
-kubectl -n ai-remediator expose deployment ai-remediator \
+kubectl -n ai-remediator expose deployment ai-remediator-agent \
   --name=ai-remediator-metrics \
   --port=9090 \
   --target-port=9090 \
@@ -862,7 +882,7 @@ kubectl -n ai-remediator create configmap ai-remediator-config \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # Scala a piu repliche
-kubectl -n ai-remediator scale deployment ai-remediator --replicas=2
+kubectl -n ai-remediator scale deployment ai-remediator-agent --replicas=2
 ```
 
 Con leader election abilitata:
@@ -947,13 +967,22 @@ Due percorsi a seconda di cosa hai gia nel cluster.
 
 #### A. Installazione da zero (senza agente preesistente)
 
-`deploy/agent.yaml` crea Namespace, ConfigMap, Secret, Deployment e Service. Personalizza prima dell'apply: cambia `WEBUI_PASSWORD` nel Secret e, se non usi il registry locale di default, l'`image:` nel Deployment.
+La GUI è abilitata di default da `scripts/install.sh` (vedi [Installazione su
+Kubernetes](#installazione-su-kubernetes)): è il modo più semplice e imposta
+anche una password casuale.
+
+Se preferisci i manifest a mano (la GUI è già `WEBUI_ENABLED=true` in `deploy/agent.yaml`):
 
 ```bash
-kubectl apply -f deploy/rbac-namespaced.yaml      # Role base per l'agente
+kubectl create namespace ai-remediator
+kubectl apply -f deploy/rbac-cluster.yaml         # RBAC base dell'agente (cluster-wide)
 kubectl apply -f deploy/rbac-webui.yaml           # Role/ClusterRole per la GUI
 kubectl apply -f deploy/rbac-scenarios.yaml       # opzionale, solo se userai "Scenarios"
-kubectl apply -f deploy/agent.yaml                # Namespace + CM + Secret + Deployment + Service
+kubectl apply -f deploy/agent.yaml                # CM + Secret + Deployment + Service
+# poi imposta una password GUI vera (il manifest ha un placeholder):
+kubectl -n ai-remediator patch secret ai-remediator-secrets --type merge \
+  -p '{"stringData":{"WEBUI_PASSWORD":"<scegli-una-password>"}}'
+kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
 ```
 
 #### B. Aggiunta della GUI a un agente gia installato
@@ -1161,7 +1190,7 @@ Il container trova il file poison, termina, e il pod entra in `CrashLoopBackOff`
 kubectl -n incident-lab get pods -w
 
 # Terminale 2: osserva i log dell'agente
-kubectl -n ai-remediator logs deploy/ai-remediator -f
+kubectl -n ai-remediator logs deploy/ai-remediator-agent -f
 
 # Terminale 3: osserva gli eventi
 kubectl -n incident-lab get events --sort-by=.metadata.creationTimestamp | tail -20
@@ -1277,7 +1306,7 @@ kubectl delete -f scenarios/ --ignore-not-found
 Per ogni scenario puoi correlare severita percepita dall'LLM e azione scelta:
 
 ```bash
-kubectl -n ai-remediator logs deploy/ai-remediator -f | grep -E 'decision|severity|action'
+kubectl -n ai-remediator logs deploy/ai-remediator-agent -f | grep -E 'decision|severity|action'
 ```
 
 Le metriche Prometheus `remediator_decisions_total{action=...}` mostrano la
@@ -1328,13 +1357,13 @@ kubectl -n ollama exec -it deploy/ollama -- ollama list
 
 ```bash
 kubectl -n ai-remediator get pods
-kubectl -n ai-remediator logs deploy/ai-remediator --tail=50
+kubectl -n ai-remediator logs deploy/ai-remediator-agent --tail=50
 ```
 
 ### Metriche
 
 ```bash
-kubectl -n ai-remediator port-forward deploy/ai-remediator 9090:9090
+kubectl -n ai-remediator port-forward deploy/ai-remediator-agent 9090:9090
 curl http://localhost:9090/metrics
 curl http://localhost:9090/healthz
 ```
@@ -1379,7 +1408,7 @@ kubectl -n ai-remediator create configmap ai-remediator-config \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # Restart per applicare le modifiche
-kubectl -n ai-remediator rollout restart deployment/ai-remediator
+kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
 ```
 
 ---
@@ -1394,7 +1423,7 @@ Possibili cause:
 1. **Il binario in esecuzione non ha le feature recenti**. Verifica dalla
    prima riga dopo il restart:
    ```bash
-   kubectl -n ai-remediator logs deploy/ai-remediator --tail=30 \
+   kubectl -n ai-remediator logs deploy/ai-remediator-agent --tail=30 \
      | grep '"msg":"agent started"' | tail -1 | jq .
    ```
    Deve contenere `"buildFeatures":"dedup,infer-dep-from-podname,..."` e
@@ -1438,7 +1467,7 @@ kubectl -n ai-remediator patch configmap ai-remediator-config \
     "OLLAMA_HTTP_TIMEOUT_SECONDS":"180",
     "POLL_CONTEXT_TIMEOUT_SECONDS":"300"
   }}'
-kubectl -n ai-remediator rollout restart deployment/ai-remediator
+kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
 ```
 
 **Alternativa se resti sul 14b**: alza i timeout
@@ -1448,7 +1477,7 @@ kubectl -n ai-remediator patch configmap ai-remediator-config \
     "OLLAMA_HTTP_TIMEOUT_SECONDS":"600",
     "POLL_CONTEXT_TIMEOUT_SECONDS":"720"
   }}'
-kubectl -n ai-remediator rollout restart deployment/ai-remediator
+kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
 ```
 Invariante: `POLL_CONTEXT_TIMEOUT_SECONDS > OLLAMA_HTTP_TIMEOUT_SECONDS`.
 
@@ -1492,7 +1521,7 @@ container. Cause frequenti:
 2. **Il Secret non e stato montato sul Deployment**: il patch `envFrom`
    non e stato applicato o lo e stato su un altro Deployment. Verifica:
    ```bash
-   kubectl -n ai-remediator get deployment ai-remediator \
+   kubectl -n ai-remediator get deployment ai-remediator-agent \
      -o jsonpath='{.spec.template.spec.containers[0].envFrom}' | jq .
    ```
    Deve contenere sia `configMapRef: ai-remediator-config` sia
@@ -1500,7 +1529,7 @@ container. Cause frequenti:
 3. **Manca il `rollout restart`** dopo aver montato il Secret: le env
    esistenti nei pod restano vuote. Forza il rollout:
    ```bash
-   kubectl -n ai-remediator rollout restart deployment/ai-remediator
+   kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
    ```
 
 ### `execute decision failed` con uno dei seguenti messaggi
@@ -1523,6 +1552,10 @@ container. Cause frequenti:
 
 ## Reset ambiente
 
+> Se hai installato con `scripts/install.sh`, il modo più semplice è
+> `scripts/install.sh --uninstall` (rimuove namespace e RBAC creati; lascia
+> Ollama, che puoi togliere con `kubectl delete namespace ollama`).
+
 ### Solo laboratorio
 
 ```bash
@@ -1535,6 +1568,7 @@ kubectl delete namespace incident-lab --ignore-not-found
 kubectl delete namespace incident-lab --ignore-not-found
 kubectl delete namespace ai-remediator --ignore-not-found
 kubectl delete namespace ollama --ignore-not-found
-kubectl delete clusterrolebinding ai-remediator --ignore-not-found
-kubectl delete clusterrole ai-remediator --ignore-not-found
+# RBAC cluster-wide (agente + GUI)
+kubectl delete clusterrolebinding ai-remediator ai-remediator-webui-rbac-admin --ignore-not-found
+kubectl delete clusterrole ai-remediator ai-remediator-webui-rbac-admin --ignore-not-found
 ```

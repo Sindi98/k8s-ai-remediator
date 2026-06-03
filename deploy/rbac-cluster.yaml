@@ -1,0 +1,89 @@
+## Cluster-wide RBAC for ai-remediator (recommended default).
+##
+## The agent lists Warning events across ALL namespaces in one call
+## (Events("").List), so it needs a CLUSTER-scoped read on events — a
+## namespace Role is not enough and the poll loop would fail with 403.
+## Remediation (restart / scale / patch / delete) then acts on workloads in
+## whatever namespace the event came from, so write access is cluster-wide too.
+##
+## Prefer deploy/rbac-namespaced.yaml only when you also set INCLUDE_NAMESPACES
+## and are willing to grant the cluster-wide events/pods READ this file carries
+## while keeping writes namespaced. For the common "watch the whole cluster"
+## setup, apply this file.
+##
+## Usage:
+##   kubectl create namespace ai-remediator   # if it does not exist yet
+##   kubectl apply -f deploy/rbac-cluster.yaml
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ai-remediator
+  namespace: ai-remediator
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ai-remediator
+rules:
+  # Read every Warning event in the cluster (the poll loop lists all
+  # namespaces and filters in-process via INCLUDE/EXCLUDE_NAMESPACES).
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [get, list, watch]
+  # Inspect and, when decided, delete failing Pods; read their logs.
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list, watch, delete]
+  # Resolve namespaces (filtering) — read-only.
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, watch]
+  # Resolve Pod -> ReplicaSet -> Deployment and apply the remediation
+  # (restart, scale, set image, patch probe/resources/registry).
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch, update, patch]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ai-remediator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ai-remediator
+subjects:
+  - kind: ServiceAccount
+    name: ai-remediator
+    namespace: ai-remediator
+
+---
+## Leader-election leases live in the agent's own namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ai-remediator-leader-election
+  namespace: ai-remediator
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ai-remediator-leader-election
+  namespace: ai-remediator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ai-remediator-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: ai-remediator
+    namespace: ai-remediator
