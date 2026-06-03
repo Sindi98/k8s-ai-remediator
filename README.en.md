@@ -351,6 +351,24 @@ kubectl -n ollama exec -it deploy/ollama -- ollama list
 > - **minikube**: `minikube start --memory=6144 --cpus=4` (14b: `--memory=10240`)
 > - **kind**: configure the resources of the underlying Docker container
 
+#### Changing the model after installation
+
+The default (code and `deploy/agent.yaml`) is `qwen2.5:7b`. If the agent uses
+the wrong model (e.g. `qwen2.5:14b`), it is because the ConfigMap sets it
+explicitly: update it and roll out the Deployment, or use the GUI
+**Configuration → LLM (Ollama)** page (it writes the ConfigMap and rolls out).
+
+```bash
+# Set the model and reload the agent
+kubectl -n ai-remediator patch configmap ai-remediator-config --type merge \
+  -p '{"data":{"OLLAMA_MODEL":"qwen2.5:7b"}}'
+kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
+
+# Make sure the model is pulled in Ollama (the name must match)
+kubectl -n ollama exec deploy/ollama -- ollama pull qwen2.5:7b
+kubectl -n ollama exec deploy/ollama -- ollama list
+```
+
 #### 2. Agent (manifests)
 
 The manifests in `deploy/` are the source of truth: apply them in the order
@@ -402,12 +420,12 @@ All variables are read from environment variables (typically via ConfigMap).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OLLAMA_BASE_URL` | `http://ollama.ollama.svc.cluster.local:11434/api` | Ollama API base URL |
-| `OLLAMA_MODEL` | `qwen2.5:14b` (code default). Recommended on local CPU: `qwen2.5:7b` | LLM model name (must match `ollama list`). On CPU use `7b` (~30-90s per call). For GPU or top quality use `14b` (~3-6 min on CPU) |
+| `OLLAMA_MODEL` | `qwen2.5:7b` | LLM model name (must match `ollama list`). `7b` (default, recommended on CPU): ~30-90s per call. For GPU or top quality set `qwen2.5:14b`: ~3-6 min on CPU |
 | `DRY_RUN` | `false` | If `true`, logs decisions without applying remediation |
 | `POLL_INTERVAL_SECONDS` | `30` | Event polling interval (seconds) |
 | `DEDUPE_TTL_SECONDS` | `300` | Dedup TTL for `(ns, kind, name, reason)` signals: identical events within the window do not trigger a new LLM call |
 | `MAX_EVENTS_PER_POLL` | `10` | Maximum number of events that trigger an LLM call per poll cycle; excess events are deferred to the next poll |
-| `INCLUDE_NAMESPACES` | *(empty)* | Comma-separated allowlist of namespaces. When set the agent only reacts to events from those namespaces. Empty = all namespaces minus the excluded ones |
+| `INCLUDE_NAMESPACES` | *(empty)* | Comma-separated allowlist of namespaces. When set the agent only reacts to events from those namespaces; it also populates the GUI **Cluster** page selector. Empty = all namespaces minus the excluded ones. Settable from the GUI: **Configuration → Namespace filters → Include namespaces** |
 | `EXCLUDE_NAMESPACES` | `kube-system,kube-public,kube-node-lease,local-path-storage` | Comma-separated denylist of system namespaces. Events here are never sent to the LLM. Always wins over the allowlist (a namespace in both is excluded) |
 
 ### Policy Variables
@@ -554,7 +572,26 @@ are disabled by default and require a double opt-in:
 In addition, every `patch_*` is blocked if the LLM confidence is below
 `PATCH_CONFIDENCE_THRESHOLD` (default `0.85`).
 
-Example opt-in on the target Deployment:
+**Step 1 — enable the global feature flags** (flips them from `false` to
+`true` in the ConfigMap, then rolls out the Deployment):
+
+```bash
+kubectl -n ai-remediator patch configmap ai-remediator-config --type merge -p '{
+  "data": {
+    "ALLOW_PATCH_PROBE": "true",
+    "ALLOW_PATCH_RESOURCES": "true",
+    "ALLOW_PATCH_REGISTRY": "true"
+  }
+}'
+kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
+```
+
+> You can also toggle them from the GUI **Configuration** page ("action
+> policies" section), which writes the ConfigMap and rolls out.
+> The flags alone are not enough: every target Deployment must **also** carry
+> the `ai-remediator/allow-patch` annotation (step 2).
+
+**Step 2 — opt-in on the target Deployment:**
 
 ```bash
 kubectl -n myns annotate deployment myapp \
@@ -946,7 +983,7 @@ An optional web GUI with a dedicated login form lets operators run the most comm
 - **Login**: classic username/password form, HMAC-signed session cookie valid for 12h. The `/api/*` endpoints also accept HTTP Basic auth so curl-based scripts keep working.
 - **Dashboard**: live status of the agent Deployment (desired/ready replicas), pods, ConfigMap, Secret, leader lease, **live probes for Ollama (model list + latency) and Redis (TCP ping)**, **recent decisions feed** from the remediation loop (action / severity / outcome), and a read-only view of the running configuration.
 - **Logs**: live tail of the agent pod via Server-Sent Events, with pause/clear controls.
-- **Cluster**: pod table for the namespaces listed in `INCLUDE_NAMESPACES`, with phase filter and name search, restart count, last-termination reason and a "logs" button that opens a tail panel (with `previous` checkbox).
+- **Cluster**: pod table for the namespaces listed in `INCLUDE_NAMESPACES`, with phase filter and name search, restart count, last-termination reason and a "logs" button that opens a tail panel (with `previous` checkbox). The namespace selector is populated from `INCLUDE_NAMESPACES`: to add the desired namespace set it from **Configuration → Namespace filters → Include namespaces** (writes the ConfigMap and rolls out); if the list is empty the selector shows "(no INCLUDE_NAMESPACES configured)".
 - **Configuration** (accordion with multiple sections): LLM model, Ollama tuning (RPS, retries, timeouts), behavior (`DRY_RUN`, severity, polling), scaling bounds, namespace filters, action policies (`ALLOW_PATCH_*`, confidence thresholds), dedup backend + Redis, SMTP (with "Send test email"), agent replica count. Each form writes to ConfigMap or Secret and triggers a Deployment rollout.
 - **Scenarios**: apply and clean up the fault scenarios described in [Error Scenarios](#error-scenarios), restricted to a sandbox namespace allowlist.
 - **RBAC**: apply namespace-scoped `Role` + `RoleBinding` to onboard a new namespace without editing YAML by hand.
