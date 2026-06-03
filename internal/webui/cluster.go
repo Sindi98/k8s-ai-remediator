@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"sort"
@@ -34,9 +35,10 @@ type clusterPodView struct {
 // (INCLUDE_NAMESPACES); when empty, the GUI declares no namespaces are
 // configured rather than fanning out to the whole cluster, which would
 // be surprising and slow on large clusters.
-func (s *Server) handleClusterNamespaces(w http.ResponseWriter, _ *http.Request) {
-	out := make([]string, 0, len(s.opts.IncludeNamespaces))
-	out = append(out, s.opts.IncludeNamespaces...)
+func (s *Server) handleClusterNamespaces(w http.ResponseWriter, r *http.Request) {
+	live := s.includeNamespacesLive(r.Context())
+	out := make([]string, 0, len(live))
+	out = append(out, live...)
 	sort.Strings(out)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"namespaces": out,
@@ -53,7 +55,7 @@ func (s *Server) handleClusterPods(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("namespace query parameter required"))
 		return
 	}
-	if !s.namespaceAllowed(ns) {
+	if !s.namespaceAllowed(r.Context(), ns) {
 		writeJSONError(w, http.StatusForbidden, fmt.Errorf("namespace %q not in INCLUDE_NAMESPACES", ns))
 		return
 	}
@@ -148,7 +150,7 @@ func (s *Server) handleClusterPodLogs(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("namespace and pod are required"))
 		return
 	}
-	if !s.namespaceAllowed(ns) {
+	if !s.namespaceAllowed(r.Context(), ns) {
 		writeJSONError(w, http.StatusForbidden, fmt.Errorf("namespace %q not in INCLUDE_NAMESPACES", ns))
 		return
 	}
@@ -196,14 +198,39 @@ func (s *Server) handleClusterPodLogs(w http.ResponseWriter, r *http.Request) {
 // namespaceAllowed enforces the INCLUDE_NAMESPACES allowlist for cluster
 // inspection. We deliberately do NOT widen to "anything the SA can list"
 // because the operator's intent (encoded in INCLUDE_NAMESPACES) is the
-// canonical "what is the agent meant to see" boundary.
-func (s *Server) namespaceAllowed(ns string) bool {
-	for _, n := range s.opts.IncludeNamespaces {
+// canonical "what is the agent meant to see" boundary. The allowlist is read
+// live from the ConfigMap so a value just set from the GUI takes effect
+// without waiting for the pod to restart.
+func (s *Server) namespaceAllowed(ctx context.Context, ns string) bool {
+	for _, n := range s.includeNamespacesLive(ctx) {
 		if n == ns {
 			return true
 		}
 	}
 	return false
+}
+
+// includeNamespacesLive returns the INCLUDE_NAMESPACES allowlist read live
+// from the agent ConfigMap, so a namespace set from the GUI (Configuration ->
+// Namespace filters) is honoured by the Cluster page immediately, before the
+// rollout-triggered restart. Falls back to the value captured at startup when
+// the ConfigMap cannot be read or does not set the key.
+func (s *Server) includeNamespacesLive(ctx context.Context) []string {
+	cm, err := s.opts.Clientset.CoreV1().ConfigMaps(s.opts.Namespace).Get(ctx, s.opts.ConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return s.opts.IncludeNamespaces
+	}
+	raw, ok := cm.Data["INCLUDE_NAMESPACES"]
+	if !ok {
+		return s.opts.IncludeNamespaces
+	}
+	out := make([]string, 0)
+	for _, p := range strings.Split(raw, ",") {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // handleRecentDecisions returns the in-memory ring buffer of the latest

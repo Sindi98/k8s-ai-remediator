@@ -142,3 +142,49 @@ func TestClusterNamespacesReturnsAllowlist(t *testing.T) {
 		t.Fatalf("got %v, want %v", got.Namespaces, want)
 	}
 }
+
+// TestClusterNamespacesReadsConfigMapLive proves the fix for "set
+// INCLUDE_NAMESPACES from the GUI but the Cluster page stays empty": the
+// allowlist is read live from the ConfigMap, so a value written after the
+// pod started (opts.IncludeNamespaces empty) is honoured immediately —
+// both for the namespace dropdown and the pod-listing allowlist.
+func TestClusterNamespacesReadsConfigMapLive(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "ai-remediator-config", Namespace: "ai-remediator"},
+			Data:       map[string]string{"INCLUDE_NAMESPACES": "live-ns, other-live"},
+		},
+		makePod("live-ns", "p1", "Running", true, 0),
+	)
+	s, err := New(Options{
+		Username: "u", Password: "p",
+		Namespace: "ai-remediator", DeploymentName: "ai-remediator-agent",
+		ConfigMapName: "ai-remediator-config", SecretName: "ai-remediator-secrets",
+		IncludeNamespaces: nil, // startup had none; the operator set it live via the GUI
+		Clientset:         cs,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	s.handleClusterNamespaces(rr, httptest.NewRequest(http.MethodGet, "/api/cluster/namespaces", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("namespaces: got %d, want 200", rr.Code)
+	}
+	var got struct {
+		Namespaces []string `json:"namespaces"`
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &got)
+	if len(got.Namespaces) != 2 || got.Namespaces[0] != "live-ns" || got.Namespaces[1] != "other-live" {
+		t.Fatalf("live namespaces = %v, want [live-ns other-live]", got.Namespaces)
+	}
+
+	// The pod-listing allowlist must also honour the live value (not 403),
+	// even though opts.IncludeNamespaces was empty at startup.
+	rr2 := httptest.NewRecorder()
+	s.handleClusterPods(rr2, httptest.NewRequest(http.MethodGet, "/api/cluster/pods?namespace=live-ns", nil))
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("pods in live namespace: got %d (%s), want 200", rr2.Code, rr2.Body.String())
+	}
+}
