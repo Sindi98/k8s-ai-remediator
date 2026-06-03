@@ -1596,6 +1596,22 @@ container. Cause frequenti:
 | `restart_deployment blocked: pod status shows OOMKilled` | L'LLM ha proposto restart su un OOM | Atteso. Attendi `patch_resources` |
 | `scale_deployment blocked: event reason=FailedScheduling` | L'LLM ha proposto di scalare un pod che chiede troppe risorse | Atteso. Attendi `patch_resources` o `mark_for_manual_fix` |
 
+### `roles ... forbidden: attempting to grant RBAC permissions not currently held` da "Apply RBAC"
+
+La GUI applica il `Role` di onboarding come ServiceAccount `ai-remediator`.
+Kubernetes vieta di creare un Role che concede permessi che il SA non possiede
+(prevenzione escalation). Capitava perche il Role includeva `events: [delete]`
+mentre l'agente tiene gli `events` solo in `get/list/watch` (non cancella mai
+eventi). **Risolto**: il Role concede `delete` solo sui `pods`. Per applicare la
+correzione su un agente gia in esecuzione serve un nuovo build dell'immagine e
+un rollout. Workaround immediato senza rebuild: onboarda il namespace a mano con
+il tuo kubeconfig (admin), che bypassa il check sul SA dell'agente:
+
+```bash
+kubectl apply -f deploy/rbac-namespaced.yaml   # gia corretto (delete solo sui pod)
+# per un namespace diverso da incident-lab, riscrivi il campo namespace prima dell'apply
+```
+
 ---
 
 ## Reset ambiente
