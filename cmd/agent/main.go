@@ -149,7 +149,15 @@ func executeDecision(
 		if err != nil {
 			return err
 		}
-		return kube.PatchDeploymentResources(ctx, cs, d.Namespace, depName, d.Parameters["container"], d.Parameters, cfg.DryRun)
+		params := d.Parameters
+		if isOOMContext(extra) {
+			// Deterministic safety net for a directly-chosen patch_resources:
+			// a weak model often proposes a memory_limit only marginally above
+			// the current one (or omits it), which passes validation but OOMs
+			// again. Raise it to the same floor the OOM auto-escalation uses.
+			params = withOOMMemoryFloor(ctx, cs, d.Namespace, depName, params)
+		}
+		return kube.PatchDeploymentResources(ctx, cs, d.Namespace, depName, params["container"], params, cfg.DryRun)
 
 	case model.ActionPatchRegistry:
 		depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName, d.Parameters)
@@ -309,6 +317,71 @@ func computeBumpedMemoryLimit(current resource.Quantity) string {
 		target = kube.MaxMemoryQuantity.DeepCopy()
 	}
 	return target.String()
+}
+
+// isOOMContext reports whether the incident context (pod status summary,
+// lastTerminated reason or event message attached as "extra") shows an OOM
+// kill. Same signal MaybeBlockRestartOnOOMKilled uses.
+func isOOMContext(extra string) bool {
+	low := strings.ToLower(extra)
+	return strings.Contains(low, "oomkilled") || strings.Contains(low, "exit=137")
+}
+
+// withOOMMemoryFloor returns params with memory_limit raised to a safe floor
+// for an OOM incident. A small local model frequently proposes patch_resources
+// with a memory_limit only marginally above the current one — or omits it
+// entirely — which passes the [16Mi,16Gi] validator but lets the container OOM
+// again immediately. That is why memory-hog kept failing even after the floor
+// was added: a *directly* chosen patch_resources never went through it (only
+// the restart→patch_resources auto-escalation did). We reuse the same floor
+// (computeBumpedMemoryLimit of the container's current limit: 4x current, min
+// 512Mi) and only raise toward it — a higher LLM value is preserved. The map
+// is copied before mutation so the recorded decision is left intact.
+func withOOMMemoryFloor(ctx context.Context, cs kubernetes.Interface, ns, depName string, params map[string]string) map[string]string {
+	dep, err := cs.AppsV1().Deployments(ns).Get(ctx, depName, metav1.GetOptions{})
+	if err != nil {
+		return params
+	}
+
+	// Current memory limit of the target container (first one when the param
+	// is empty or does not match), used to size the floor.
+	var current resource.Quantity
+	containers := dep.Spec.Template.Spec.Containers
+	if len(containers) > 0 {
+		idx := 0
+		if name := strings.TrimSpace(params["container"]); name != "" {
+			for i, c := range containers {
+				if c.Name == name {
+					idx = i
+					break
+				}
+			}
+		}
+		current = containers[idx].Resources.Limits[corev1.ResourceMemory]
+	}
+
+	floor := resource.MustParse(computeBumpedMemoryLimit(current))
+	if raw := strings.TrimSpace(params["memory_limit"]); raw != "" {
+		if q, perr := resource.ParseQuantity(raw); perr == nil && q.Cmp(floor) >= 0 {
+			return params // already adequate
+		}
+	}
+
+	out := make(map[string]string, len(params)+1)
+	for k, v := range params {
+		out[k] = v
+	}
+	out["memory_limit"] = floor.String()
+	// Never let memory_request exceed the new limit (the validator rejects
+	// that); cap it at half the floor, matching the prompt guidance.
+	if raw := strings.TrimSpace(out["memory_request"]); raw != "" {
+		if q, perr := resource.ParseQuantity(raw); perr == nil && q.Cmp(floor) > 0 {
+			half := floor.DeepCopy()
+			half.Set(floor.Value() / 2)
+			out["memory_request"] = half.String()
+		}
+	}
+	return out
 }
 
 // toSet builds a quick-lookup set from a slice of strings.

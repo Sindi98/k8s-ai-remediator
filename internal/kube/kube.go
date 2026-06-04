@@ -666,6 +666,28 @@ func DeploymentToText(dep *appsv1.Deployment) string {
 		out += "\nAllow-patch scopes (opt-in via annotation): none"
 	}
 
+	// Emit current requests/limits using the exact patch_resources parameter
+	// names so the LLM can propose an informed bump (it can see the
+	// memory_limit it must raise) instead of guessing blindly.
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		parts := make([]string, 0, 4)
+		if v, ok := c.Resources.Requests[corev1.ResourceCPU]; ok {
+			parts = append(parts, "cpu_request="+v.String())
+		}
+		if v, ok := c.Resources.Requests[corev1.ResourceMemory]; ok {
+			parts = append(parts, "memory_request="+v.String())
+		}
+		if v, ok := c.Resources.Limits[corev1.ResourceCPU]; ok {
+			parts = append(parts, "cpu_limit="+v.String())
+		}
+		if v, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
+			parts = append(parts, "memory_limit="+v.String())
+		}
+		if len(parts) > 0 {
+			out += fmt.Sprintf("\nContainer %s resources: %s", c.Name, strings.Join(parts, " "))
+		}
+	}
+
 	// Emit current probe timings so the LLM can propose incremental changes
 	// (e.g. double failureThreshold) without guessing blindly.
 	for _, c := range dep.Spec.Template.Spec.Containers {

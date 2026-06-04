@@ -613,3 +613,38 @@ func TestDeploymentToText_IncludesProbeAndAnnotation(t *testing.T) {
 		}
 	}
 }
+
+func TestDeploymentToText_IncludesResources(t *testing.T) {
+	// The snapshot must surface the current requests/limits — using the exact
+	// patch_resources param names — so the LLM can see the memory_limit it has
+	// to raise on an OOM instead of guessing blindly.
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "memory-hog"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(1),
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name: "app", Image: "polinux/stress",
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("10m"),
+								corev1.ResourceMemory: resource.MustParse("16Mi"),
+							},
+							Limits: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("100m"),
+								corev1.ResourceMemory: resource.MustParse("32Mi"),
+							},
+						},
+					}},
+				},
+			},
+		},
+	}
+	got := DeploymentToText(dep)
+	for _, want := range []string{"cpu_request=10m", "memory_request=16Mi", "cpu_limit=100m", "memory_limit=32Mi"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected %q in snapshot, got:\n%s", want, got)
+		}
+	}
+}

@@ -601,3 +601,92 @@ func TestExecuteDecision_PatchRegistry_HappyPath(t *testing.T) {
 		t.Errorf("unexpected image %q", got)
 	}
 }
+
+// newMemHogCluster builds a single-container Deployment that opts in to
+// resources patching and runs near a tight 32Mi memory limit, mirroring the
+// critical-oomkilled scenario.
+func newMemHogCluster(t *testing.T) *fake.Clientset {
+	t.Helper()
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "memory-hog", Namespace: "default",
+			Annotations: map[string]string{kube.AllowPatchAnnotation: "resources"},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "memory-hog"}},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name: "app",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("16Mi")},
+						Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("32Mi")},
+					},
+				}},
+			}},
+		},
+	}
+	return fake.NewSimpleClientset(dep)
+}
+
+func TestExecuteDecision_PatchResources_OOMFloorRaisesLowLimit(t *testing.T) {
+	// The bug behind "memory-hog still doesn't resolve": a directly-chosen
+	// patch_resources with a too-low memory_limit passed validation and OOMed
+	// again. On an OOM incident it must be raised to the 512Mi floor.
+	cs := newMemHogCluster(t)
+	ctx := context.Background()
+	d := model.Decision{
+		Action: model.ActionPatchResources, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "memory-hog", Confidence: 0.95,
+		Parameters: map[string]string{"container": "app", "memory_limit": "64Mi"},
+	}
+	extra := "container=app lastTerminated reason=OOMKilled exit=137"
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg(), "BackOff", extra); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "memory-hog", metav1.GetOptions{})
+	got := dep.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory]
+	if got.Cmp(resource.MustParse("512Mi")) != 0 {
+		t.Errorf("expected memory_limit floored to 512Mi, got %s", got.String())
+	}
+}
+
+func TestExecuteDecision_PatchResources_OOMFloorKeepsAdequateLimit(t *testing.T) {
+	// A value that already clears the floor is preserved (never lowered).
+	cs := newMemHogCluster(t)
+	ctx := context.Background()
+	d := model.Decision{
+		Action: model.ActionPatchResources, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "memory-hog", Confidence: 0.95,
+		Parameters: map[string]string{"container": "app", "memory_limit": "1Gi"},
+	}
+	extra := "container=app lastTerminated reason=OOMKilled exit=137"
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg(), "BackOff", extra); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "memory-hog", metav1.GetOptions{})
+	got := dep.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory]
+	if got.Cmp(resource.MustParse("1Gi")) != 0 {
+		t.Errorf("expected memory_limit preserved at 1Gi, got %s", got.String())
+	}
+}
+
+func TestExecuteDecision_PatchResources_NonOOMNotFloored(t *testing.T) {
+	// Non-OOM patch_resources (e.g. FailedScheduling, where the container uses
+	// ~no memory) must keep the proposed value: the floor is OOM-specific.
+	cs := newMemHogCluster(t)
+	ctx := context.Background()
+	d := model.Decision{
+		Action: model.ActionPatchResources, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "memory-hog", Confidence: 0.95,
+		Parameters: map[string]string{"container": "app", "memory_limit": "128Mi"},
+	}
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg(), "FailedScheduling", "Pod pending: Insufficient memory"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "memory-hog", metav1.GetOptions{})
+	got := dep.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory]
+	if got.Cmp(resource.MustParse("128Mi")) != 0 {
+		t.Errorf("expected memory_limit kept at 128Mi for non-OOM, got %s", got.String())
+	}
+}

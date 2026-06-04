@@ -88,9 +88,12 @@ registry `host.docker.internal:5050`.
 Effect: the container moves from `memory_limit=32Mi` to `memory_limit=512Mi`.
 `polinux/stress` allocates ~256MB (≈244Mi): a 256Mi (≈268MB) limit sits too
 close to that allocation and frequently OOMs again, so the scenario did not
-close reliably. 512Mi leaves real headroom → stable `Running` pod. The
-auto-escalation (restart blocked on OOM → `patch_resources`) uses the same
-512Mi floor.
+close reliably. 512Mi leaves real headroom → stable `Running` pod. The 512Mi
+floor (4x the current limit, min 512Mi) is enforced on **every**
+`patch_resources` for an OOM — both a direct LLM choice and the auto-escalation
+from a blocked restart — so even a too-low `memory_limit` proposed by a weak
+model is raised. The Deployment snapshot now includes the current limits, so
+the LLM can see the value it must raise.
 
 ### severe-failedscheduling (patch_resources or abstention)
 With opt-in enabled (`ai-remediator/allow-patch=resources`) you expect:
