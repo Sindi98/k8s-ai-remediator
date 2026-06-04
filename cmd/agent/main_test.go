@@ -210,11 +210,12 @@ func TestComputeBumpedMemoryLimit(t *testing.T) {
 		current string
 		want    string
 	}{
-		{"", "256Mi"},      // nothing set → floor
-		{"16Mi", "256Mi"},  // doubled (32Mi) < floor → floor wins
-		{"32Mi", "256Mi"},  // doubled (64Mi) < floor → floor wins
-		{"256Mi", "512Mi"}, // exact 2x above floor
-		{"1Gi", "2Gi"},     // 2x scaling
+		{"", "512Mi"},      // nothing set → floor
+		{"16Mi", "512Mi"},  // 4x (64Mi) < floor → floor wins
+		{"32Mi", "512Mi"},  // 4x (128Mi) < floor → floor wins
+		{"128Mi", "512Mi"}, // 4x == floor
+		{"256Mi", "1Gi"},   // 4x above floor
+		{"1Gi", "4Gi"},     // 4x scaling
 		{"16Gi", "16Gi"},   // capped at MaxMemoryQuantity (16Gi)
 	}
 	for _, c := range cases {
@@ -295,11 +296,11 @@ func TestTryAutoPatchResourcesOnOOM_Success(t *testing.T) {
 	if transformed.Parameters["container"] != "app" {
 		t.Errorf("expected container=app, got %s", transformed.Parameters["container"])
 	}
-	// 32Mi * 2 = 64Mi < 256Mi floor → should snap to 256Mi.
+	// 32Mi * 4 = 128Mi < 512Mi floor → should snap to 512Mi.
 	gotLimit := resource.MustParse(transformed.Parameters["memory_limit"])
-	wantLimit := resource.MustParse("256Mi")
+	wantLimit := resource.MustParse("512Mi")
 	if gotLimit.Cmp(wantLimit) != 0 {
-		t.Errorf("expected memory_limit=256Mi, got %s", transformed.Parameters["memory_limit"])
+		t.Errorf("expected memory_limit=512Mi, got %s", transformed.Parameters["memory_limit"])
 	}
 }
 
@@ -341,9 +342,78 @@ func TestExecuteDecision_AutoEscalatesOOMRestartToPatchResources(t *testing.T) {
 	// Verify the Deployment was patched.
 	got, _ := cs.AppsV1().Deployments("default").Get(context.Background(), "memory-hog", metav1.GetOptions{})
 	newLimit := got.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory]
-	want := resource.MustParse("256Mi")
+	want := resource.MustParse("512Mi")
 	if newLimit.Cmp(want) != 0 {
-		t.Errorf("expected memory_limit=256Mi after auto-escalation, got %s", newLimit.String())
+		t.Errorf("expected memory_limit=512Mi after auto-escalation, got %s", newLimit.String())
+	}
+}
+
+func TestTryAutoPatchProbeOnUnhealthy_NoOptIn(t *testing.T) {
+	// Deployment opts in to "resources" but not "probe" → transformer declines.
+	cs := newPatchableClusterForAgent(t, "resources")
+	cfg := patchFlagsCfg()
+	d := model.Decision{Action: model.ActionRestartDeployment, Namespace: "default", ResourceKind: "Deployment", ResourceName: "app"}
+	if _, ok := tryAutoPatchProbeOnUnhealthy(context.Background(), cs, d, cfg); ok {
+		t.Error("expected transformer to decline without the probe opt-in scope")
+	}
+}
+
+func TestTryAutoPatchProbeOnUnhealthy_FlagOff(t *testing.T) {
+	cs := newPatchableClusterForAgent(t, "probe")
+	cfg := defaultCfg() // AllowPatchProbe=false
+	d := model.Decision{Action: model.ActionRestartDeployment, Namespace: "default", ResourceKind: "Deployment", ResourceName: "app"}
+	if _, ok := tryAutoPatchProbeOnUnhealthy(context.Background(), cs, d, cfg); ok {
+		t.Error("expected transformer to decline when ALLOW_PATCH_PROBE=false")
+	}
+}
+
+func TestTryAutoPatchProbeOnUnhealthy_Success(t *testing.T) {
+	cs := newPatchableClusterForAgent(t, "probe") // "main" has a readiness probe
+	cfg := patchFlagsCfg()
+	d := model.Decision{
+		Action: model.ActionRestartDeployment, Namespace: "default",
+		ResourceKind: "Pod", ResourceName: "app-xxx-yyy",
+		Parameters: map[string]string{"deployment_name": "app"},
+	}
+	transformed, ok := tryAutoPatchProbeOnUnhealthy(context.Background(), cs, d, cfg)
+	if !ok {
+		t.Fatal("expected transformer to succeed")
+	}
+	if transformed.Action != model.ActionPatchProbe {
+		t.Errorf("expected action=patch_probe, got %s", transformed.Action)
+	}
+	if transformed.Parameters["container"] != "main" || transformed.Parameters["probe"] != "readiness" {
+		t.Errorf("expected container=main probe=readiness, got %+v", transformed.Parameters)
+	}
+	if transformed.Parameters["failure_threshold"] != "6" || transformed.Parameters["period_seconds"] != "15" {
+		t.Errorf("expected tolerant probe defaults, got %+v", transformed.Parameters)
+	}
+}
+
+func TestExecuteDecision_AutoEscalatesUnhealthyRestartToPatchProbe(t *testing.T) {
+	// End-to-end: blocked restart_deployment + reason Unhealthy + probe opt-in
+	// → transformed to patch_probe and applied. Confidence is intentionally low
+	// to prove the deterministic escalation is not gated by the LLM confidence
+	// it attached to the rejected restart.
+	cs := newPatchableClusterForAgent(t, "probe")
+	ctx := context.Background()
+	cfg := patchFlagsCfg()
+
+	d := model.Decision{
+		Action: model.ActionRestartDeployment, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app",
+		Confidence: 0.1,
+	}
+	if err := executeDecision(ctx, cs, d, cfg, "Unhealthy", ""); err != nil {
+		t.Fatalf("expected auto-escalation to succeed, got %v", err)
+	}
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "app", metav1.GetOptions{})
+	p := dep.Spec.Template.Spec.Containers[0].ReadinessProbe
+	if p == nil {
+		t.Fatal("readiness probe missing after patch")
+	}
+	if p.FailureThreshold != 6 || p.PeriodSeconds != 15 || p.TimeoutSeconds != 5 {
+		t.Errorf("probe not relaxed: failureThreshold=%d period=%d timeout=%d", p.FailureThreshold, p.PeriodSeconds, p.TimeoutSeconds)
 	}
 }
 

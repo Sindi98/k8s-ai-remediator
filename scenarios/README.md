@@ -45,6 +45,16 @@ Effetto: la readinessProbe passa da `failureThreshold=2, periodSeconds=5` a
 dello scenario la probe non fallisce piu abbastanza a lungo per generare eventi
 `Unhealthy`.
 
+Nota (severita bassa): lo scenario e `low` e con `MIN_SEVERITY=medium` un
+modello che gli assegna severita bassa farebbe scartare la decisione prima
+dell'esecuzione. Le azioni opt-in (`patch_*`, `set_deployment_image`) sono ora
+**esentate dal filtro `MIN_SEVERITY`**: sono gia protette da flag globale +
+annotation + soglia di confidence, quindi non vengono piu silenziosamente
+scartate per una severita sottostimata. Inoltre, se il modello propone
+erroneamente `restart_deployment` su un evento `Unhealthy`, l'agente lo
+converte automaticamente in `patch_probe` (auto-escalation, richiede l'opt-in
+`probe`).
+
 ### medium-imagepullbackoff (set_deployment_image)
 ```json
 {
@@ -71,13 +81,17 @@ e pushare sul registry `host.docker.internal:5050`.
   "params": {
     "deployment_name": "memory-hog",
     "container": "app",
-    "memory_limit": "256Mi",
-    "memory_request": "128Mi"
+    "memory_limit": "512Mi",
+    "memory_request": "256Mi"
   }
 }
 ```
-Effetto: il container passa da `memory_limit=32Mi` a `memory_limit=256Mi`.
-`polinux/stress` completa l'allocazione di 256MB senza OOM → pod `Running`.
+Effetto: il container passa da `memory_limit=32Mi` a `memory_limit=512Mi`.
+`polinux/stress` alloca ~256MB (≈244Mi): un limite di 256Mi (≈268MB) e troppo
+vicino all'allocazione e va spesso di nuovo in OOM, quindi lo scenario non si
+chiudeva in modo affidabile. 512Mi lascia margine reale → pod `Running` stabile.
+L'auto-escalation (restart bloccato su OOM → `patch_resources`) usa lo stesso
+floor di 512Mi.
 
 ### severe-failedscheduling (patch_resources o astensione)
 Con opt-in attivo (`ai-remediator/allow-patch=resources`), ci si aspetta:

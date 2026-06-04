@@ -23,6 +23,28 @@ func TestParseSeverity(t *testing.T) {
 	}
 }
 
+func TestActionIsOperatorGated(t *testing.T) {
+	gated := []Action{
+		ActionPatchProbe, ActionPatchResources, ActionPatchRegistry, ActionSetDeploymentImage,
+	}
+	for _, a := range gated {
+		if !a.IsOperatorGated() {
+			t.Errorf("action %q should be operator-gated (exempt from MIN_SEVERITY)", a)
+		}
+	}
+
+	notGated := []Action{
+		ActionNoop, ActionRestartDeployment, ActionDeleteFailedPod,
+		ActionDeleteAndRecreate, ActionScaleDeployment, ActionInspectPodLogs,
+		ActionMarkForManualFix, ActionAskHuman,
+	}
+	for _, a := range notGated {
+		if a.IsOperatorGated() {
+			t.Errorf("action %q should NOT be operator-gated", a)
+		}
+	}
+}
+
 func TestSeverity_MeetsMinimum(t *testing.T) {
 	tests := []struct {
 		sev  Severity
