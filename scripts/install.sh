@@ -4,10 +4,12 @@
 #
 #   1. (optional) build & push the agent image to your registry
 #   2. (optional) install Ollama and pull the LLM model
-#   3. apply RBAC (cluster-wide ServiceAccount/ClusterRole + leader-election)
-#   4. apply the agent (Namespace, ConfigMap, Secret, Deployment, Service)
-#   5. (optional) apply the admin GUI + scenarios RBAC
-#   6. override image / model / GUI credentials, then roll out and verify
+#   3. install Redis (mandatory dedup backend) + its password Secret,
+#      or point at an external Redis with --redis-addr
+#   4. apply RBAC (cluster-wide ServiceAccount/ClusterRole + leader-election)
+#   5. apply the agent (Namespace, ConfigMap, Secret, Deployment, Service)
+#   6. (optional) apply the admin GUI + scenarios RBAC
+#   7. override image / model / GUI credentials, then roll out and verify
 #
 # Every step uses `kubectl apply` (or merge patches), so re-running the script
 # converges the cluster to the desired state without erroring on existing
@@ -26,6 +28,8 @@
 #   --webui-user NAME    GUI login username (default: admin)          [WEBUI_USERNAME]
 #   --webui-password PW  GUI login password (default: random)         [WEBUI_PASSWORD]
 #   --sandbox-ns NS      Namespace allowed to receive fault scenarios [SANDBOX_NS]
+#   --redis-addr ADDR    Use an external Redis (host:port); skip the bundled one [REDIS_ADDR]
+#   --redis-password PW  Redis password (bundled or external; random if unset)   [REDIS_PASSWORD]
 #   --no-scenarios       Skip the scenarios sandbox RBAC              [ENABLE_SCENARIOS=false]
 #   --dry-run            Print the actions without changing the cluster
 #   --uninstall          Remove everything this script creates
@@ -58,6 +62,14 @@ REGISTRY="${REGISTRY:-host.docker.internal:5050}"
 IMAGE="${IMAGE:-}"                       # defaults to $REGISTRY/k8s-ai-remediator:latest below
 MODEL="${MODEL:-qwen2.5:7b}"
 SANDBOX_NS="${SANDBOX_NS:-incident-lab}"
+
+# Redis is the (mandatory) dedup backend. Leave REDIS_ADDR empty to install the
+# bundled single-instance Redis (deploy/redis.yaml); set it to an existing
+# host:port to use an external Redis instead. REDIS_PASSWORD is stored in the
+# ai-remediator-redis Secret; a random one is generated when installing the
+# bundled Redis without an explicit value.
+REDIS_ADDR="${REDIS_ADDR:-}"
+REDIS_PASSWORD="${REDIS_PASSWORD:-}"
 
 INSTALL_OLLAMA="${INSTALL_OLLAMA:-true}"
 ENABLE_WEBUI="${ENABLE_WEBUI:-true}"
@@ -103,7 +115,9 @@ apply_stdin() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-usage() { sed -n '2,48p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# Print the leading comment block (the help header) up to, but not including,
+# the `set -euo pipefail` line. Robust to the header growing or shrinking.
+usage() { sed -n '2,/^set -euo pipefail/{/^set -euo pipefail/!p;}' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 # --- argument parsing -------------------------------------------------------
 while [ "$#" -gt 0 ]; do
@@ -117,6 +131,8 @@ while [ "$#" -gt 0 ]; do
         --webui-user)       WEBUI_USERNAME="$2"; shift 2 ;;
         --webui-password)   WEBUI_PASSWORD="$2"; shift 2 ;;
         --sandbox-ns)       SANDBOX_NS="$2"; shift 2 ;;
+        --redis-addr)       REDIS_ADDR="$2"; shift 2 ;;
+        --redis-password)   REDIS_PASSWORD="$2"; shift 2 ;;
         --no-scenarios)     ENABLE_SCENARIOS=false; shift ;;
         --dry-run)          DRY_RUN=true; shift ;;
         --uninstall)        UNINSTALL=true; shift ;;
@@ -136,9 +152,11 @@ preflight() {
     fi
     [ -f "${DEPLOY_DIR}/agent.yaml" ] || die "deploy/agent.yaml not found — run from a repo checkout"
     [ -f "${DEPLOY_DIR}/rbac-cluster.yaml" ] || die "deploy/rbac-cluster.yaml not found"
+    [ -n "$REDIS_ADDR" ] || [ -f "${DEPLOY_DIR}/redis.yaml" ] || die "deploy/redis.yaml not found (needed for the bundled Redis; or pass --redis-addr for an external one)"
     info "kubectl context: $(kubectl config current-context 2>/dev/null || echo '?')"
     info "agent image:     ${IMAGE}"
     info "ollama model:    ${MODEL} ($([ "$INSTALL_OLLAMA" = true ] && echo 'will install Ollama' || echo 'Ollama install skipped'))"
+    info "dedup backend:   Redis ($([ -n "$REDIS_ADDR" ] && echo "external: ${REDIS_ADDR}" || echo 'bundled (deploy/redis.yaml)'))"
     info "admin GUI:       $([ "$ENABLE_WEBUI" = true ] && echo enabled || echo disabled)"
 }
 
@@ -209,6 +227,79 @@ YAML
     run kubectl -n "$OLLAMA_NAMESPACE" exec deploy/ollama -- ollama list
 }
 
+# --- Redis dedup backend (mandatory) ---------------------------------------
+# ensure_redis_secret creates the ai-remediator-redis Secret that holds the
+# Redis password (read by both the Redis Deployment and the agent). Idempotent:
+# an existing Secret is left untouched so re-running the installer never rotates
+# the password out from under a running Redis — which would lock the agent out
+# of the persisted dedup state. The first argument controls whether a random
+# password is generated when none is provided: true for the bundled Redis (we
+# own both ends), false for an external Redis (a random password the external
+# server does not know would just fail auth; connect unauthenticated instead).
+ensure_redis_secret() {
+    local allow_generate="${1:-false}"
+    if [ "$DRY_RUN" = true ]; then
+        printf '%s    [dry-run] ensure secret/ai-remediator-redis in %s%s\n' "$DIM" "$NAMESPACE" "$RESET"
+        return 0
+    fi
+    if kubectl -n "$NAMESPACE" get secret ai-remediator-redis >/dev/null 2>&1; then
+        info "Redis Secret 'ai-remediator-redis' already exists — keeping the current password"
+        return 0
+    fi
+    if [ -z "$REDIS_PASSWORD" ]; then
+        if [ "$allow_generate" = true ]; then
+            REDIS_PASSWORD="$(gen_password)"
+            REDIS_PASSWORD_GENERATED=true
+        else
+            info "No Redis password provided — agent will connect to ${REDIS_ADDR} without auth"
+            return 0
+        fi
+    fi
+    kubectl -n "$NAMESPACE" create secret generic ai-remediator-redis \
+        --from-literal=password="$REDIS_PASSWORD"
+    info "Created Redis password Secret 'ai-remediator-redis'"
+}
+
+# install_redis deploys the bundled Redis (deploy/redis.yaml) and waits for it,
+# or — when REDIS_ADDR points at an external instance — skips the deployment and
+# just ensures the password Secret. Sets REDIS_ADDR to the bundled Service when
+# installing the bundled one so install_agent can wire it into the ConfigMap.
+install_redis() {
+    ensure_namespace "$NAMESPACE"
+
+    if [ -n "$REDIS_ADDR" ]; then
+        step "Using external Redis at ${REDIS_ADDR} (skipping bundled install)"
+        ensure_redis_secret false  # external server owns the password; never invent one
+        return 0
+    fi
+
+    step "Installing Redis dedup backend in namespace '${NAMESPACE}'"
+    ensure_redis_secret true  # must exist before the Deployment starts (requirepass)
+
+    # redis.yaml is namespaced to ai-remediator; retarget it if NAMESPACE differs.
+    if [ "$NAMESPACE" = "ai-remediator" ]; then
+        run kubectl apply -f "${DEPLOY_DIR}/redis.yaml"
+    elif [ "$DRY_RUN" = true ]; then
+        printf '%s    [dry-run] retarget redis.yaml to namespace %s%s\n' "$DIM" "$NAMESPACE" "$RESET"
+    else
+        sed "s/namespace: ai-remediator/namespace: ${NAMESPACE}/g" "${DEPLOY_DIR}/redis.yaml" | kubectl apply -f -
+    fi
+
+    REDIS_ADDR="ai-remediator-redis:6379"
+
+    if [ "$DRY_RUN" = true ]; then
+        printf '%s    [dry-run] kubectl -n %s rollout status deployment/ai-remediator-redis%s\n' "$DIM" "$NAMESPACE" "$RESET"
+        return 0
+    fi
+    step "Waiting for Redis to be ready"
+    if ! kubectl -n "$NAMESPACE" rollout status deployment/ai-remediator-redis --timeout="$ROLLOUT_TIMEOUT"; then
+        warn "Redis did not become ready in ${ROLLOUT_TIMEOUT}."
+        kubectl -n "$NAMESPACE" get pods -l app.kubernetes.io/name=ai-remediator-redis || true
+        warn "If its PVC is Pending, the cluster has no default StorageClass — provide one, or pass --redis-addr to use an external Redis."
+        die "Redis is the required dedup backend; aborting."
+    fi
+}
+
 # --- RBAC + agent -----------------------------------------------------------
 install_agent() {
     step "Applying RBAC (cluster-wide ServiceAccount + ClusterRole + leases)"
@@ -228,9 +319,9 @@ install_agent() {
     info "Setting image to ${IMAGE}"
     run kubectl -n "$NAMESPACE" set image deployment/ai-remediator-agent "agent=${IMAGE}"
 
-    info "Setting OLLAMA_MODEL=${MODEL}, WEBUI_ENABLED=${ENABLE_WEBUI}, SCENARIO_SANDBOX_NAMESPACES=${SANDBOX_NS}"
+    info "Setting OLLAMA_MODEL=${MODEL}, WEBUI_ENABLED=${ENABLE_WEBUI}, SCENARIO_SANDBOX_NAMESPACES=${SANDBOX_NS}, DEDUP_BACKEND=redis, REDIS_ADDR=${REDIS_ADDR}"
     run kubectl -n "$NAMESPACE" patch configmap ai-remediator-config --type merge \
-        -p "{\"data\":{\"OLLAMA_MODEL\":\"${MODEL}\",\"OLLAMA_BASE_URL\":\"http://ollama.${OLLAMA_NAMESPACE}.svc.cluster.local:11434/api\",\"WEBUI_ENABLED\":\"${ENABLE_WEBUI}\",\"SCENARIO_SANDBOX_NAMESPACES\":\"${SANDBOX_NS}\"}}"
+        -p "{\"data\":{\"OLLAMA_MODEL\":\"${MODEL}\",\"OLLAMA_BASE_URL\":\"http://ollama.${OLLAMA_NAMESPACE}.svc.cluster.local:11434/api\",\"WEBUI_ENABLED\":\"${ENABLE_WEBUI}\",\"SCENARIO_SANDBOX_NAMESPACES\":\"${SANDBOX_NS}\",\"DEDUP_BACKEND\":\"redis\",\"REDIS_ADDR\":\"${REDIS_ADDR}\"}}"
 
     if [ "$ENABLE_WEBUI" = true ]; then
         if [ -z "$WEBUI_PASSWORD" ]; then
@@ -287,6 +378,8 @@ summary() {
     [ "$DRY_RUN" = true ] && { step "Dry-run complete — no changes were made."; return 0; }
     step "Done."
     info "Agent:   deployment/ai-remediator-agent in namespace ${NAMESPACE}"
+    info "Dedup:   Redis backend at ${REDIS_ADDR}"
+    [ "${REDIS_PASSWORD_GENERATED:-false}" = true ] && info "         (random password stored in Secret ai-remediator-redis, key 'password')"
     info "Metrics: kubectl -n ${NAMESPACE} port-forward deploy/ai-remediator-agent 9090:9090  ->  http://localhost:9090/metrics"
     if [ "$ENABLE_WEBUI" = true ]; then
         info "Admin GUI: kubectl -n ${NAMESPACE} port-forward svc/ai-remediator-webui 8080:80  ->  http://localhost:8080"
@@ -299,7 +392,7 @@ summary() {
 # --- uninstall --------------------------------------------------------------
 uninstall() {
     step "Uninstalling ai-remediator"
-    warn "This deletes namespace '${NAMESPACE}', the cluster RBAC, and (if present) '${SANDBOX_NS}'."
+    warn "This deletes namespace '${NAMESPACE}' (including the bundled Redis and its PVC/dedup data), the cluster RBAC, and (if present) '${SANDBOX_NS}'."
     run kubectl delete -f "${DEPLOY_DIR}/rbac-cluster.yaml" --ignore-not-found
     run kubectl delete clusterrole ai-remediator-webui-rbac-admin --ignore-not-found
     run kubectl delete clusterrolebinding ai-remediator-webui-rbac-admin --ignore-not-found
@@ -320,6 +413,7 @@ main() {
     preflight
     build_image
     install_ollama
+    install_redis
     install_agent
     install_scenarios
     rollout_and_verify

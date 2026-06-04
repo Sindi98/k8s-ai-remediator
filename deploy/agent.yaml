@@ -15,7 +15,11 @@
 ## WEBUI_USERNAME/PASSWORD via the Secret to expose it.
 ##
 ##   kubectl apply -f rbac-namespaced.yaml
+##   kubectl apply -f redis.yaml      # required: dedup backend (DEDUP_BACKEND=redis)
 ##   kubectl apply -f agent.yaml
+##
+## Redis is the default dedup backend. Apply redis.yaml before (or together
+## with) agent.yaml, or just run scripts/install.sh which wires it up for you.
 ##
 ## After the rollout, point your browser at https://<ingress-host>/ and log in
 ## with the basic-auth credentials from the Secret.
@@ -46,7 +50,15 @@ data:
   ALLOW_PATCH_RESOURCES: "false"
   ALLOW_PATCH_REGISTRY: "false"
   EXCLUDE_NAMESPACES: "kube-system,kube-public,kube-node-lease,local-path-storage,ai-remediator"
-  DEDUP_BACKEND: "memory"
+  # Redis is the default (and recommended) dedup backend: it keeps the
+  # "already seen / already remediated" state across agent restarts and
+  # leader failovers, so a restart cannot re-fire a remediation within the
+  # dedup TTL. Deploy it with `kubectl apply -f redis.yaml` (or via
+  # scripts/install.sh, which does it automatically). To point at an
+  # external Redis, change REDIS_ADDR. If Redis is unreachable the agent
+  # logs an error and falls back to in-memory dedup (never blocks).
+  DEDUP_BACKEND: "redis"
+  REDIS_ADDR: "ai-remediator-redis:6379"
   LEADER_ELECTION: "true"
   LEASE_NAME: "ai-remediator-leader"
   LEASE_NAMESPACE: "ai-remediator"
@@ -116,6 +128,17 @@ spec:
                 name: ai-remediator-config
             - secretRef:
                 name: ai-remediator-secrets
+          env:
+            # Redis password for the dedup backend. Sourced from the
+            # ai-remediator-redis Secret created alongside redis.yaml. Marked
+            # optional so an empty/absent Secret means an unauthenticated
+            # Redis the agent connects to without a password.
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ai-remediator-redis
+                  key: password
+                  optional: true
           ports:
             - name: metrics
               containerPort: 9090

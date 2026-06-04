@@ -79,7 +79,7 @@ Agente AI in Go che osserva eventi Kubernetes di tipo `Warning` e applica remedi
 
 Quando l'evento riguarda un Pod, l'agente risale al Deployment tramite `ownerReferences` (Pod -> ReplicaSet -> Deployment).
 
-Il dedup store e pluggabile: di default `memory` (in-process, si azzera al restart), opzionalmente Redis per sopravvivere ai restart del pod (vedi [Backend di deduplicazione](#backend-di-deduplicazione)). Su outage di Redis lo store fallisce aperto: l'agente torna a comportarsi come con dedup in-memory, non blocca mai la remediation.
+Il dedup store e pluggabile: di default `redis` (predefinito nel deployment e installato da `scripts/install.sh`, sopravvive ai restart del pod), con `memory` (in-process, si azzera al restart) come fallback (vedi [Backend di deduplicazione](#backend-di-deduplicazione)). Su outage di Redis lo store fallisce aperto: l'agente torna a comportarsi come con dedup in-memory, non blocca mai la remediation.
 
 ---
 
@@ -242,7 +242,7 @@ kubectl -n ai-remediator set image deploy/ai-remediator-redis \
 ## Installazione su Kubernetes
 
 Il modo consigliato è lo script **`scripts/install.sh`**: predispone tutto
-nell'ordine corretto (Ollama → RBAC → agente → GUI), è idempotente (puoi
+nell'ordine corretto (Ollama → Redis → RBAC → agente → GUI), è idempotente (puoi
 rilanciarlo senza errori) e verifica il rollout. Sotto trovi anche
 l'equivalente manuale a manifest.
 
@@ -268,9 +268,10 @@ scripts/install.sh --uninstall
 1. **Preflight** — verifica `kubectl` e che il cluster sia raggiungibile
 2. **`--build`** (opzionale) — `docker build` + `docker push` dell'immagine
 3. **Ollama** (default, salta con `--skip-ollama`) — Deployment + Service nel namespace `ollama` e `ollama pull` del modello
-4. **RBAC cluster-wide** — `deploy/rbac-cluster.yaml` (ServiceAccount + ClusterRole + Role per le lease). Necessario perché l'agente lista gli eventi di **tutti** i namespace in un'unica chiamata: un Role namespaced non basta
-5. **Agente** — `deploy/agent.yaml` (Namespace, ConfigMap, Secret, Deployment, Service); con GUI attiva applica anche `deploy/rbac-webui.yaml` e `deploy/rbac-scenarios.yaml`
-6. **Override** di immagine, modello e credenziali GUI, poi `rollout` e verifica (pod + log)
+4. **Redis** (obbligatorio, backend di dedup) — crea il Secret `ai-remediator-redis` (password casuale se non fornita), applica `deploy/redis.yaml` e ne attende il rollout. Con `--redis-addr host:port` salta il Redis bundled e punta a uno esterno
+5. **RBAC cluster-wide** — `deploy/rbac-cluster.yaml` (ServiceAccount + ClusterRole + Role per le lease). Necessario perché l'agente lista gli eventi di **tutti** i namespace in un'unica chiamata: un Role namespaced non basta
+6. **Agente** — `deploy/agent.yaml` (Namespace, ConfigMap, Secret, Deployment, Service); con GUI attiva applica anche `deploy/rbac-webui.yaml` e `deploy/rbac-scenarios.yaml`
+7. **Override** di immagine, modello, `DEDUP_BACKEND`/`REDIS_ADDR` e credenziali GUI, poi `rollout` e verifica (pod + log)
 
 **Flag principali** (default sensati; `scripts/install.sh --help` per l'elenco completo):
 
@@ -283,6 +284,8 @@ scripts/install.sh --uninstall
 | `--no-webui` | off | installa l'agente senza GUI (niente RBAC della GUI) |
 | `--webui-user` / `--webui-password` | `admin` / generata | credenziali di login della GUI |
 | `--sandbox-ns` | `incident-lab` | namespace abilitato agli scenari di guasto |
+| `--redis-addr` | *(vuoto)* | usa un Redis esterno (`host:port`) e salta quello bundled |
+| `--redis-password` | generata | password Redis (bundled o esterno); casuale se non impostata |
 | `--dry-run` / `--uninstall` | — | anteprima senza modifiche / rimozione di namespace e RBAC creati |
 
 > Se non passi `--webui-password`, lo script ne genera una casuale e la stampa
@@ -372,7 +375,7 @@ kubectl -n ollama exec deploy/ollama -- ollama list
 #### 2. Agente (manifest)
 
 I manifest in `deploy/` sono la fonte di verità: applicali nell'ordine
-namespace → RBAC → agente.
+namespace → RBAC → Redis → agente.
 
 ```bash
 # Namespace
@@ -385,7 +388,14 @@ kubectl apply -f deploy/rbac-cluster.yaml
 kubectl apply -f deploy/rbac-webui.yaml
 kubectl apply -f deploy/rbac-scenarios.yaml      # sandbox: namespace incident-lab
 
+# Redis (backend di dedup, obbligatorio): Secret password + Deployment + Service + PVC
+kubectl -n ai-remediator create secret generic ai-remediator-redis \
+  --from-literal=password="$(openssl rand -base64 32)"
+kubectl apply -f deploy/redis.yaml
+kubectl -n ai-remediator rollout status deployment/ai-remediator-redis --timeout=60s
+
 # Agente: Namespace + ConfigMap + Secret + Deployment + Service
+# (agent.yaml ha gia DEDUP_BACKEND=redis, REDIS_ADDR e REDIS_PASSWORD pre-cablati)
 kubectl apply -f deploy/agent.yaml
 
 # Personalizza immagine e password della GUI (il manifest ha un placeholder)
@@ -468,19 +478,28 @@ Tutte le variabili sono lette da environment (tipicamente via ConfigMap).
 
 ### Backend di deduplicazione
 
-Di default lo stato di dedup (eventi gia visti + segnali recenti) vive in memoria: semplice, zero-ops, ma **si perde al restart del pod**, quindi subito dopo un restart l'agente puo rimediare una seconda volta sullo stesso incidente. Il backend Redis persiste lo stato e rende la dedup condivisa tra restart (e, in futuro, tra piu repliche).
+**Redis è il backend di deduplicazione predefinito**: `deploy/agent.yaml` imposta `DEDUP_BACKEND=redis` e `scripts/install.sh` installa e configura Redis automaticamente. Redis persiste lo stato di dedup (eventi gia visti + segnali recenti) tra i restart del pod e i failover del leader, evitando che subito dopo un restart l'agente rimedi una seconda volta sullo stesso incidente. Il backend `memory` (in-process) resta come fallback: semplice e zero-ops, ma **si perde al restart del pod**.
 
 | Variabile | Default | Descrizione |
 |-----------|---------|-------------|
-| `DEDUP_BACKEND` | `memory` | Backend dello store di dedup. Valori: `memory` (in-process), `redis` (condiviso, sopravvive ai restart) |
-| `REDIS_ADDR` | *(vuoto)* | `host:port` di Redis. Obbligatorio se `DEDUP_BACKEND=redis` |
-| `REDIS_PASSWORD` | *(vuoto)* | Password Redis (tipicamente iniettata da un Secret). Lasciare vuota per Redis senza auth |
+| `DEDUP_BACKEND` | `redis` ¹ | Backend dello store di dedup. Valori: `redis` (predefinito nel deployment, condiviso, sopravvive ai restart), `memory` (in-process, fallback) |
+| `REDIS_ADDR` | `ai-remediator-redis:6379` ¹ | `host:port` di Redis. Obbligatorio se `DEDUP_BACKEND=redis` |
+| `REDIS_PASSWORD` | *(vuoto)* | Password Redis (iniettata dal Secret `ai-remediator-redis`). Lasciare vuota per Redis senza auth |
 | `REDIS_DB` | `0` | Numero del DB logico Redis |
 | `REDIS_KEY_PREFIX` | `k8s-remediator:` | Prefisso di tutte le chiavi scritte dall'agente. Utile per condividere un Redis con altri servizi |
+
+> ¹ Default impostato da `deploy/agent.yaml` e da `scripts/install.sh`. Il default a livello di binario (env var non impostata) resta `memory`/vuoto, pensato solo per run locali fuori dal cluster; in cluster la ConfigMap forza sempre `redis`.
 
 **Comportamento in caso di outage Redis**: lo store **fallisce aperto** (`MarkSeen` restituisce `fresh=true`, `IsSignalFresh` restituisce `false`). In pratica: se Redis e giu l'agente torna a comportarsi come con dedup in-memory (possibili duplicati), ma **non blocca mai la remediation**. All'avvio, se la connessione fallisce, l'agente fa fallback automatico a `memory` e logga un warning.
 
 #### Setup rapido del backend Redis
+
+`scripts/install.sh` esegue automaticamente tutti i passaggi seguenti (Redis è
+obbligatorio): crea il Secret della password, applica `deploy/redis.yaml`,
+attende il rollout e wira `DEDUP_BACKEND`/`REDIS_ADDR`/`REDIS_PASSWORD`
+sull'agente. Usa `--redis-addr host:port` per puntare a un Redis esterno
+saltando quello bundled. I comandi sotto servono per un'installazione manuale o
+per capire cosa fa lo script.
 
 Il manifest `deploy/redis.yaml` installa un Redis mono-istanza (Deployment + Service + PVC + NetworkPolicy, `redis:7.2-alpine`, AOF attivo, non-root, rootfs readonly):
 
@@ -518,11 +537,11 @@ kubectl -n ai-remediator logs deploy/ai-remediator-agent --tail=5 | grep 'dedup 
 ```
 
 > **Nota sulla NetworkPolicy**: il manifest ammette ingress dai pod con
-> label `app=ai-remediator` oppure `app.kubernetes.io/name=ai-remediator`
-> (rispettivamente: default di `kubectl create deployment` e convenzione
-> best-practice). Se il tuo agent usa label diverse o il CNI del cluster
-> non applica NetworkPolicy (Docker Desktop non le enforce di default),
-> rimuovi `networkpolicy/ai-remediator-redis` per evitare sorprese.
+> label `app=ai-remediator-agent` (quella reale impostata da `agent.yaml`),
+> piu `app=ai-remediator` e `app.kubernetes.io/name=ai-remediator` per
+> deployment manuali/`kubectl create`. Se il tuo agent usa label diverse o il
+> CNI del cluster non applica NetworkPolicy (Docker Desktop non le enforce di
+> default), rimuovi `networkpolicy/ai-remediator-redis` per evitare sorprese.
 
 **Verifica lato Redis**:
 
@@ -533,11 +552,12 @@ kubectl -n ai-remediator exec deploy/ai-remediator-redis -- \
 # signal:<ns>|<kind>|<name>|<reason>   (TTL = DEDUPE_TTL_SECONDS)
 ```
 
-**Quando NON serve Redis**:
-- Se l'agente non si riavvia spesso e ti sta bene che dopo un restart una manciata di segnali venga rivalutata.
-- Se giri con `DRY_RUN=true` per osservazione.
+**Tornare al fallback `memory` (sconsigliato)**: imposta `DEDUP_BACKEND=memory`
+nella ConfigMap. Accettabile solo se l'agente non si riavvia spesso e ti sta
+bene che dopo un restart una manciata di segnali venga rivalutata, oppure se
+giri con `DRY_RUN=true` per sola osservazione.
 
-**Quando serve**:
+**Perche Redis e il default**:
 - In produzione con policy di auto-remediation attive (`ALLOW_PATCH_*`), dove un doppio `patch_resources` o un doppio `restart_deployment` dopo restart puo amplificare un incidente invece di risolverlo.
 - Se prevedi di scalare l'agente oltre una singola replica (richiede anche modifiche al loop, non coperte da questo step).
 
