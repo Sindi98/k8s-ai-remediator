@@ -190,9 +190,12 @@ noop, restart_deployment, delete_failed_pod, delete_and_recreate_pod, scale_depl
    - If snapshot "Allow-patch scopes" contains "resources" or "*":
        action=patch_resources, severity=high
        params: deployment_name, container,
-               memory_limit=<2x-8x current limit, at least 256Mi>,
-               memory_request=<half of limit>
+               memory_limit=<at least 512Mi; if 4x the current limit is
+                             larger, use that instead>,
+               memory_request=<half of the chosen limit>
    - Else: action=mark_for_manual_fix
+   Choose a limit with real headroom over the workload's allocation; a value
+   barely above the old limit just OOMs again.
    NEVER pick restart_deployment when OOMKilled is visible. The new pod
    hits the same limit and OOMs again.
 
@@ -261,7 +264,7 @@ Example B - OOMKilled with opt-in:
   → {"action":"patch_resources","severity":"high","confidence":0.95,
      "probable_cause":"Memory limit too low for workload allocation",
      "params":{"deployment_name":"app","container":"main",
-               "memory_limit":"256Mi","memory_request":"128Mi"}}
+               "memory_limit":"512Mi","memory_request":"256Mi"}}
 
 Example C - Failed to pull, valid image:
   Event reason: Failed; Message: Failed to pull image "busybox:1.36"

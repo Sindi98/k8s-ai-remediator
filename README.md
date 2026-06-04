@@ -762,8 +762,8 @@ Decisione presa
   Confidence: 1.00
   Parameters:
     container: app
-    memory_limit: 256Mi
-    memory_request: 128Mi
+    memory_limit: 512Mi
+    memory_request: 256Mi
 
 Situazione post intervento
   Azione applicata con successo.
@@ -1592,8 +1592,8 @@ container. Cause frequenti:
 | `deployment ... does not opt in to patch_probe (set annotation ai-remediator/allow-patch)` | Manca annotation sul Deployment | `kubectl annotate deployment X ai-remediator/allow-patch=probe` |
 | `probe field "failure_threshold" not an integer: parsing "x5"` | LLM ha emesso un moltiplicatore o espressione | Rifiuto corretto. Attendi il prossimo ciclo; il prompt ora richiede esplicitamente integer puri |
 | `cpu_request: quantity outside bounds` | Valore fuori `[10m, 8]` CPU o `[16Mi, 16Gi]` memoria | Rifiuto corretto. Alza i bounds in codice o fai manual fix |
-| `restart_deployment blocked: event reason=Unhealthy` | L'LLM ha proposto di riavviare un pod con probe flaky | Atteso. Attendi che l'LLM converga su `patch_probe` (se la annotation c'e) |
-| `restart_deployment blocked: pod status shows OOMKilled` | L'LLM ha proposto restart su un OOM | Atteso. Attendi `patch_resources` |
+| `restart_deployment blocked: event reason=Unhealthy` | L'LLM ha proposto di riavviare un pod con probe flaky | Atteso. Con l'opt-in `probe` attivo (`ALLOW_PATCH_PROBE=true` + annotation) l'agente auto-converte in `patch_probe`; altrimenti attende che l'LLM converga su `patch_probe` |
+| `restart_deployment blocked: pod status shows OOMKilled` | L'LLM ha proposto restart su un OOM | Atteso. Con l'opt-in `resources` attivo l'agente auto-converte in `patch_resources` (floor 512Mi); altrimenti attende `patch_resources` |
 | `scale_deployment blocked: event reason=FailedScheduling` | L'LLM ha proposto di scalare un pod che chiede troppe risorse | Atteso. Attendi `patch_resources` o `mark_for_manual_fix` |
 
 ### `roles ... forbidden: attempting to grant RBAC permissions not currently held` da "Apply RBAC"

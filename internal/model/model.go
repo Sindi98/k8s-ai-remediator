@@ -77,6 +77,24 @@ func AllActions() []Action {
 	}
 }
 
+// IsOperatorGated reports whether an action can only fire once an operator has
+// deliberately enabled it: a global feature flag (ALLOW_PATCH_* /
+// ALLOW_IMAGE_UPDATES), a per-Deployment opt-in annotation, and a confidence
+// threshold all guard these actions. Because those gates already encode
+// operator intent, the agent must NOT additionally drop them through the
+// MIN_SEVERITY noise filter: a weak local model that under-rates a genuinely
+// actionable incident (e.g. labelling a flaky-probe fix "low") would otherwise
+// have its remediation silently discarded before it ever runs. Read-only and
+// no-op actions stay subject to MIN_SEVERITY so real noise is still filtered.
+func (a Action) IsOperatorGated() bool {
+	switch a {
+	case ActionPatchProbe, ActionPatchResources, ActionPatchRegistry, ActionSetDeploymentImage:
+		return true
+	default:
+		return false
+	}
+}
+
 // Decision is the structured response from the LLM.
 type Decision struct {
 	Summary       string            `json:"summary"`

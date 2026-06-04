@@ -45,12 +45,23 @@ func executeDecision(
 	extra string,
 ) error {
 	if err := policy.MaybeBlockRestartOnProbeFailure(d, eventReason); err != nil {
-		return err
+		// Auto-escalation: a probe failure (reason Unhealthy) is never fixed by
+		// a restart. If the Deployment opts in to probe patching, relax the
+		// probe instead of rejecting the decision outright. Mirrors the OOM
+		// auto-escalation below.
+		if transformed, ok := tryAutoPatchProbeOnUnhealthy(ctx, cs, d, cfg); ok {
+			slog.Info("auto-escalation: restart_deployment → patch_probe (Unhealthy)",
+				"ns", transformed.Namespace, "deployment", transformed.Parameters["deployment_name"],
+				"container", transformed.Parameters["container"], "probe", transformed.Parameters["probe"])
+			d = transformed
+		} else {
+			return err
+		}
 	}
 	if err := policy.MaybeBlockRestartOnOOMKilled(d, extra); err != nil {
 		// Auto-escalation: if the Deployment opts in to resources patching,
 		// silently transform the rejected restart into a patch_resources
-		// with a safe 2x bump (floor 256Mi). This covers the common case
+		// with a safe 4x bump (floor 512Mi). This covers the common case
 		// where the LLM fails the "NEVER restart on OOMKilled" rule.
 		if transformed, ok := tryAutoPatchResourcesOnOOM(ctx, cs, d, cfg); ok {
 			slog.Info("auto-escalation: restart_deployment → patch_resources (OOMKilled)",
@@ -156,10 +167,10 @@ func executeDecision(
 // context is cancelled (e.g. on SIGTERM), allowing for graceful shutdown.
 // tryAutoPatchResourcesOnOOM converts a blocked restart_deployment into a
 // patch_resources when the target Deployment has the "resources" opt-in
-// annotation and the global flag is on. Uses a conservative 2x bump of
-// the current memory_limit (minimum 256Mi) so the retry has a realistic
-// chance of succeeding. Returns (transformed, true) on success,
-// (untouched, false) otherwise.
+// annotation and the global flag is on. Uses a 4x bump of the current
+// memory_limit (minimum 512Mi) so the retry has real headroom over the
+// allocation and does not immediately OOM again. Returns (transformed, true)
+// on success, (untouched, false) otherwise.
 func tryAutoPatchResourcesOnOOM(ctx context.Context, cs kubernetes.Interface, d model.Decision, cfg config.AgentConfig) (model.Decision, bool) {
 	if !cfg.AllowPatchResources {
 		return d, false
@@ -187,6 +198,13 @@ func tryAutoPatchResourcesOnOOM(ctx context.Context, cs kubernetes.Interface, d 
 
 	transformed := d
 	transformed.Action = model.ActionPatchResources
+	// The escalation is a deterministic, opt-in-gated policy transform, not an
+	// LLM guess: the confidence the model attached to the rejected restart is
+	// irrelevant, so lift it to the patch threshold and let the real gates
+	// (global flag + annotation) decide.
+	if transformed.Confidence < cfg.PatchConfidenceThreshold {
+		transformed.Confidence = cfg.PatchConfidenceThreshold
+	}
 	if transformed.Parameters == nil {
 		transformed.Parameters = map[string]string{}
 	}
@@ -196,22 +214,95 @@ func tryAutoPatchResourcesOnOOM(ctx context.Context, cs kubernetes.Interface, d 
 	return transformed, true
 }
 
-// computeBumpedMemoryLimit returns a safe "next step" memory limit: 2x the
-// current value (or 256Mi when the current is unset or smaller), capped at
+// tryAutoPatchProbeOnUnhealthy converts a blocked restart_deployment into a
+// patch_probe when the source event was a probe failure (reason Unhealthy)
+// and the target Deployment opts in to "probe" patching. Restarting never
+// fixes a readiness/liveness probe that is too strict for a workload's natural
+// readiness flapping — the replacement pod flaps in exactly the same way.
+// Mirrors tryAutoPatchResourcesOnOOM so a weak local model that disobeys the
+// "NEVER restart on Unhealthy" rule still lands on the correct remediation:
+// the probe is relaxed (longer period, higher failure threshold) so brief
+// unready windows stop tripping it. Returns (transformed, true) on success,
+// (untouched, false) otherwise.
+func tryAutoPatchProbeOnUnhealthy(ctx context.Context, cs kubernetes.Interface, d model.Decision, cfg config.AgentConfig) (model.Decision, bool) {
+	if !cfg.AllowPatchProbe {
+		return d, false
+	}
+
+	depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName, d.Parameters)
+	if err != nil {
+		return d, false
+	}
+
+	dep, err := cs.AppsV1().Deployments(d.Namespace).Get(ctx, depName, metav1.GetOptions{})
+	if err != nil {
+		return d, false
+	}
+	if !kube.DeploymentAllowsPatch(dep, "probe") {
+		return d, false
+	}
+
+	// Find a container with a probe to relax, preferring readiness since it
+	// governs Service membership and is the usual source of Unhealthy noise.
+	container, probe := "", ""
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		if c.ReadinessProbe != nil {
+			container, probe = c.Name, "readiness"
+			break
+		}
+	}
+	if probe == "" {
+		for _, c := range dep.Spec.Template.Spec.Containers {
+			if c.LivenessProbe != nil {
+				container, probe = c.Name, "liveness"
+				break
+			}
+		}
+	}
+	if probe == "" {
+		return d, false
+	}
+
+	transformed := d
+	transformed.Action = model.ActionPatchProbe
+	if transformed.Confidence < cfg.PatchConfidenceThreshold {
+		transformed.Confidence = cfg.PatchConfidenceThreshold
+	}
+	if transformed.Parameters == nil {
+		transformed.Parameters = map[string]string{}
+	}
+	transformed.Parameters["deployment_name"] = depName
+	transformed.Parameters["container"] = container
+	transformed.Parameters["probe"] = probe
+	// Tolerant defaults: 6 consecutive failures at a 15s period means ~90s of
+	// continuous unreadiness before the pod leaves the Service, well above the
+	// short flaps that generate the Unhealthy noise.
+	transformed.Parameters["failure_threshold"] = "6"
+	transformed.Parameters["period_seconds"] = "15"
+	transformed.Parameters["timeout_seconds"] = "5"
+	return transformed, true
+}
+
+// computeBumpedMemoryLimit returns a safe "next step" memory limit: 4x the
+// current value (or 512Mi when the current is unset or smaller), capped at
 // the package-wide MaxMemoryQuantity so the subsequent validator does not
-// reject it.
+// reject it. The 512Mi floor leaves real headroom over a workload that was
+// OOMKilled near a small limit (e.g. a container touching ~256MB under a
+// 32Mi limit): a value only marginally above the old limit just OOMs again,
+// which is exactly why a 256Mi target failed to resolve the memory-hog
+// scenario reliably.
 func computeBumpedMemoryLimit(current resource.Quantity) string {
-	floor := resource.MustParse("256Mi")
+	floor := resource.MustParse("512Mi")
 	var target resource.Quantity
 	if current.IsZero() {
 		target = floor
 	} else {
-		doubled := current.DeepCopy()
-		doubled.Set(current.Value() * 2)
-		if doubled.Cmp(floor) < 0 {
+		bumped := current.DeepCopy()
+		bumped.Set(current.Value() * 4)
+		if bumped.Cmp(floor) < 0 {
 			target = floor
 		} else {
-			target = doubled
+			target = bumped
 		}
 	}
 	if target.Cmp(kube.MaxMemoryQuantity) > 0 {
@@ -311,7 +402,7 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 		"ollamaHTTPTimeoutSec", cfg.OllamaHTTPTimeoutSec,
 		"pollContextTimeoutSec", cfg.PollContextTimeoutSec,
 		"metricsAddr", cfg.MetricsAddr,
-		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry",
+		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry,auto-escalate-oom,auto-escalate-unhealthy,severity-exempt-optin",
 	)
 
 	ticker := time.NewTicker(time.Duration(cfg.PollSec) * time.Second)
@@ -460,7 +551,13 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 				"params", d.Parameters,
 			)
 
-			if !severity.MeetsMinimum(minSev) {
+			// MIN_SEVERITY is a noise filter. Opt-in actions (patch_*,
+			// set_deployment_image) are exempt: they already pass stricter,
+			// operator-controlled gates (global flag + per-Deployment annotation
+			// + confidence threshold), so a weak model that under-rates a
+			// genuinely actionable incident — e.g. tagging a flaky-probe fix
+			// "low" — must not have its remediation silently discarded here.
+			if !severity.MeetsMinimum(minSev) && !d.Action.IsOperatorGated() {
 				slog.Info("skipping decision below minimum severity",
 					"severity", string(severity),
 					"minSeverity", string(minSev),
