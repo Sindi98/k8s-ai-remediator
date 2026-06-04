@@ -5,12 +5,17 @@
 ## Redis goes down the agent fails open (may re-apply a remediation) but
 ## will never block event processing.
 ##
-## Usage:
+## scripts/install.sh applies this automatically (Redis is the default dedup
+## backend) and creates the password Secret for you. The steps below are for a
+## manual install; agent.yaml already wires DEDUP_BACKEND=redis,
+## REDIS_ADDR=ai-remediator-redis:6379 and REDIS_PASSWORD from the Secret.
+##
+## Manual usage:
 ##   1. (optional) create a password Secret:
 ##        kubectl -n ai-remediator create secret generic ai-remediator-redis \
 ##          --from-literal=password="$(openssl rand -base64 32)"
 ##   2. kubectl apply -f redis.yaml
-##   3. configure the agent Deployment with:
+##   3. (only if you changed the manifest) set on the agent Deployment:
 ##        DEDUP_BACKEND=redis
 ##        REDIS_ADDR=ai-remediator-redis:6379
 ##        REDIS_PASSWORD (valueFrom the Secret above, optional)
@@ -124,10 +129,10 @@ spec:
 
 ---
 ## NetworkPolicy: restricts Redis ingress to agent pods in the same namespace.
-## Accepts both the "app.kubernetes.io/name=ai-remediator" label (manifest-
-## style deployments) and "app=ai-remediator" (kubectl create deployment
-## default). If you deploy the agent with a different label, drop this
-## NetworkPolicy or add your own matchExpressions here.
+## Accepts the agent's actual pod label "app=ai-remediator-agent" (set by
+## agent.yaml), plus "app.kubernetes.io/name=ai-remediator" and the bare
+## "app=ai-remediator" for manifest-/kubectl-style deployments. If you deploy
+## the agent with a different label, add it to the matchExpressions below.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -149,7 +154,7 @@ spec:
             matchExpressions:
               - key: app
                 operator: In
-                values: [ai-remediator]
+                values: [ai-remediator, ai-remediator-agent]
       ports:
         - protocol: TCP
           port: 6379

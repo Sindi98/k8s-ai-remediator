@@ -89,11 +89,14 @@ type AgentConfig struct {
 	NotifyMinSeverity string
 
 	// DedupBackend selects the dedup store implementation.
-	// Accepted values: "memory" (default, in-process) or "redis" (shared,
-	// survives pod restart).
+	// Accepted values: "redis" (default, shared, survives pod restart) or
+	// "memory" (in-process fallback). When "redis" is selected but Redis is
+	// unreachable, the agent logs a warning and falls back to memory at
+	// startup, so the default never hard-fails an out-of-cluster run.
 	DedupBackend string
 	// RedisAddr is the host:port of the Redis instance used when
-	// DedupBackend=redis. Ignored otherwise.
+	// DedupBackend=redis. Defaults to the in-cluster Service name
+	// "ai-remediator-redis:6379" (deploy/redis.yaml). Ignored otherwise.
 	RedisAddr string
 	// RedisPassword is read from REDIS_PASSWORD (typically mounted from a
 	// Secret). Leave empty for unauthenticated Redis.
@@ -170,8 +173,8 @@ func LoadFromEnv() AgentConfig {
 		NotifyFrom:               Getenv("NOTIFY_FROM", ""),
 		NotifyTo:                 Getenv("NOTIFY_TO", ""),
 		NotifyMinSeverity:        Getenv("NOTIFY_MIN_SEVERITY", "medium"),
-		DedupBackend:             Getenv("DEDUP_BACKEND", "memory"),
-		RedisAddr:                Getenv("REDIS_ADDR", ""),
+		DedupBackend:             Getenv("DEDUP_BACKEND", "redis"),
+		RedisAddr:                Getenv("REDIS_ADDR", "ai-remediator-redis:6379"),
 		RedisPassword:            Getenv("REDIS_PASSWORD", ""),
 		RedisDB:                  Getint("REDIS_DB", 0),
 		RedisKeyPrefix:           Getenv("REDIS_KEY_PREFIX", "k8s-remediator:"),
