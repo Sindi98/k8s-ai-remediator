@@ -205,3 +205,19 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 		t.Errorf("expected maxEventsPerPoll 10, got %d", cfg.MaxEventsPerPoll)
 	}
 }
+
+func TestLoadFromEnv_DedupDefaults(t *testing.T) {
+	// Redis is the default dedup backend; the address defaults to the
+	// in-cluster Service so a deployment that only sets DEDUP_BACKEND still
+	// connects. Out-of-cluster runs fall back to memory at startup.
+	for _, k := range []string{"DEDUP_BACKEND", "REDIS_ADDR"} {
+		os.Unsetenv(k)
+	}
+	cfg := LoadFromEnv()
+	if cfg.DedupBackend != "redis" {
+		t.Errorf("expected default DedupBackend=redis, got %q", cfg.DedupBackend)
+	}
+	if cfg.RedisAddr != "ai-remediator-redis:6379" {
+		t.Errorf("expected default RedisAddr=ai-remediator-redis:6379, got %q", cfg.RedisAddr)
+	}
+}

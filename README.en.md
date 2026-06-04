@@ -488,7 +488,7 @@ All variables are read from environment variables (typically via ConfigMap).
 | `REDIS_DB` | `0` | Redis logical DB number |
 | `REDIS_KEY_PREFIX` | `k8s-remediator:` | Prefix applied to every key the agent writes. Useful when sharing Redis with other services |
 
-> ¹ Default set by `deploy/agent.yaml` and `scripts/install.sh`. The binary-level default (when the env var is unset) stays `memory`/empty, intended only for local out-of-cluster runs; in-cluster the ConfigMap always forces `redis`.
+> ¹ This is the default at every level: code (`internal/config`), `deploy/agent.yaml` and `scripts/install.sh`. For local out-of-cluster runs without Redis, the agent automatically falls back to `memory` at startup (warning in the logs, never blocks remediation).
 
 **Behaviour during a Redis outage**: the store **fails open** (`MarkSeen` returns `fresh=true`, `IsSignalFresh` returns `false`). In practice: if Redis is down the agent behaves as if dedup were in-memory (possible duplicates), but **never blocks remediation**. If the initial connection fails at startup the agent automatically falls back to `memory` and logs a warning.
 
