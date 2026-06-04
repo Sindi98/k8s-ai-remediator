@@ -90,8 +90,11 @@ Effetto: il container passa da `memory_limit=32Mi` a `memory_limit=512Mi`.
 `polinux/stress` alloca ~256MB (≈244Mi): un limite di 256Mi (≈268MB) e troppo
 vicino all'allocazione e va spesso di nuovo in OOM, quindi lo scenario non si
 chiudeva in modo affidabile. 512Mi lascia margine reale → pod `Running` stabile.
-L'auto-escalation (restart bloccato su OOM → `patch_resources`) usa lo stesso
-floor di 512Mi.
+Il floor di 512Mi (4x il limite corrente, minimo 512Mi) e applicato a **ogni**
+`patch_resources` su un OOM — sia scelta diretta dell'LLM sia auto-escalation
+da un restart bloccato — quindi anche un `memory_limit` troppo basso proposto
+da un modello debole viene comunque alzato. Lo snapshot del Deployment ora
+include i limiti correnti, cosi l'LLM vede il valore da aumentare.
 
 ### severe-failedscheduling (patch_resources o astensione)
 Con opt-in attivo (`ai-remediator/allow-patch=resources`), ci si aspetta:
