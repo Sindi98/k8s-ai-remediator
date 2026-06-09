@@ -47,14 +47,24 @@ func (s *Server) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 	pass := r.FormValue("password")
 	next := sanitiseNext(r.FormValue("next"))
 
+	// Brute-force throttle: reject without even checking credentials when the
+	// client IP is locked out from too many recent failures.
+	ip := clientIP(r)
+	if !s.throttle.allowed(ip) {
+		http.Redirect(w, r, "/login?error=locked&next="+urlQueryEscape(next), http.StatusSeeOther)
+		return
+	}
+
 	expectedUser := []byte(s.opts.Username)
 	expectedPass := []byte(s.opts.Password)
 	userMatch := subtle.ConstantTimeCompare([]byte(user), expectedUser) == 1
 	passMatch := subtle.ConstantTimeCompare([]byte(pass), expectedPass) == 1
 	if !userMatch || !passMatch {
+		s.throttle.recordFailure(ip)
 		http.Redirect(w, r, "/login?error=invalid&next="+urlQueryEscape(next), http.StatusSeeOther)
 		return
 	}
+	s.throttle.recordSuccess(ip)
 
 	expiry := time.Now().Add(sessionTTL)
 	value := signSession(user, expiry, sessionKey(s.opts.Password))

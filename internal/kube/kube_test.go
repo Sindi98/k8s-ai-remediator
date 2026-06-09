@@ -101,6 +101,32 @@ func TestInferDeploymentFromPodName(t *testing.T) {
 	}
 }
 
+func TestInferDeploymentFromPodName_PrefersReplicaSetOwner(t *testing.T) {
+	// When the ReplicaSet still exists, its ownerReference is authoritative —
+	// even if the name-strip heuristic would land elsewhere.
+	cs := newFakeCluster(t) // RS "web-abc" owned by Deployment "web", pod "web-abc-123"
+	name, ok := InferDeploymentFromPodName(context.Background(), cs, "default", "web-abc-123")
+	if !ok || name != "web" {
+		t.Errorf("expected web via ReplicaSet ownerRef, got %q ok=%v", name, ok)
+	}
+}
+
+func TestInferDeploymentFromPodName_RejectsStandaloneReplicaSet(t *testing.T) {
+	// A ReplicaSet that exists but is NOT Deployment-owned must not be mapped
+	// onto a same-prefix Deployment: that is exactly the false positive the
+	// ownerRef check exists to prevent.
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: "default"},
+	}
+	rs := &appsv1.ReplicaSet{ // standalone RS, no Deployment owner
+		ObjectMeta: metav1.ObjectMeta{Name: "a-b", Namespace: "default"},
+	}
+	cs := fake.NewSimpleClientset(dep, rs)
+	if name, ok := InferDeploymentFromPodName(context.Background(), cs, "default", "a-b-c"); ok {
+		t.Errorf("expected not-ok for standalone ReplicaSet, got %q", name)
+	}
+}
+
 func TestResolveDeploymentFromPod_NotFound(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	_, err := ResolveDeploymentFromPod(context.Background(), cs, "default", "nonexistent")
@@ -222,6 +248,30 @@ func TestDeletePod_DryRun(t *testing.T) {
 	}
 	_, err := cs.CoreV1().Pods("default").Get(ctx, "web-abc-123", metav1.GetOptions{})
 	if err != nil {
+		t.Error("dry run should not delete pod")
+	}
+}
+
+func TestDeleteAndRecreatePod(t *testing.T) {
+	cs := newFakeCluster(t)
+	ctx := context.Background()
+
+	if err := DeleteAndRecreatePod(ctx, cs, "default", "web-abc-123", false); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := cs.CoreV1().Pods("default").Get(ctx, "web-abc-123", metav1.GetOptions{}); err == nil {
+		t.Error("pod should be force-deleted")
+	}
+}
+
+func TestDeleteAndRecreatePod_DryRun(t *testing.T) {
+	cs := newFakeCluster(t)
+	ctx := context.Background()
+
+	if err := DeleteAndRecreatePod(ctx, cs, "default", "web-abc-123", true); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := cs.CoreV1().Pods("default").Get(ctx, "web-abc-123", metav1.GetOptions{}); err != nil {
 		t.Error("dry run should not delete pod")
 	}
 }

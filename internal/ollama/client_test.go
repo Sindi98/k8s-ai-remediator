@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sindi98/k8s-ai-remediator/internal/model"
 )
@@ -208,7 +209,7 @@ func TestSetMetricsHooks_OnErrorPerAttempt(t *testing.T) {
 
 	var errHookCalls int32
 	client := NewClient(srv.URL, "test-model", 100, 1, false, 0)
-	client.SetMetricsHooks(nil, func() { atomic.AddInt32(&errHookCalls, 1) })
+	client.SetMetricsHooks(nil, func() { atomic.AddInt32(&errHookCalls, 1) }, nil)
 
 	if _, err := client.Decide(context.Background(), "test"); err == nil {
 		t.Fatal("expected error after exhausting retries")
@@ -231,7 +232,7 @@ func TestSetMetricsHooks_OnRateLimited(t *testing.T) {
 	// rps=2 with burst 1: the first call passes instantly, the second has to
 	// wait ~500ms for a token, which must trigger the rate-limited hook.
 	client := NewClient(srv.URL, "test-model", 2, 0, false, 0)
-	client.SetMetricsHooks(func() { atomic.AddInt32(&rlHookCalls, 1) }, nil)
+	client.SetMetricsHooks(func() { atomic.AddInt32(&rlHookCalls, 1) }, nil, nil)
 
 	for i := 0; i < 2; i++ {
 		if _, err := client.Decide(context.Background(), "test"); err != nil {
@@ -240,6 +241,28 @@ func TestSetMetricsHooks_OnRateLimited(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&rlHookCalls); got < 1 {
 		t.Errorf("expected onRateLimited to fire at least once, got %d", got)
+	}
+}
+
+func TestSetMetricsHooks_OnRequestPerAttempt(t *testing.T) {
+	// 5xx triggers retries; onRequest must fire once per HTTP attempt (not just
+	// on success) so remediator_ollama_requests_total counts real traffic.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("unavailable"))
+	}))
+	defer srv.Close()
+
+	var reqHookCalls int32
+	client := NewClient(srv.URL, "test-model", 100, 1, false, 0)
+	client.SetMetricsHooks(nil, nil, func(time.Duration) { atomic.AddInt32(&reqHookCalls, 1) })
+
+	if _, err := client.Decide(context.Background(), "test"); err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	// 1 initial attempt + 1 retry = 2 HTTP attempts → 2 request hook calls.
+	if got := atomic.LoadInt32(&reqHookCalls); got != 2 {
+		t.Errorf("expected onRequest to fire twice, got %d", got)
 	}
 }
 

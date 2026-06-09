@@ -123,6 +123,31 @@ func TestExecuteDecision_DeletePod(t *testing.T) {
 	}
 }
 
+func TestExecuteDecision_DeleteAndRecreatePod(t *testing.T) {
+	cs := newFakeCluster(t)
+	ctx := context.Background()
+
+	d := model.Decision{
+		Action: model.ActionDeleteAndRecreate, Namespace: "default",
+		ResourceKind: "Pod", ResourceName: "web-abc-123",
+	}
+	if err := executeDecision(ctx, cs, d, defaultCfg(), "", ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := cs.CoreV1().Pods("default").Get(ctx, "web-abc-123", metav1.GetOptions{}); err == nil {
+		t.Error("pod should have been deleted by delete_and_recreate_pod")
+	}
+
+	// Wrong kind must be rejected, like delete_failed_pod.
+	dWrong := model.Decision{
+		Action: model.ActionDeleteAndRecreate, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "web",
+	}
+	if err := executeDecision(ctx, cs, dWrong, defaultCfg(), "", ""); err == nil {
+		t.Error("delete_and_recreate_pod should require resource_kind=Pod")
+	}
+}
+
 func TestExecuteDecision_ScaleDeployment(t *testing.T) {
 	cs := newFakeCluster(t)
 	ctx := context.Background()

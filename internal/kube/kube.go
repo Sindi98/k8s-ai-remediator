@@ -73,13 +73,36 @@ func DeploymentAllowsPatch(dep *appsv1.Deployment, scope string) bool {
 // InferDeploymentFromPodName derives the parent Deployment name from the
 // Kubernetes naming convention `{deployment}-{replicaset-hash}-{pod-hash}`,
 // used as a fallback when the pod itself has already been deleted and
-// ownerReferences cannot be followed. The candidate is returned only if
-// a Deployment with that name still exists in the namespace.
+// ownerReferences cannot be followed.
+//
+// It first tries the authoritative path: reconstruct the ReplicaSet name
+// `{deployment}-{hash}` and, if that ReplicaSet still exists, trust its
+// ownerReference. This avoids mapping an unrelated standalone pod like
+// "a-b-c" onto a Deployment "a" that merely shares a name prefix. Only when
+// the ReplicaSet is also gone (e.g. rolled over) does it fall back to the
+// pure name heuristic, and even then only when a Deployment with the derived
+// name actually exists.
 func InferDeploymentFromPodName(ctx context.Context, cs kubernetes.Interface, ns, podName string) (string, bool) {
 	parts := strings.Split(podName, "-")
 	if len(parts) < 3 {
 		return "", false
 	}
+
+	// Preferred: follow the ReplicaSet ownerReference when the RS still exists.
+	rsName := strings.Join(parts[:len(parts)-1], "-")
+	if rs, err := cs.AppsV1().ReplicaSets(ns).Get(ctx, rsName, metav1.GetOptions{}); err == nil {
+		for _, owner := range rs.OwnerReferences {
+			if owner.Kind == "Deployment" {
+				return owner.Name, true
+			}
+		}
+		// The ReplicaSet exists but is not Deployment-owned: this pod is not a
+		// Deployment child, so decline rather than guess.
+		return "", false
+	}
+
+	// Fallback: the ReplicaSet is gone too. Rely on the naming convention, but
+	// only when a Deployment with the derived name actually exists.
 	candidate := strings.Join(parts[:len(parts)-2], "-")
 	if _, err := cs.AppsV1().Deployments(ns).Get(ctx, candidate, metav1.GetOptions{}); err != nil {
 		return "", false
@@ -174,12 +197,28 @@ func RestartDeployment(ctx context.Context, cs kubernetes.Interface, ns, name st
 	})
 }
 
-// DeletePod removes a pod, relying on the controller to recreate it.
+// DeletePod removes a pod gracefully (default termination grace period),
+// relying on the controller to recreate it.
 func DeletePod(ctx context.Context, cs kubernetes.Interface, ns, name string, dryRun bool) error {
 	if dryRun {
 		return nil
 	}
 	return cs.CoreV1().Pods(ns).Delete(ctx, name, metav1.DeleteOptions{})
+}
+
+// DeleteAndRecreatePod force-deletes a pod with a zero grace period so the
+// controller recreates it immediately. Unlike DeletePod (a graceful delete
+// that lets the kubelet run the full termination sequence), this is the right
+// choice when the pod must be replaced from scratch — e.g. it is wedged in a
+// state that a graceful shutdown will not clear. Recreation is still owned by
+// the controller (ReplicaSet/StatefulSet); "recreate" here means "do not wait
+// for graceful termination".
+func DeleteAndRecreatePod(ctx context.Context, cs kubernetes.Interface, ns, name string, dryRun bool) error {
+	if dryRun {
+		return nil
+	}
+	grace := int64(0)
+	return cs.CoreV1().Pods(ns).Delete(ctx, name, metav1.DeleteOptions{GracePeriodSeconds: &grace})
 }
 
 // ScaleDeployment adjusts replica count within the given policy bounds.
@@ -271,7 +310,9 @@ func parseProbeField(key, raw string) (int32, error) {
 	if err != nil {
 		return 0, fmt.Errorf("probe field %q not an integer: %v", key, err)
 	}
-	if int32(n) < bounds[0] || int32(n) > bounds[1] {
+	// Compare as int: casting an out-of-int32 value (e.g. "4294967301") would
+	// silently wrap into the valid range and pass the bounds check.
+	if n < int(bounds[0]) || n > int(bounds[1]) {
 		return 0, fmt.Errorf("probe field %q=%d outside bounds [%d,%d]", key, n, bounds[0], bounds[1])
 	}
 	return int32(n), nil
@@ -621,16 +662,30 @@ func InspectPodLogs(ctx context.Context, cs kubernetes.Interface, ns, kind, name
 		return fmt.Errorf("cannot read current or previous logs for container %s: current=%v previous=%v", container, curErr, prevErr)
 	}
 
-	slog.Info("inspect_pod_logs", "ns", ns, "pod", podName, "container", container)
+	// Summary at INFO; full bodies only at DEBUG. Pod logs can contain secrets
+	// (tokens, connection strings) and shipping arbitrary workload logs into
+	// the agent's own structured logs — and from there the central logging
+	// stack — is a data-exposure risk. Operators who need the content can lower
+	// the agent log level to debug.
+	slog.Info("inspect_pod_logs", "ns", ns, "pod", podName, "container", container,
+		"current_lines", countLines(current), "previous_lines", countLines(previous))
 
 	if current != "" {
-		slog.Info("pod logs (current)", "ns", ns, "pod", podName, "container", container, "logs", current)
+		slog.Debug("pod logs (current)", "ns", ns, "pod", podName, "container", container, "logs", current)
 	}
 	if previous != "" {
-		slog.Info("pod logs (previous)", "ns", ns, "pod", podName, "container", container, "logs", previous)
+		slog.Debug("pod logs (previous)", "ns", ns, "pod", podName, "container", container, "logs", previous)
 	}
 
 	return nil
+}
+
+// countLines returns the number of newline-separated lines in s (0 for empty).
+func countLines(s string) int {
+	if s == "" {
+		return 0
+	}
+	return strings.Count(s, "\n") + 1
 }
 
 // DeploymentToText produces a human-readable summary of a deployment,

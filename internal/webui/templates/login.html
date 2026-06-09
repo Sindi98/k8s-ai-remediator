@@ -15,6 +15,9 @@
     {{if eq .Error "invalid"}}
       <div class="login-error">Invalid username or password.</div>
     {{end}}
+    {{if eq .Error "locked"}}
+      <div class="login-error">Too many failed attempts. Try again later.</div>
+    {{end}}
     <form method="post" action="/login" class="form">
       <input type="hidden" name="next" value="{{.Next}}">
       <label>Username

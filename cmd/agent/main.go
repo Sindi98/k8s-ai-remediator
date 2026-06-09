@@ -98,9 +98,17 @@ func executeDecision(
 		}
 		return kube.RestartDeployment(ctx, cs, d.Namespace, depName, cfg.DryRun)
 
-	case model.ActionDeleteFailedPod, model.ActionDeleteAndRecreate:
+	case model.ActionDeleteFailedPod:
 		if strings.EqualFold(d.ResourceKind, "Pod") {
 			return kube.DeletePod(ctx, cs, d.Namespace, d.ResourceName, cfg.DryRun)
+		}
+		return fmt.Errorf("%s requires resource_kind=Pod", d.Action)
+
+	case model.ActionDeleteAndRecreate:
+		// Distinct from delete_failed_pod: force-delete (zero grace period) so a
+		// pod wedged in termination is replaced from scratch immediately.
+		if strings.EqualFold(d.ResourceKind, "Pod") {
+			return kube.DeleteAndRecreatePod(ctx, cs, d.Namespace, d.ResourceName, cfg.DryRun)
 		}
 		return fmt.Errorf("%s requires resource_kind=Pod", d.Action)
 
@@ -419,26 +427,10 @@ func canonicalReason(reason, message string) string {
 	return trimmed
 }
 
-func runLoop(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder, notifier notify.Notifier, recorder *webui.RecentDecisionRecorder) {
-	store, err := dedup.NewStore(dedup.BackendConfig{
-		Backend:        cfg.DedupBackend,
-		RedisAddr:      cfg.RedisAddr,
-		RedisPassword:  cfg.RedisPassword,
-		RedisDB:        cfg.RedisDB,
-		RedisKeyPrefix: cfg.RedisKeyPrefix,
-	})
-	if err != nil {
-		slog.Error("dedup store init failed, falling back to in-memory", "error", err)
-		store = dedup.NewMemoryStore()
-	} else {
-		slog.Info("dedup store initialised", "backend", cfg.DedupBackend)
-	}
-	runLoopWithStore(ctx, cs, ollamaClient, cfg, m, notifier, store, recorder)
-}
-
-// runLoopWithStore is the injectable form of runLoop: tests and future
-// alternative backends (Redis, SQLite, ConfigMap) can pass a custom Store
-// so dedup state survives across agent restarts.
+// runLoopWithStore runs the event polling loop against an injected dedup
+// Store. The store is owned by the caller (created once in main and reused
+// across leader re-elections) so a flapping lease never leaks a Redis
+// connection pool. Tests pass a custom Store to exercise dedup behaviour.
 func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder, notifier notify.Notifier, cache dedup.Store, recorder *webui.RecentDecisionRecorder) {
 
 	dedupeTTL := time.Duration(cfg.DedupeTTLSec) * time.Second
@@ -489,7 +481,9 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 		pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
 		defer cancel()
 
-		list, err := cs.CoreV1().Events("").List(pollCtx, metav1.ListOptions{})
+		// Ask the API server for Warning events only: on a busy cluster this
+		// avoids transferring (and dedup-marking) every Normal event each poll.
+		list, err := cs.CoreV1().Events("").List(pollCtx, metav1.ListOptions{FieldSelector: "type=Warning"})
 		if err != nil {
 			slog.Error("list events failed", "error", err)
 			return
@@ -500,17 +494,15 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 
 		processed := 0
 		for _, e := range list.Items {
-			key := e.Namespace + "/" + e.Name + "/" + e.ResourceVersion
-			if !cache.MarkSeen(key, now, seenTTL) {
-				m.EventsSkipped.Add(1)
-				continue
-			}
-
+			// Cheap in-memory filters first, before any dedup-store round trip:
+			// non-Warning events (defence in depth — the List already
+			// field-selects type=Warning) and namespaces outside the configured
+			// scope. This keeps a persistent dedup backend (Redis SetNX) from
+			// being hit once per cluster-wide event.
 			if !strings.EqualFold(e.Type, "Warning") {
 				m.EventsSkipped.Add(1)
 				continue
 			}
-
 			// Namespace filter: skip kube-system and friends, plus anything
 			// not in the include allowlist when present.
 			if exclude[e.Namespace] {
@@ -518,6 +510,12 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 				continue
 			}
 			if len(include) > 0 && !include[e.Namespace] {
+				m.EventsSkipped.Add(1)
+				continue
+			}
+
+			key := e.Namespace + "/" + e.Name + "/" + e.ResourceVersion
+			if !cache.MarkSeen(key, now, seenTTL) {
 				m.EventsSkipped.Add(1)
 				continue
 			}
@@ -582,10 +580,7 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 				extra,
 			)
 
-			start := time.Now()
 			d, err := ollamaClient.Decide(pollCtx, prompt)
-			duration := time.Since(start)
-
 			if err != nil {
 				m.DecisionErrors.Add(1)
 				slog.Error("ollama decision failed",
@@ -593,7 +588,8 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 				continue
 			}
 
-			m.RecordOllamaLatency(duration)
+			// Latency/request counters are recorded per HTTP attempt inside the
+			// Ollama client via the onRequest metric hook (wired in main).
 			m.RecordDecision(string(d.Action))
 
 			if d.Namespace == "" {
@@ -717,12 +713,14 @@ func main() {
 	ollamaClient := ollama.NewClient(cfg.BaseURL, cfg.Model, cfg.OllamaRPS, cfg.OllamaMaxRetries, cfg.OllamaTLSSkipVerify, cfg.OllamaHTTPTimeoutSec)
 	m := metrics.New()
 
-	// Wire the Ollama client's rate-limit and error counters into the metrics
-	// recorder so remediator_ollama_rate_limited_total and
-	// remediator_ollama_errors_total reflect real traffic instead of staying 0.
+	// Wire the Ollama client's metric hooks into the recorder. onRequest fires
+	// once per HTTP attempt with its latency, so remediator_ollama_requests_total
+	// and the average-latency gauge count real per-attempt traffic (not just
+	// successes) and stay consistent with remediator_ollama_errors_total.
 	ollamaClient.SetMetricsHooks(
 		func() { m.OllamaRateLimited.Add(1) },
 		func() { m.OllamaErrors.Add(1) },
+		func(d time.Duration) { m.RecordOllamaLatency(d) },
 	)
 
 	notifier := notify.New(notify.SMTPConfig{
@@ -802,8 +800,28 @@ func main() {
 		}
 	}
 
+	// Dedup store: created once and reused across leader re-elections so a
+	// flapping lease never leaks a Redis connection pool (and in-memory dedup
+	// state survives within the process). Closed on shutdown.
+	store, err := dedup.NewStore(dedup.BackendConfig{
+		Backend:        cfg.DedupBackend,
+		RedisAddr:      cfg.RedisAddr,
+		RedisPassword:  cfg.RedisPassword,
+		RedisDB:        cfg.RedisDB,
+		RedisKeyPrefix: cfg.RedisKeyPrefix,
+	})
+	if err != nil {
+		slog.Error("dedup store init failed, falling back to in-memory", "error", err)
+		store = dedup.NewMemoryStore()
+	} else {
+		slog.Info("dedup store initialised", "backend", cfg.DedupBackend)
+	}
+	if closer, ok := store.(interface{ Close() error }); ok {
+		defer func() { _ = closer.Close() }()
+	}
+
 	run := func(ctx context.Context) {
-		runLoop(ctx, cs, ollamaClient, cfg, m, notifier, decisionRecorder)
+		runLoopWithStore(ctx, cs, ollamaClient, cfg, m, notifier, store, decisionRecorder)
 	}
 
 	if cfg.LeaderElection {

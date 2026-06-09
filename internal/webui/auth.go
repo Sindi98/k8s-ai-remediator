@@ -86,6 +86,17 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 	expectedPass := []byte(s.opts.Password)
 	key := sessionKey(s.opts.Password)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// CSRF defence-in-depth: reject cross-site state-changing requests.
+		// Modern browsers send Sec-Fetch-Site; when absent (curl/older clients)
+		// we allow, so basic-auth scripting keeps working. Combined with the
+		// SameSite=Lax session cookie this blocks classic CSRF on mutating
+		// endpoints.
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+			if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+				http.Error(w, "cross-site request blocked", http.StatusForbidden)
+				return
+			}
+		}
 		if c, err := r.Cookie(sessionCookie); err == nil {
 			if user := verifySession(c.Value, key, time.Now()); user != "" {
 				next.ServeHTTP(w, r)
@@ -93,12 +104,19 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			}
 		}
 		if u, p, ok := r.BasicAuth(); ok {
+			ip := clientIP(r)
+			if !s.throttle.allowed(ip) {
+				http.Error(w, "too many failed attempts, try again later", http.StatusTooManyRequests)
+				return
+			}
 			userMatch := subtle.ConstantTimeCompare([]byte(u), expectedUser) == 1
 			passMatch := subtle.ConstantTimeCompare([]byte(p), expectedPass) == 1
 			if userMatch && passMatch {
+				s.throttle.recordSuccess(ip)
 				next.ServeHTTP(w, r)
 				return
 			}
+			s.throttle.recordFailure(ip)
 		}
 		s.unauthorized(w, r)
 	})
