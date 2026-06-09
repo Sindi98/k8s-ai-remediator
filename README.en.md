@@ -572,8 +572,8 @@ with a handful of signals being re-evaluated afterwards, or if you run with
 | `mark_for_manual_fix` | Passive | Marks the resource as not automatically resolvable |
 | `inspect_pod_logs` | Read-only | Reads current and previous logs of the container with the most restarts |
 | `restart_deployment` | Mutation | Forces a rollout by updating the pod template annotation |
-| `delete_failed_pod` | Mutation | Deletes the pod; the controller recreates it |
-| `delete_and_recreate_pod` | Mutation | Same as above, used when the pod needs to be recreated from scratch |
+| `delete_failed_pod` | Mutation | Deletes the pod (graceful termination); the controller recreates it |
+| `delete_and_recreate_pod` | Mutation | Force-delete (grace period 0): immediately replaces a pod stuck terminating, used when it must be recreated from scratch |
 | `scale_deployment` | Mutation | Updates `spec.replicas` within `SCALE_MIN`/`SCALE_MAX` bounds |
 | `set_deployment_image` | Mutation | Updates the container image (requires `ALLOW_IMAGE_UPDATES=true`, confidence above threshold, valid OCI image) |
 | `patch_probe` | Mutation (patch) | Tunes readiness/liveness probe timing fields (`initialDelaySeconds`, `periodSeconds`, `failureThreshold`, `successThreshold`, `timeoutSeconds`). Never the probe handler |
@@ -868,7 +868,7 @@ kubectl -n ai-remediator expose deployment ai-remediator-agent \
    - `scale_deployment` and `restart_deployment` blocked on `FailedScheduling` events (impossible resource requests aren't fixed by scaling)
 8. **OCI validation**: images from the LLM are validated against the standard OCI format
 9. **Prompt sanitization**: Kubernetes event messages are sanitized before being sent to the LLM (control character removal, prompt injection patterns, truncation)
-10. **Distroless container**: the image has no shell, minimal filesystem, non-root user
+10. **Distroless container + Pod Security "restricted"**: the image has no shell, minimal filesystem, non-root user; `deploy/agent.yaml` enforces via `securityContext` `runAsNonRoot`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, `capabilities: drop [ALL]` and the `RuntimeDefault` seccomp profile
 11. **Rate limiting**: prevents overloading Ollama during event storms
 12. **Signal dedup**: collapses `(ns, Deployment, reason)` events into a single LLM call per `DEDUPE_TTL_SECONDS` (default 300s); cap `MAX_EVENTS_PER_POLL` (default 10)
 
@@ -1000,7 +1000,7 @@ kubectl -n <new-namespace> create rolebinding ai-remediator \
 
 An optional web GUI with a dedicated login form lets operators run the most common tasks from the browser:
 
-- **Login**: classic username/password form, HMAC-signed session cookie valid for 12h. The `/api/*` endpoints also accept HTTP Basic auth so curl-based scripts keep working.
+- **Login**: classic username/password form, HMAC-signed session cookie valid for 12h. The `/api/*` endpoints also accept HTTP Basic auth so curl-based scripts keep working. Failed login attempts are rate-limited per IP (lockout after 5 failures) as brute-force defence; cross-site mutating requests are rejected (`Sec-Fetch-Site` + `SameSite=Lax` cookie) as CSRF defence.
 - **Dashboard**: live status of the agent Deployment (desired/ready replicas), pods, ConfigMap, Secret, leader lease, **live probes for Ollama (model list + latency) and Redis (TCP ping)**, **recent decisions feed** from the remediation loop (action / severity / outcome), and a read-only view of the running configuration.
 - **Logs**: live tail of the agent pod via Server-Sent Events, with pause/clear controls.
 - **Cluster**: pod table for the namespaces listed in `INCLUDE_NAMESPACES`, with phase filter and name search, restart count, last-termination reason and a "logs" button that opens a tail panel (with `previous` checkbox). The namespace selector is populated from `INCLUDE_NAMESPACES`, read **live from the ConfigMap**: to add the desired namespace set it from **Configuration → Namespace filters → Include namespaces** and the Cluster page shows it immediately, without waiting for the pod restart (the agent, instead, applies the new scope on its next rollout). If the list is empty the selector shows "(no INCLUDE_NAMESPACES configured)".

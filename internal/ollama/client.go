@@ -29,21 +29,26 @@ type Client struct {
 	limiter    *rate.Limiter
 	maxRetries int
 
-	// onRateLimited and onError are optional metric hooks invoked when a
-	// request is delayed by the rate limiter or when an attempt fails. Both
-	// may be nil; wire them via SetMetricsHooks. Kept as callbacks rather
-	// than importing the metrics package so the client stays decoupled and
-	// trivially testable.
+	// onRateLimited, onError and onRequest are optional metric hooks. They
+	// fire, respectively, when a request is delayed by the rate limiter, when
+	// an attempt fails, and once per HTTP attempt with its latency. All may be
+	// nil; wire them via SetMetricsHooks. Kept as callbacks rather than
+	// importing the metrics package so the client stays decoupled and trivially
+	// testable.
 	onRateLimited func()
 	onError       func()
+	onRequest     func(time.Duration)
 }
 
-// SetMetricsHooks wires optional counters invoked on rate-limit waits and
-// per-attempt request errors. Both callbacks may be nil. Call once right
-// after NewClient, before the first Decide.
-func (c *Client) SetMetricsHooks(onRateLimited, onError func()) {
+// SetMetricsHooks wires optional counters. onRateLimited fires on rate-limit
+// waits, onError on each failed attempt, and onRequest once per HTTP attempt
+// (success or failure) with its measured latency — so request and error
+// counters both reflect per-attempt traffic instead of only successes. Any
+// callback may be nil. Call once right after NewClient, before the first Decide.
+func (c *Client) SetMetricsHooks(onRateLimited, onError func(), onRequest func(time.Duration)) {
 	c.onRateLimited = onRateLimited
 	c.onError = onError
+	c.onRequest = onRequest
 }
 
 // NewClient creates an Ollama client with rate limiting, TLS support, and retry config.
@@ -157,6 +162,11 @@ func (c *Client) doRequest(ctx context.Context, body []byte) (model.Decision, er
 	start := time.Now()
 	resp, err := c.http.Do(req)
 	duration := time.Since(start)
+	// Count every attempt that reached the wire (success or failure) so the
+	// request counter and average latency reflect real per-attempt traffic.
+	if c.onRequest != nil {
+		c.onRequest(duration)
+	}
 	if err != nil {
 		return model.Decision{}, err
 	}

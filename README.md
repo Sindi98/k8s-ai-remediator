@@ -572,8 +572,8 @@ giri con `DRY_RUN=true` per sola osservazione.
 | `mark_for_manual_fix` | Passiva | Marca la risorsa come non risolvibile automaticamente |
 | `inspect_pod_logs` | Read-only | Legge i log correnti e precedenti del container con piu restart |
 | `restart_deployment` | Mutazione | Forza un rollout aggiornando l'annotazione del pod template |
-| `delete_failed_pod` | Mutazione | Elimina il pod, il controller lo ricrea |
-| `delete_and_recreate_pod` | Mutazione | Come sopra, usato quando il pod va ricreato da zero |
+| `delete_failed_pod` | Mutazione | Elimina il pod (terminazione graceful), il controller lo ricrea |
+| `delete_and_recreate_pod` | Mutazione | Force-delete (grace period 0): sostituisce subito un pod bloccato in terminazione, da usare quando va ricreato da zero |
 | `scale_deployment` | Mutazione | Aggiorna `spec.replicas` entro i limiti `SCALE_MIN`/`SCALE_MAX` |
 | `set_deployment_image` | Mutazione | Aggiorna l'immagine del container (richiede `ALLOW_IMAGE_UPDATES=true`, confidenza sopra soglia, immagine OCI valida) |
 | `patch_probe` | Mutazione (patch) | Modifica i campi temporali di readiness/liveness probe (`initialDelaySeconds`, `periodSeconds`, `failureThreshold`, `successThreshold`, `timeoutSeconds`). Mai il probe handler |
@@ -870,7 +870,7 @@ kubectl -n ai-remediator expose deployment ai-remediator-agent \
    - `scale_deployment` e `restart_deployment` bloccati su eventi `FailedScheduling` (risorse impossibili non si risolvono scalando)
 8. **Validazione OCI**: le immagini dal LLM vengono validate contro il formato OCI standard
 9. **Sanitizzazione prompt**: i messaggi degli eventi Kubernetes vengono sanitizzati prima di essere inviati all'LLM (rimozione caratteri di controllo, pattern di prompt injection, troncamento)
-10. **Container distroless**: l'immagine non ha shell, file system minimo, utente non-root
+10. **Container distroless + Pod Security "restricted"**: l'immagine non ha shell, file system minimo, utente non-root; `deploy/agent.yaml` impone via `securityContext` `runAsNonRoot`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, `capabilities: drop [ALL]` e seccomp `RuntimeDefault`
 11. **Rate limiting**: previene il sovraccarico di Ollama durante storm di eventi
 12. **Deduplicazione per segnale**: collassa gli eventi `(ns, Deployment, reason)` in un'unica chiamata LLM per `DEDUPE_TTL_SECONDS` (default 300s); cap `MAX_EVENTS_PER_POLL` (default 10)
 
@@ -1002,7 +1002,7 @@ kubectl -n <nuovo-namespace> create rolebinding ai-remediator \
 
 Una GUI web opzionale, con form di login dedicato, permette di gestire dal browser le operazioni piu comuni:
 
-- **Login**: form classico (username/password) con sessione cookie HMAC-firmata di 12h. Gli endpoint `/api/*` accettano anche basic-auth header per script CLI.
+- **Login**: form classico (username/password) con sessione cookie HMAC-firmata di 12h. Gli endpoint `/api/*` accettano anche basic-auth header per script CLI. Tentativi di login falliti sono rate-limitati per IP (lockout dopo 5 errori) come difesa anti-brute-force; le richieste mutanti cross-site sono respinte (`Sec-Fetch-Site` + cookie `SameSite=Lax`) come difesa CSRF.
 - **Dashboard**: stato del Deployment dell'agente (repliche desiderate/pronte), pod, ConfigMap, Secret, leader lease, **probe live di Ollama (lista modelli + latenza) e Redis (TCP ping)**, **feed delle ultime decisioni** del loop di remediation (action / severity / outcome), configurazione live in lettura.
 - **Logs**: streaming live dei log del pod via Server-Sent Events, con pause/clear.
 - **Cluster**: tabella dei pod nei namespace listati in `INCLUDE_NAMESPACES`, con filtro per phase e ricerca per nome, restart count, last-termination reason, e bottone "logs" che apre un pannello con tail (anche `previous`). Il selettore di namespace si popola da `INCLUDE_NAMESPACES`, letto **live dalla ConfigMap**: per aggiungere il namespace desiderato impostalo da **Configuration → Namespace filters → Include namespaces** e la pagina Cluster lo mostra subito, senza attendere il riavvio del pod (l'agente, invece, applica il nuovo scope al prossimo rollout). Se la lista è vuota il selettore mostra "(no INCLUDE_NAMESPACES configured)".

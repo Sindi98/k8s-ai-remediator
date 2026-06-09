@@ -87,9 +87,10 @@ type Options struct {
 
 // Server is the HTTP server that exposes the admin GUI.
 type Server struct {
-	opts  Options
-	mux   *http.ServeMux
-	pages map[string]*template.Template
+	opts     Options
+	mux      *http.ServeMux
+	pages    map[string]*template.Template
+	throttle *loginThrottle
 }
 
 // pageNames lists the per-page templates the GUI knows how to render.
@@ -159,9 +160,10 @@ func New(opts Options) (*Server, error) {
 	}
 
 	s := &Server{
-		opts:  opts,
-		mux:   http.NewServeMux(),
-		pages: pages,
+		opts:     opts,
+		mux:      http.NewServeMux(),
+		pages:    pages,
+		throttle: newLoginThrottle(),
 	}
 	s.routes()
 	return s, nil

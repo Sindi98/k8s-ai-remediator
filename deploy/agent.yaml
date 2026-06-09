@@ -112,8 +112,25 @@ spec:
         app: ai-remediator-agent
     spec:
       serviceAccountName: ai-remediator
+      # Pod-level hardening: enforce non-root and the default seccomp profile so
+      # the Deployment satisfies the Pod Security "restricted" standard. The
+      # distroless:nonroot image already runs as uid 65532; this makes it a
+      # contract the API server enforces rather than an image detail.
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: agent
+          # Container-level hardening: drop all capabilities, forbid privilege
+          # escalation and run on a read-only root filesystem. The agent writes
+          # nothing to local disk (state lives in Redis/the API server), so a
+          # read-only rootfs has no functional impact.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           # !!! CUSTOMISE BEFORE APPLYING !!!
           # Default points to the local registry used throughout the README
           # ("Build and push to the local registry"). If you build/push to a
