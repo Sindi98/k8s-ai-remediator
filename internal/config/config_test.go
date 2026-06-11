@@ -162,8 +162,8 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	}
 
 	cfg := LoadFromEnv()
-	if cfg.Model != "qwen2.5:7b" {
-		t.Errorf("expected default model qwen2.5:7b, got %s", cfg.Model)
+	if cfg.Model != "qwen3.5:9b" {
+		t.Errorf("expected default model qwen3.5:9b, got %s", cfg.Model)
 	}
 	if cfg.DryRun {
 		t.Error("expected default dryRun=false")
@@ -203,6 +203,72 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	}
 	if cfg.MaxEventsPerPoll != 10 {
 		t.Errorf("expected maxEventsPerPoll 10, got %d", cfg.MaxEventsPerPoll)
+	}
+}
+
+func TestGetOptionalBool(t *testing.T) {
+	cases := []struct {
+		val  string // value of the env var ("" = unset)
+		def  string
+		want *bool // nil = field omitted
+	}{
+		{"", "false", boolPtr(false)},  // unset → default applies
+		{"", "auto", nil},              // unset → default "auto" omits
+		{"", "", nil},                  // unset, no default → omit
+		{"auto", "false", nil},         // explicit auto wins over default
+		{"omit", "false", nil},         // alias of auto
+		{"false", "auto", boolPtr(false)},
+		{"true", "false", boolPtr(true)},
+		{"1", "false", boolPtr(true)},
+		{"yes", "false", boolPtr(true)},
+		{"banana", "auto", boolPtr(false)}, // garbage → falsy, like Getbool
+	}
+	for _, c := range cases {
+		os.Unsetenv("TEST_OPTBOOL")
+		if c.val != "" {
+			os.Setenv("TEST_OPTBOOL", c.val)
+		}
+		got := GetOptionalBool("TEST_OPTBOOL", c.def)
+		switch {
+		case got == nil && c.want != nil, got != nil && c.want == nil:
+			t.Errorf("GetOptionalBool(%q, def=%q) = %v, want %v", c.val, c.def, fmtPtr(got), fmtPtr(c.want))
+		case got != nil && c.want != nil && *got != *c.want:
+			t.Errorf("GetOptionalBool(%q, def=%q) = %v, want %v", c.val, c.def, *got, *c.want)
+		}
+	}
+	os.Unsetenv("TEST_OPTBOOL")
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+func fmtPtr(b *bool) string {
+	if b == nil {
+		return "nil"
+	}
+	if *b {
+		return "&true"
+	}
+	return "&false"
+}
+
+func TestLoadFromEnv_OllamaThink(t *testing.T) {
+	// Default: thinking disabled, so the default model (qwen3.5:9b, a
+	// reasoning model) does not blow through the HTTP timeout on CPU.
+	os.Unsetenv("OLLAMA_THINK")
+	cfg := LoadFromEnv()
+	if cfg.OllamaThink == nil || *cfg.OllamaThink {
+		t.Errorf("expected default OllamaThink=&false, got %v", fmtPtr(cfg.OllamaThink))
+	}
+
+	os.Setenv("OLLAMA_THINK", "auto")
+	defer os.Unsetenv("OLLAMA_THINK")
+	if cfg := LoadFromEnv(); cfg.OllamaThink != nil {
+		t.Errorf("expected OllamaThink=nil for auto, got %v", fmtPtr(cfg.OllamaThink))
+	}
+
+	os.Setenv("OLLAMA_THINK", "true")
+	if cfg := LoadFromEnv(); cfg.OllamaThink == nil || !*cfg.OllamaThink {
+		t.Errorf("expected OllamaThink=&true, got %v", fmtPtr(cfg.OllamaThink))
 	}
 }
 

@@ -13,8 +13,16 @@
   <summary><h2>LLM (Ollama)</h2></summary>
   <form class="form" data-endpoint="/api/config/llm">
     <div class="grid-2">
-      <label>Model <input name="model" placeholder="qwen2.5:7b"></label>
+      <label>Model <input name="model" placeholder="qwen3.5:9b"></label>
       <label>Base URL <input name="base_url" placeholder="http://ollama.ollama.svc.cluster.local:11434/api"></label>
+      <label>Thinking mode
+        <select name="think">
+          <option value="">(unchanged)</option>
+          <option value="false">false — required for reasoning models (qwen3.x, gemma4)</option>
+          <option value="true">true — slower, needs long timeouts</option>
+          <option value="auto">auto — server default</option>
+        </select>
+      </label>
     </div>
     <button type="submit" class="btn-primary">Save and rollout</button>
   </form>

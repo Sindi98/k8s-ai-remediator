@@ -40,7 +40,14 @@ metadata:
   namespace: ai-remediator
 data:
   OLLAMA_BASE_URL: "http://ollama.ollama.svc.cluster.local:11434/api"
-  OLLAMA_MODEL: "qwen2.5:7b"
+  OLLAMA_MODEL: "qwen3.5:9b"
+  # Reasoning ("thinking") mode, sent as the native `think` parameter of the
+  # Ollama chat API. qwen3.x and gemma4 are reasoning models: with thinking
+  # left on, every call spends minutes emitting reasoning tokens on CPU and
+  # times out before producing any JSON. Values: "false" (default), "true",
+  # "auto" (= server/model default). Models without the capability are
+  # detected and handled automatically.
+  OLLAMA_THINK: "false"
   DRY_RUN: "false"
   MIN_SEVERITY: "medium"
   POLL_INTERVAL_SECONDS: "30"

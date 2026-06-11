@@ -122,6 +122,13 @@ type ChatRequest struct {
 	Stream   bool           `json:"stream"`
 	Format   map[string]any `json:"format"`
 	Options  map[string]any `json:"options"`
+	// Think toggles the model's reasoning ("thinking") mode. It is a
+	// top-level chat API parameter (Ollama >= 0.9), NOT an options entry:
+	// the generate endpoint ignores it inside options. Pointer + omitempty
+	// keeps the three states distinct on the wire: nil omits the field
+	// (server/model default), &false serialises as "think":false, &true
+	// as "think":true.
+	Think *bool `json:"think,omitempty"`
 }
 
 // ChatResponse is the response body from the Ollama /api/chat endpoint.
