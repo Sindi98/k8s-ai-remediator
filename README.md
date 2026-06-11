@@ -279,7 +279,8 @@ scripts/install.sh --uninstall
 |------|---------|---------|
 | `--build` | off | build & push dell'immagine prima del deploy (richiede Docker) |
 | `--image` / `--registry` | `host.docker.internal:5050/k8s-ai-remediator:latest` | immagine da deployare |
-| `--model` | `qwen2.5:7b` | modello Ollama da scaricare e usare |
+| `--model` | `qwen3.5:9b` | modello Ollama da scaricare e usare |
+| `--think` | `false` | modalita reasoning del modello (`false`/`true`/`auto`); `false` e necessario con i modelli con reasoning (qwen3.x, gemma4) |
 | `--skip-ollama` | off | non installa Ollama (lo dai per già presente) |
 | `--no-webui` | off | installa l'agente senza GUI (niente RBAC della GUI) |
 | `--webui-user` / `--webui-password` | `admin` / generata | credenziali di login della GUI |
@@ -337,40 +338,46 @@ kubectl -n ollama expose deployment ollama \
 
 # Attendi il rollout e installa il modello
 kubectl -n ollama rollout status deployment/ollama --timeout=180s
-# qwen2.5:7b e il default consigliato per CPU (chiamate da 30-90s).
-# Se hai GPU o vuoi massima qualita, usa qwen2.5:14b (chiamate 3-6min su CPU).
-kubectl -n ollama exec -it deploy/ollama -- ollama pull qwen2.5:7b
+# qwen3.5:9b e il default (chiamate ~30-90s su CPU con OLLAMA_THINK=false,
+# il default dell'agente). Alternativa leggera senza reasoning: qwen2.5:7b.
+kubectl -n ollama exec -it deploy/ollama -- ollama pull qwen3.5:9b
 kubectl -n ollama exec -it deploy/ollama -- ollama list
 ```
 
 > **Nota**: il valore di `OLLAMA_MODEL` nella ConfigMap deve coincidere esattamente con il nome mostrato da `ollama list`.
 >
 > **Scelta del modello e requisiti di RAM**:
-> - `qwen2.5:7b` (consigliato per CPU): ~4 GB RAM libera, chiamate ~30-90s. Qualita piu che sufficiente perche il prompt e strutturato come decision tree con few-shot examples.
-> - `qwen2.5:14b`: ~8 GB RAM libera, chiamate ~3-6 min su CPU. Qualita superiore; adatto se hai GPU o timeout estesi.
+> - `qwen3.5:9b` (default): ~7 GB RAM libera, chiamate ~30-90s su CPU. E un modello con reasoning: richiede `OLLAMA_THINK=false` (default dell'agente), altrimenti ogni chiamata spende minuti in token di ragionamento e supera il timeout HTTP.
+> - `qwen2.5:7b` (fallback leggero, senza reasoning): ~4 GB RAM libera, chiamate ~30-90s. Qualita comunque buona perche il prompt e strutturato come decision tree con few-shot examples.
+> - `qwen3.6:35b-a3b` (MoE, ~3B parametri attivi): ~24 GB RAM libera; veloce rispetto alla taglia e qualita superiore. Anche qui serve `OLLAMA_THINK=false`.
 >
 > Se il pod resta in `Pending`, verifica che il nodo abbia risorse sufficienti con `kubectl describe node`. Per cluster locali:
-> - **Docker Desktop**: Settings → Resources → assegna almeno **6 GB RAM / 4 CPU** (14b: 10 GB), poi Apply & Restart
-> - **minikube**: `minikube start --memory=6144 --cpus=4` (14b: `--memory=10240`)
+> - **Docker Desktop**: Settings → Resources → assegna almeno **8 GB RAM / 4 CPU** (qwen2.5:7b: 6 GB), poi Apply & Restart
+> - **minikube**: `minikube start --memory=8192 --cpus=4` (qwen2.5:7b: `--memory=6144`)
 > - **kind**: configura le risorse del container Docker sottostante
 
 #### Cambiare il modello dopo l'installazione
 
-Il default (codice e `deploy/agent.yaml`) è `qwen2.5:7b`. Se l'agente usa il
-modello sbagliato (es. `qwen2.5:14b`), è perché la ConfigMap lo imposta
-esplicitamente: aggiornala e ricarica il Deployment, oppure usa la pagina
-**Configuration → LLM (Ollama)** della GUI (scrive la ConfigMap e fa il rollout).
+Il default (codice, `deploy/agent.yaml` e `scripts/install.sh`) è `qwen3.5:9b`
+con `OLLAMA_THINK=false`. Se l'agente usa il modello sbagliato, è perché la
+ConfigMap lo imposta esplicitamente: aggiornala e ricarica il Deployment,
+oppure usa la pagina **Configuration → LLM (Ollama)** della GUI (scrive la
+ConfigMap e fa il rollout; il campo "Thinking mode" controlla `OLLAMA_THINK`).
 
 ```bash
-# Imposta il modello e ricarica l'agente
+# Imposta modello e thinking mode, poi ricarica l'agente
 kubectl -n ai-remediator patch configmap ai-remediator-config --type merge \
-  -p '{"data":{"OLLAMA_MODEL":"qwen2.5:7b"}}'
+  -p '{"data":{"OLLAMA_MODEL":"qwen3.5:9b","OLLAMA_THINK":"false"}}'
 kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
 
 # Assicurati che il modello sia scaricato in Ollama (il nome deve combaciare)
-kubectl -n ollama exec deploy/ollama -- ollama pull qwen2.5:7b
+kubectl -n ollama exec deploy/ollama -- ollama pull qwen3.5:9b
 kubectl -n ollama exec deploy/ollama -- ollama list
 ```
+
+> I modelli con reasoning (qwen3.x, gemma4) generano token di ragionamento
+> prima della risposta: con `OLLAMA_THINK` diverso da `false` ogni chiamata
+> su CPU dura minuti e supera `OLLAMA_HTTP_TIMEOUT_SECONDS`.
 
 #### 2. Agente (manifest)
 
@@ -430,7 +437,7 @@ Tutte le variabili sono lette da environment (tipicamente via ConfigMap).
 | Variabile | Default | Descrizione |
 |-----------|---------|-------------|
 | `OLLAMA_BASE_URL` | `http://ollama.ollama.svc.cluster.local:11434/api` | URL base dell'API Ollama |
-| `OLLAMA_MODEL` | `qwen2.5:7b` | Nome del modello LLM (deve corrispondere a `ollama list`). `7b` (default, consigliato per CPU): ~30-90s per chiamata. Per GPU o massima qualita imposta `qwen2.5:14b`: ~3-6min su CPU |
+| `OLLAMA_MODEL` | `qwen3.5:9b` | Nome del modello LLM (deve corrispondere a `ollama list`). Default `qwen3.5:9b`: ~30-90s per chiamata su CPU con thinking disattivato. Alternative: `qwen2.5:7b` (leggero, senza reasoning), `qwen3.6:35b-a3b` (qualita superiore, ~24 GB RAM) |
 | `DRY_RUN` | `false` | Se `true`, logga le decisioni senza applicare remediation |
 | `POLL_INTERVAL_SECONDS` | `30` | Intervallo di polling degli eventi (secondi) |
 | `DEDUPE_TTL_SECONDS` | `300` | TTL di deduplicazione per `(ns, kind, name, reason)`: eventi identici entro la finestra non generano una nuova chiamata LLM |
@@ -458,6 +465,7 @@ Tutte le variabili sono lette da environment (tipicamente via ConfigMap).
 | `OLLAMA_RPS` | `2.0` | Max richieste al secondo verso Ollama (rate limiting) |
 | `OLLAMA_MAX_RETRIES` | `3` | Tentativi per errori transitori (5xx, rete) con backoff esponenziale |
 | `OLLAMA_TLS_SKIP_VERIFY` | `false` | Salta la verifica TLS (per certificati self-signed) |
+| `OLLAMA_THINK` | `false` | Modalita reasoning ("thinking") del modello, inviata come parametro nativo `think` della chat API di Ollama. `false` (default): disattivata — necessario con i modelli con reasoning (qwen3.x, gemma4), che altrimenti spendono minuti in token di ragionamento e superano il timeout HTTP. `true`: attiva (servono timeout generosi). `auto`: lascia il default del server. I modelli senza la capability sono rilevati e gestiti automaticamente |
 | `OLLAMA_HTTP_TIMEOUT_SECONDS` | `180` | Timeout HTTP per ogni richiesta a Ollama (attesa headers + body). Aumenta se vedi `Client.Timeout exceeded while awaiting headers` con modelli lenti (CPU, GPU scarica, cold start) |
 | `POLL_CONTEXT_TIMEOUT_SECONDS` | `300` | Timeout del context che avvolge l'intero ciclo di polling (list eventi + chiamate Ollama). Deve restare maggiore di `OLLAMA_HTTP_TIMEOUT_SECONDS` altrimenti il context scade prima del client HTTP e produce `context deadline exceeded` |
 | `POD_LOG_TAIL_LINES` | `200` | Numero di righe di log lette per container |
@@ -1453,7 +1461,8 @@ kubectl auth can-i update deployments \
 ```bash
 kubectl -n ai-remediator create configmap ai-remediator-config \
   --from-literal=OLLAMA_BASE_URL=http://ollama.ollama.svc.cluster.local:11434/api \
-  --from-literal=OLLAMA_MODEL=qwen2.5:7b \
+  --from-literal=OLLAMA_MODEL=qwen3.5:9b \
+  --from-literal=OLLAMA_THINK=false \
   --from-literal=DRY_RUN=false \
   --from-literal=POLL_INTERVAL_SECONDS=30 \
   --from-literal=MIN_SEVERITY=medium \
@@ -1521,24 +1530,40 @@ Verifica:
 
 ### `Post "...": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`
 
-Ollama ci mette piu di `OLLAMA_HTTP_TIMEOUT_SECONDS` a rispondere.
-Tempi tipici su CPU:
-- `qwen2.5:7b`: 30-90s (timeout 180s basta)
-- `qwen2.5:14b`: 100-360s (timeout 360-600s)
+Ollama ci mette piu di `OLLAMA_HTTP_TIMEOUT_SECONDS` a rispondere. Cause
+tipiche, in ordine di probabilita:
 
-**Soluzione preferita**: passa al 7b (4x piu veloce):
+**1. Thinking mode attivo su un modello con reasoning (qwen3.x, gemma4).**
+Il modello spende minuti in token di ragionamento prima di produrre il JSON.
+Verifica nel log di startup che compaia `"ollamaThink":"false"`; se il campo
+manca, il binario e vecchio (rebuild + rollout). Se vale `true`/`auto`,
+riportalo a `false`:
 ```bash
-kubectl -n ollama exec -it deploy/ollama -- ollama pull qwen2.5:7b
+kubectl -n ai-remediator patch configmap ai-remediator-config \
+  --type=merge -p '{"data":{"OLLAMA_THINK":"false"}}'
+kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
+```
+
+**2. Modello troppo lento per il timeout.** Tempi tipici su CPU (think off):
+- `qwen3.5:9b` (default): 30-90s (timeout 180s basta)
+- `qwen2.5:7b`: 30-90s (timeout 180s basta)
+- `qwen2.5:14b` e taglie maggiori: 100-360s (timeout 360-600s)
+- prima chiamata dopo il deploy: somma il tempo di caricamento del modello in RAM (cold start)
+
+**Soluzione preferita**: resta sul default `qwen3.5:9b` con think off:
+```bash
+kubectl -n ollama exec -it deploy/ollama -- ollama pull qwen3.5:9b
 kubectl -n ai-remediator patch configmap ai-remediator-config \
   --type=merge -p '{"data":{
-    "OLLAMA_MODEL":"qwen2.5:7b",
+    "OLLAMA_MODEL":"qwen3.5:9b",
+    "OLLAMA_THINK":"false",
     "OLLAMA_HTTP_TIMEOUT_SECONDS":"180",
     "POLL_CONTEXT_TIMEOUT_SECONDS":"300"
   }}'
 kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
 ```
 
-**Alternativa se resti sul 14b**: alza i timeout
+**Alternativa se usi un modello piu grande**: alza i timeout
 ```bash
 kubectl -n ai-remediator patch configmap ai-remediator-config \
   --type=merge -p '{"data":{

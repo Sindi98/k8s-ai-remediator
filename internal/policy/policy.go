@@ -147,7 +147,7 @@ func SanitizeForPrompt(s string, maxLen int) string {
 }
 
 // BuildPrompt constructs the LLM prompt from Kubernetes event fields.
-// The prompt is tuned for smaller local models (e.g. qwen2.5:7b): a compact
+// The prompt is tuned for smaller local models (e.g. qwen3.5:9b): a compact
 // decision tree, few-shot examples, and explicit format constraints, instead
 // of long prose that smaller models often ignore.
 func BuildPrompt(ns, kind, name, etype, reason, message, extra string) string {

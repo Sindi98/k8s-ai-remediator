@@ -167,3 +167,74 @@ func TestHandleUpdateGeneral_RejectsInvalidValue(t *testing.T) {
 		t.Error("configmap should not be created when validation fails")
 	}
 }
+
+func TestHandleUpdateLLM_PersistsModelAndThink(t *testing.T) {
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "dep", Namespace: "ns"}}
+	cs := fake.NewSimpleClientset(dep)
+	s := newConfigServer(cs)
+
+	form := url.Values{}
+	form.Set("model", "qwen3.5:9b")
+	form.Set("think", "false")
+	req := httptest.NewRequest(http.MethodPost, "/api/config/llm", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	s.handleUpdateLLM(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	cm, err := cs.CoreV1().ConfigMaps("ns").Get(context.Background(), "cfg", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("configmap not written: %v", err)
+	}
+	if cm.Data["OLLAMA_MODEL"] != "qwen3.5:9b" || cm.Data["OLLAMA_THINK"] != "false" {
+		t.Errorf("unexpected config: %+v", cm.Data)
+	}
+}
+
+func TestHandleUpdateLLM_EmptyThinkLeavesKeyUntouched(t *testing.T) {
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "dep", Namespace: "ns"}}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cfg", Namespace: "ns"},
+		Data:       map[string]string{"OLLAMA_THINK": "auto"},
+	}
+	cs := fake.NewSimpleClientset(dep, cm)
+	s := newConfigServer(cs)
+
+	form := url.Values{}
+	form.Set("model", "qwen3.5:9b") // no think field in the form
+	req := httptest.NewRequest(http.MethodPost, "/api/config/llm", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	s.handleUpdateLLM(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	got, _ := cs.CoreV1().ConfigMaps("ns").Get(context.Background(), "cfg", metav1.GetOptions{})
+	if got.Data["OLLAMA_THINK"] != "auto" {
+		t.Errorf("empty form field must leave OLLAMA_THINK unchanged, got %q", got.Data["OLLAMA_THINK"])
+	}
+}
+
+func TestHandleUpdateLLM_RejectsInvalidThink(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	s := newConfigServer(cs)
+
+	form := url.Values{}
+	form.Set("model", "qwen3.5:9b")
+	form.Set("think", "banana")
+	req := httptest.NewRequest(http.MethodPost, "/api/config/llm", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	s.handleUpdateLLM(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid think value, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := cs.CoreV1().ConfigMaps("ns").Get(context.Background(), "cfg", metav1.GetOptions{}); err == nil {
+		t.Error("configmap should not be created when validation fails")
+	}
+}

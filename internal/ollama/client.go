@@ -13,7 +13,9 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -29,6 +31,19 @@ type Client struct {
 	limiter    *rate.Limiter
 	maxRetries int
 
+	// think mirrors AgentConfig.OllamaThink: nil omits the chat API `think`
+	// parameter (server default), false disables the reasoning mode of
+	// thinking models (qwen3.x, gemma4), true enables it. Set once via
+	// SetThink before the first Decide.
+	think *bool
+	// thinkUnsupported latches when the server rejects the think parameter
+	// (model without the thinking capability, e.g. qwen2.5). From then on
+	// the field is dropped from every request so OLLAMA_THINK=false never
+	// breaks non-reasoning models. Atomic out of caution: Decide is called
+	// serially by the poll loop today, but the latch must stay correct if a
+	// second caller ever appears.
+	thinkUnsupported atomic.Bool
+
 	// onRateLimited, onError and onRequest are optional metric hooks. They
 	// fire, respectively, when a request is delayed by the rate limiter, when
 	// an attempt fails, and once per HTTP attempt with its latency. All may be
@@ -38,6 +53,13 @@ type Client struct {
 	onRateLimited func()
 	onError       func()
 	onRequest     func(time.Duration)
+}
+
+// SetThink configures the reasoning ("thinking") mode requested from the
+// model: nil leaves the server default, false disables it, true enables it.
+// Call once right after NewClient, before the first Decide.
+func (c *Client) SetThink(think *bool) {
+	c.think = think
 }
 
 // SetMetricsHooks wires optional counters. onRateLimited fires on rate-limit
@@ -77,6 +99,44 @@ func NewClient(baseURL, mdl string, rps float64, maxRetries int, tlsSkipVerify b
 	}
 }
 
+// systemPrompt is the fixed system message sent with every decision request.
+const systemPrompt = "You are a Kubernetes remediation agent. Return only valid JSON matching the schema. " +
+	"Allowed actions: noop,restart_deployment,delete_failed_pod,delete_and_recreate_pod,scale_deployment,inspect_pod_logs,set_deployment_image,patch_probe,patch_resources,patch_registry,mark_for_manual_fix,ask_human. " +
+	"Severity must be one of: critical, high, medium, low, info. " +
+	"Never suggest shell commands. " +
+	"The user message contains detailed rules for when to pick each action; follow them strictly, including any HARD RULE."
+
+// buildRequestBody assembles the chat payload, honouring the configured
+// thinking mode. When thinking is explicitly disabled the Qwen-style
+// "/no_think" soft switch is also appended to the system message: the
+// native `think` parameter needs Ollama >= 0.9, while the in-prompt switch
+// covers older servers (inert text for other model families). Once the
+// server has declared the model incapable of thinking, the parameter is
+// dropped entirely.
+func (c *Client) buildRequestBody(prompt string) ([]byte, error) {
+	think := c.think
+	if c.thinkUnsupported.Load() {
+		think = nil
+	}
+	system := systemPrompt
+	if think != nil && !*think {
+		system += " /no_think"
+	}
+
+	reqBody := model.ChatRequest{
+		Model: c.model,
+		Messages: []model.Message{
+			{Role: "system", Content: system},
+			{Role: "user", Content: prompt},
+		},
+		Stream:  false,
+		Format:  buildSchema(),
+		Options: map[string]any{"temperature": 0},
+		Think:   think,
+	}
+	return json.Marshal(reqBody)
+}
+
 // Decide sends the prompt to Ollama and returns a validated Decision.
 // Transient errors (network, 5xx) are retried with exponential backoff.
 func (c *Client) Decide(ctx context.Context, prompt string) (model.Decision, error) {
@@ -93,27 +153,7 @@ func (c *Client) Decide(ctx context.Context, prompt string) (model.Decision, err
 
 	slog.Debug("sending prompt to ollama", "model", c.model, "prompt_len", len(prompt))
 
-	schema := buildSchema()
-
-	reqBody := model.ChatRequest{
-		Model: c.model,
-		Messages: []model.Message{
-			{
-				Role: "system",
-				Content: "You are a Kubernetes remediation agent. Return only valid JSON matching the schema. " +
-					"Allowed actions: noop,restart_deployment,delete_failed_pod,delete_and_recreate_pod,scale_deployment,inspect_pod_logs,set_deployment_image,patch_probe,patch_resources,patch_registry,mark_for_manual_fix,ask_human. " +
-					"Severity must be one of: critical, high, medium, low, info. " +
-					"Never suggest shell commands. " +
-					"The user message contains detailed rules for when to pick each action; follow them strictly, including any HARD RULE.",
-			},
-			{Role: "user", Content: prompt},
-		},
-		Stream:  false,
-		Format:  schema,
-		Options: map[string]any{"temperature": 0},
-	}
-
-	b, err := json.Marshal(reqBody)
+	b, err := c.buildRequestBody(prompt)
 	if err != nil {
 		return model.Decision{}, err
 	}
@@ -140,6 +180,17 @@ func (c *Client) Decide(ctx context.Context, prompt string) (model.Decision, err
 			lastErr = err
 			if c.onError != nil {
 				c.onError()
+			}
+			// The server rejected the think parameter: the configured model has
+			// no thinking capability (e.g. qwen2.5). Latch, rebuild the body
+			// without the field and redo the call, so OLLAMA_THINK=false never
+			// breaks non-reasoning models. The latch makes the recursion depth
+			// at most one.
+			if isThinkUnsupportedErr(err) && c.think != nil && !c.thinkUnsupported.Load() {
+				c.thinkUnsupported.Store(true)
+				slog.Warn("ollama: model does not support the think parameter; retrying without it",
+					"model", c.model)
+				return c.Decide(ctx, prompt)
 			}
 			if isRetryable(err) {
 				continue
@@ -187,12 +238,13 @@ func (c *Client) doRequest(ctx context.Context, body []byte) (model.Decision, er
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return model.Decision{}, err
 	}
-	if out.Message.Content == "" {
+	content := cleanModelContent(out.Message.Content)
+	if content == "" {
 		return model.Decision{}, fmt.Errorf("empty ollama response")
 	}
 
 	var d model.Decision
-	if err := json.Unmarshal([]byte(out.Message.Content), &d); err != nil {
+	if err := json.Unmarshal([]byte(content), &d); err != nil {
 		return model.Decision{}, err
 	}
 	if !AllowedAction(d.Action) {
@@ -203,6 +255,37 @@ func (c *Client) doRequest(ctx context.Context, body []byte) (model.Decision, er
 	}
 
 	return d, nil
+}
+
+// thinkBlockRe matches a reasoning block at the start of the content.
+// Qwen-family models emit one (empty with /no_think) on Ollama versions
+// that do not separate thinking from content.
+var thinkBlockRe = regexp.MustCompile(`(?s)\A\s*<think>.*?</think>`)
+
+// cleanModelContent strips the artifacts thinking-capable models leave
+// around the JSON payload: a leading <think>...</think> block and markdown
+// code fences (observed when thinking interacts with structured outputs,
+// e.g. gemma4). Plain JSON passes through untouched.
+func cleanModelContent(s string) string {
+	s = thinkBlockRe.ReplaceAllString(s, "")
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "```") {
+		s = strings.TrimPrefix(s, "```")
+		s = strings.TrimPrefix(s, "json")
+		if i := strings.LastIndex(s, "```"); i >= 0 {
+			s = s[:i]
+		}
+		s = strings.TrimSpace(s)
+	}
+	return s
+}
+
+// isThinkUnsupportedErr matches the 4xx error Ollama returns when the
+// `think` parameter is sent to a model without the thinking capability.
+// Matched on the stable phrase used by the server ("does not support
+// thinking").
+func isThinkUnsupportedErr(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "does not support thinking")
 }
 
 // retryableError marks errors that should trigger a retry.

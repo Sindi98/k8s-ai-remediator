@@ -392,6 +392,14 @@ func withOOMMemoryFloor(ctx context.Context, cs kubernetes.Interface, ns, depNam
 	return out
 }
 
+// formatTriBool renders a tri-state *bool for logs: "auto" when nil.
+func formatTriBool(b *bool) string {
+	if b == nil {
+		return "auto"
+	}
+	return strconv.FormatBool(*b)
+}
+
 // toSet builds a quick-lookup set from a slice of strings.
 func toSet(in []string) map[string]bool {
 	if len(in) == 0 {
@@ -466,8 +474,9 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 		"ollamaRPS", cfg.OllamaRPS,
 		"ollamaHTTPTimeoutSec", cfg.OllamaHTTPTimeoutSec,
 		"pollContextTimeoutSec", cfg.PollContextTimeoutSec,
+		"ollamaThink", formatTriBool(cfg.OllamaThink),
 		"metricsAddr", cfg.MetricsAddr,
-		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry,auto-escalate-oom,auto-escalate-unhealthy,severity-exempt-optin",
+		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry,auto-escalate-oom,auto-escalate-unhealthy,severity-exempt-optin,ollama-think-toggle",
 	)
 
 	ticker := time.NewTicker(time.Duration(cfg.PollSec) * time.Second)
@@ -711,6 +720,10 @@ func main() {
 	}
 
 	ollamaClient := ollama.NewClient(cfg.BaseURL, cfg.Model, cfg.OllamaRPS, cfg.OllamaMaxRetries, cfg.OllamaTLSSkipVerify, cfg.OllamaHTTPTimeoutSec)
+	// Reasoning mode (OLLAMA_THINK). Defaults to off: thinking models
+	// (qwen3.x, gemma4) would otherwise spend minutes per call emitting
+	// reasoning tokens on CPU and time out before producing any JSON.
+	ollamaClient.SetThink(cfg.OllamaThink)
 	m := metrics.New()
 
 	// Wire the Ollama client's metric hooks into the recorder. onRequest fires

@@ -22,6 +22,8 @@
 #   --image REF          Agent image to deploy           [IMAGE]
 #   --registry HOST      Registry prefix for the image   [REGISTRY]
 #   --model NAME         Ollama model to pull/use         [MODEL]
+#   --think MODE         Model thinking mode: false|true|auto (default: false;
+#                        required "false" for reasoning models like qwen3.x) [OLLAMA_THINK]
 #   --build              Build & push the image first (needs Docker)  [BUILD=true]
 #   --skip-ollama        Do not install Ollama / pull the model       [INSTALL_OLLAMA=false]
 #   --no-webui           Install the agent without the admin GUI      [ENABLE_WEBUI=false]
@@ -60,7 +62,13 @@ NAMESPACE="${NAMESPACE:-ai-remediator}"
 OLLAMA_NAMESPACE="${OLLAMA_NAMESPACE:-ollama}"
 REGISTRY="${REGISTRY:-host.docker.internal:5050}"
 IMAGE="${IMAGE:-}"                       # defaults to $REGISTRY/k8s-ai-remediator:latest below
-MODEL="${MODEL:-qwen2.5:7b}"
+MODEL="${MODEL:-qwen3.5:9b}"
+# Thinking mode wired into the agent ConfigMap (OLLAMA_THINK). qwen3.x and
+# gemma4 are reasoning models: leaving thinking on makes every LLM call spend
+# minutes on CPU and exceed the agent HTTP timeout, so "false" is the default.
+# "auto" keeps the Ollama server default; models without the capability are
+# detected and handled automatically by the agent.
+OLLAMA_THINK="${OLLAMA_THINK:-false}"
 SANDBOX_NS="${SANDBOX_NS:-incident-lab}"
 
 # Redis is the (mandatory) dedup backend. Leave REDIS_ADDR empty to install the
@@ -125,6 +133,7 @@ while [ "$#" -gt 0 ]; do
         --image)            IMAGE="$2"; shift 2 ;;
         --registry)         REGISTRY="$2"; shift 2 ;;
         --model)            MODEL="$2"; shift 2 ;;
+        --think)            OLLAMA_THINK="$2"; shift 2 ;;
         --build)            BUILD=true; shift ;;
         --skip-ollama)      INSTALL_OLLAMA=false; shift ;;
         --no-webui)         ENABLE_WEBUI=false; shift ;;
@@ -143,6 +152,11 @@ done
 
 IMAGE="${IMAGE:-${REGISTRY}/k8s-ai-remediator:latest}"
 
+case "$OLLAMA_THINK" in
+    false|true|auto) ;;
+    *) die "--think must be one of: false, true, auto (got: ${OLLAMA_THINK})" ;;
+esac
+
 # --- preflight --------------------------------------------------------------
 preflight() {
     step "Preflight checks"
@@ -155,7 +169,7 @@ preflight() {
     [ -n "$REDIS_ADDR" ] || [ -f "${DEPLOY_DIR}/redis.yaml" ] || die "deploy/redis.yaml not found (needed for the bundled Redis; or pass --redis-addr for an external one)"
     info "kubectl context: $(kubectl config current-context 2>/dev/null || echo '?')"
     info "agent image:     ${IMAGE}"
-    info "ollama model:    ${MODEL} ($([ "$INSTALL_OLLAMA" = true ] && echo 'will install Ollama' || echo 'Ollama install skipped'))"
+    info "ollama model:    ${MODEL} ($([ "$INSTALL_OLLAMA" = true ] && echo 'will install Ollama' || echo 'Ollama install skipped'), thinking: ${OLLAMA_THINK})"
     info "dedup backend:   Redis ($([ -n "$REDIS_ADDR" ] && echo "external: ${REDIS_ADDR}" || echo 'bundled (deploy/redis.yaml)'))"
     info "admin GUI:       $([ "$ENABLE_WEBUI" = true ] && echo enabled || echo disabled)"
 }
@@ -203,7 +217,10 @@ spec:
             - { name: OLLAMA_HOST, value: "0.0.0.0:11434" }
           resources:
             requests: { cpu: "500m", memory: "2Gi" }
-            limits:   { cpu: "4",    memory: "8Gi" }
+            # qwen3.5:9b (q4) loads ~7GB of weights; 12Gi leaves headroom for
+            # the KV cache and the runtime without OOMKilling the pod. Only
+            # the request drives scheduling, so small nodes still fit.
+            limits:   { cpu: "4",    memory: "12Gi" }
           volumeMounts:
             - { name: ollama-data, mountPath: /root/.ollama }
       volumes:
@@ -319,9 +336,9 @@ install_agent() {
     info "Setting image to ${IMAGE}"
     run kubectl -n "$NAMESPACE" set image deployment/ai-remediator-agent "agent=${IMAGE}"
 
-    info "Setting OLLAMA_MODEL=${MODEL}, WEBUI_ENABLED=${ENABLE_WEBUI}, SCENARIO_SANDBOX_NAMESPACES=${SANDBOX_NS}, DEDUP_BACKEND=redis, REDIS_ADDR=${REDIS_ADDR}"
+    info "Setting OLLAMA_MODEL=${MODEL}, OLLAMA_THINK=${OLLAMA_THINK}, WEBUI_ENABLED=${ENABLE_WEBUI}, SCENARIO_SANDBOX_NAMESPACES=${SANDBOX_NS}, DEDUP_BACKEND=redis, REDIS_ADDR=${REDIS_ADDR}"
     run kubectl -n "$NAMESPACE" patch configmap ai-remediator-config --type merge \
-        -p "{\"data\":{\"OLLAMA_MODEL\":\"${MODEL}\",\"OLLAMA_BASE_URL\":\"http://ollama.${OLLAMA_NAMESPACE}.svc.cluster.local:11434/api\",\"WEBUI_ENABLED\":\"${ENABLE_WEBUI}\",\"SCENARIO_SANDBOX_NAMESPACES\":\"${SANDBOX_NS}\",\"DEDUP_BACKEND\":\"redis\",\"REDIS_ADDR\":\"${REDIS_ADDR}\"}}"
+        -p "{\"data\":{\"OLLAMA_MODEL\":\"${MODEL}\",\"OLLAMA_THINK\":\"${OLLAMA_THINK}\",\"OLLAMA_BASE_URL\":\"http://ollama.${OLLAMA_NAMESPACE}.svc.cluster.local:11434/api\",\"WEBUI_ENABLED\":\"${ENABLE_WEBUI}\",\"SCENARIO_SANDBOX_NAMESPACES\":\"${SANDBOX_NS}\",\"DEDUP_BACKEND\":\"redis\",\"REDIS_ADDR\":\"${REDIS_ADDR}\"}}"
 
     if [ "$ENABLE_WEBUI" = true ]; then
         if [ -z "$WEBUI_PASSWORD" ]; then

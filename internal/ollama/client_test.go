@@ -3,9 +3,11 @@ package ollama
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -278,5 +280,217 @@ func TestDecide_NilHooks_NoPanic(t *testing.T) {
 	client := NewClient(srv.URL, "test-model", 100, 0, false, 0)
 	if _, err := client.Decide(context.Background(), "test"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// newBodyCaptureServer returns a test server that records every request body
+// and replies with a valid decision, plus an accessor for the recorded bodies.
+func newBodyCaptureServer(t *testing.T) (*httptest.Server, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		resp := model.ChatResponse{}
+		resp.Message.Content = string(validDecisionJSON())
+		json.NewEncoder(w).Encode(resp)
+	}))
+	return srv, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), bodies...)
+	}
+}
+
+func TestDecide_ThinkFalse_SendsParamAndSoftSwitch(t *testing.T) {
+	srv, bodies := newBodyCaptureServer(t)
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-model", 100, 0, false, 0)
+	think := false
+	client.SetThink(&think)
+	if _, err := client.Decide(context.Background(), "test"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := bodies()
+	if len(got) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(got))
+	}
+	var req model.ChatRequest
+	if err := json.Unmarshal([]byte(got[0]), &req); err != nil {
+		t.Fatalf("request body not JSON: %v", err)
+	}
+	if req.Think == nil || *req.Think {
+		t.Error(`expected "think":false in the request body`)
+	}
+	if !strings.HasSuffix(req.Messages[0].Content, "/no_think") {
+		t.Error("expected the /no_think soft switch appended to the system message")
+	}
+}
+
+func TestDecide_ThinkUnset_OmitsParam(t *testing.T) {
+	srv, bodies := newBodyCaptureServer(t)
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-model", 100, 0, false, 0)
+	if _, err := client.Decide(context.Background(), "test"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := bodies()
+	if len(got) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(got))
+	}
+	if strings.Contains(got[0], `"think"`) {
+		t.Error("think field must be omitted when no mode is configured")
+	}
+	if strings.Contains(got[0], "/no_think") {
+		t.Error("soft switch must not be appended when no mode is configured")
+	}
+}
+
+func TestDecide_ThinkTrue_SendsParamWithoutSoftSwitch(t *testing.T) {
+	srv, bodies := newBodyCaptureServer(t)
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-model", 100, 0, false, 0)
+	think := true
+	client.SetThink(&think)
+	if _, err := client.Decide(context.Background(), "test"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := bodies()
+	var req model.ChatRequest
+	if err := json.Unmarshal([]byte(got[0]), &req); err != nil {
+		t.Fatalf("request body not JSON: %v", err)
+	}
+	if req.Think == nil || !*req.Think {
+		t.Error(`expected "think":true in the request body`)
+	}
+	if strings.Contains(req.Messages[0].Content, "/no_think") {
+		t.Error("soft switch must not be appended when thinking is enabled")
+	}
+}
+
+func TestDecide_ThinkUnsupported_AutoDegrades(t *testing.T) {
+	// OLLAMA_THINK=false must never break models without the thinking
+	// capability (qwen2.5 and friends): on the server's rejection the client
+	// drops the parameter, retries, and latches the degrade for later calls.
+	var mu sync.Mutex
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		if strings.Contains(string(b), `"think"`) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"\"test-model\" does not support thinking"}`))
+			return
+		}
+		resp := model.ChatResponse{}
+		resp.Message.Content = string(validDecisionJSON())
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-model", 100, 0, false, 0)
+	think := false
+	client.SetThink(&think)
+
+	got, err := client.Decide(context.Background(), "test")
+	if err != nil {
+		t.Fatalf("expected auto-degrade to succeed, got %v", err)
+	}
+	if got.Action != model.ActionRestartDeployment {
+		t.Errorf("expected restart_deployment, got %s", got.Action)
+	}
+
+	mu.Lock()
+	n, first, second := len(bodies), bodies[0], bodies[len(bodies)-1]
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("expected 2 requests (rejected + degraded), got %d", n)
+	}
+	if !strings.Contains(first, `"think"`) {
+		t.Error("first request should carry the think parameter")
+	}
+	if strings.Contains(second, `"think"`) {
+		t.Error("degraded retry must drop the think parameter")
+	}
+
+	// The latch persists: later calls go straight out without the parameter.
+	if _, err := client.Decide(context.Background(), "test"); err != nil {
+		t.Fatalf("unexpected error after degrade: %v", err)
+	}
+	mu.Lock()
+	n, third := len(bodies), bodies[len(bodies)-1]
+	mu.Unlock()
+	if n != 3 {
+		t.Fatalf("expected 3 total requests, got %d", n)
+	}
+	if strings.Contains(third, `"think"`) {
+		t.Error("latched client must not send think again")
+	}
+}
+
+func TestCleanModelContent(t *testing.T) {
+	plain := `{"a":1}`
+	cases := []struct{ in, want string }{
+		{plain, plain},
+		{"  \n" + plain + "\n ", plain},
+		// Empty reasoning block: qwen3 emits one even with /no_think on
+		// Ollama versions that do not separate thinking from content.
+		{"<think>\n\n</think>\n" + plain, plain},
+		{"<think>step 1\nstep 2</think>" + plain, plain},
+		{"```json\n" + plain + "\n```", plain},
+		{"```\n" + plain + "\n```", plain},
+		{"<think>x</think>\n```json\n" + plain + "\n```", plain},
+		// Nothing but reasoning: cleans to empty, surfaced upstream as an
+		// "empty ollama response" error rather than a JSON parse failure.
+		{"<think>only reasoning</think>", ""},
+	}
+	for _, c := range cases {
+		if got := cleanModelContent(c.in); got != c.want {
+			t.Errorf("cleanModelContent(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestDecide_ParsesThinkBlockAndFencedContent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := model.ChatResponse{}
+		resp.Message.Content = "<think>\nreasoning...\n</think>\n```json\n" + string(validDecisionJSON()) + "\n```"
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-model", 100, 0, false, 0)
+	got, err := client.Decide(context.Background(), "test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Action != model.ActionRestartDeployment {
+		t.Errorf("expected restart_deployment, got %s", got.Action)
+	}
+}
+
+func TestDecide_OnlyThinkBlockIsEmptyResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := model.ChatResponse{}
+		resp.Message.Content = "<think>endless pondering</think>"
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-model", 100, 0, false, 0)
+	_, err := client.Decide(context.Background(), "test")
+	if err == nil || !strings.Contains(err.Error(), "empty ollama response") {
+		t.Errorf("expected empty-response error, got %v", err)
 	}
 }

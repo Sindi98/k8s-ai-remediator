@@ -33,6 +33,18 @@ type AgentConfig struct {
 	// and produces "context deadline exceeded" before the HTTP client can
 	// fail with its own timeout. Defaults to 300s.
 	PollContextTimeoutSec int
+	// OllamaThink controls the model's reasoning ("thinking") mode via the
+	// native `think` parameter of the Ollama chat API. OLLAMA_THINK accepts:
+	//   - "false" (default): thinking disabled. Required for reasoning
+	//     models (qwen3.x, gemma4): with thinking on, a CPU-bound call spends
+	//     minutes emitting reasoning tokens and blows through
+	//     OLLAMA_HTTP_TIMEOUT_SECONDS before any JSON is produced.
+	//   - "true": thinking enabled (needs generous timeouts).
+	//   - "auto": omit the parameter, keeping the server/model default.
+	// Models without the thinking capability are handled transparently: if
+	// the server rejects the parameter the client retries without it and
+	// stops sending it (see internal/ollama).
+	OllamaThink *bool
 	MetricsAddr           string
 	LeaderElection        bool
 	LeaseName             string
@@ -139,7 +151,7 @@ type AgentConfig struct {
 func LoadFromEnv() AgentConfig {
 	cfg := AgentConfig{
 		BaseURL:                  Getenv("OLLAMA_BASE_URL", "http://ollama.ollama.svc.cluster.local:11434/api"),
-		Model:                    Getenv("OLLAMA_MODEL", "qwen2.5:7b"),
+		Model:                    Getenv("OLLAMA_MODEL", "qwen3.5:9b"),
 		DryRun:                   Getbool("DRY_RUN", false),
 		MinScale:                 int32(Getint("SCALE_MIN", 1)),
 		MaxScale:                 int32(Getint("SCALE_MAX", 5)),
@@ -152,6 +164,7 @@ func LoadFromEnv() AgentConfig {
 		OllamaTLSSkipVerify:      Getbool("OLLAMA_TLS_SKIP_VERIFY", false),
 		OllamaHTTPTimeoutSec:     Getint("OLLAMA_HTTP_TIMEOUT_SECONDS", 180),
 		PollContextTimeoutSec:    Getint("POLL_CONTEXT_TIMEOUT_SECONDS", 300),
+		OllamaThink:              GetOptionalBool("OLLAMA_THINK", "false"),
 		MetricsAddr:              Getenv("METRICS_ADDR", ":9090"),
 		LeaderElection:           Getbool("LEADER_ELECTION", false),
 		LeaseName:                Getenv("LEASE_NAME", "ai-remediator-leader"),
@@ -221,6 +234,23 @@ func Getbool(key string, def bool) bool {
 		return def
 	}
 	return v == "1" || v == "true" || v == "yes"
+}
+
+// GetOptionalBool reads a tri-state boolean used for optional upstream API
+// fields. "auto" (or "omit") yields nil — the field is left out of the
+// request entirely — while any other value follows the Getbool truthiness
+// rules. def replaces the raw value when the variable is unset or empty.
+func GetOptionalBool(key, def string) *bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if v == "" {
+		v = strings.ToLower(strings.TrimSpace(def))
+	}
+	switch v {
+	case "", "auto", "omit":
+		return nil
+	}
+	b := v == "1" || v == "true" || v == "yes"
+	return &b
 }
 
 func Getint(key string, def int) int {

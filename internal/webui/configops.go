@@ -36,10 +36,22 @@ func (s *Server) handleUpdateLLM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	baseURL := formValueTrim(r, "base_url")
+	// Reasoning mode for the chosen model. Empty = leave unchanged; "auto"
+	// is stored verbatim and makes the agent omit the think parameter.
+	think := strings.ToLower(formValueTrim(r, "think"))
+	switch think {
+	case "", "auto", "true", "false":
+	default:
+		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("think must be one of auto, true, false"))
+		return
+	}
 
 	updates := map[string]string{"OLLAMA_MODEL": model}
 	if baseURL != "" {
 		updates["OLLAMA_BASE_URL"] = baseURL
+	}
+	if think != "" {
+		updates["OLLAMA_THINK"] = think
 	}
 
 	if err := s.patchConfigMap(r.Context(), updates); err != nil {
