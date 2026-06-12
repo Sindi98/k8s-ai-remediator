@@ -1600,6 +1600,15 @@ kubectl -n ai-remediator logs deploy/ai-remediator-agent --tail=5 \
   | grep -o 'explicit-param-schema' || echo "old binary!"
 ```
 
+> **Residual `set_deployment_image` case**: the agent cannot *invent* the
+> correct image (it does not know which valid tag you want). If the model
+> picks `set_deployment_image` without `params.image`, the prompt redirects it
+> to `restart_deployment` (retry the pull, fixes transient failures); if the
+> tag is permanently non-existent, the circuit breaker (`SIGNAL_MAX_ATTEMPTS`)
+> marks it `mark_for_manual_fix` on the dashboard. Probe, OOM resources and
+> FailedScheduling are instead completed deterministically even with empty
+> `params`.
+
 ### `Post "...": context deadline exceeded` (without `Client.Timeout`)
 
 Here it's the `pollCtx` expiring, not the HTTP client. Raise

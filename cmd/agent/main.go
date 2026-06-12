@@ -189,20 +189,27 @@ func executeDecision(
 			return err
 		}
 		params := d.Parameters
-		if isOOMContext(extra) {
+		switch {
+		case isOOMContext(extra):
 			// Deterministic safety net for a directly-chosen patch_resources:
 			// a weak model often proposes a memory_limit only marginally above
 			// the current one (or omits it), which passes validation but OOMs
 			// again. Raise it to the same floor the OOM auto-escalation uses.
 			params = withOOMMemoryFloor(ctx, cs, d.Namespace, depName, params)
-		}
-		if strings.EqualFold(strings.TrimSpace(eventReason), "FailedScheduling") && !hasResourceParams(params) {
-			// Same class of completion as the OOM floor: the prompt's rule 2
-			// tells the model to lower requests to schedulable-anywhere values
-			// on FailedScheduling, but a model that emits empty parameters
-			// would otherwise leave the workload Pending forever. Mirror those
-			// exact values; the opt-in annotation still gates the patch.
+		case strings.EqualFold(strings.TrimSpace(eventReason), "FailedScheduling") && !hasResourceParams(params):
+			// The prompt's rule 2 tells the model to lower requests to
+			// schedulable-anywhere values on FailedScheduling, but a model that
+			// emits empty parameters would otherwise leave the workload Pending
+			// forever. Mirror those exact values; the opt-in annotation gates it.
 			params = withSchedulableResourceDefaults(params)
+		case !hasResourceParams(params):
+			// patch_resources with no quantities and no OOM marker in our
+			// snapshot (the pod read can time out, so `extra` may miss the
+			// OOMKilled/exit=137 the model saw): the dominant cause is memory
+			// pressure. Apply the same memory floor from the container's
+			// current limit instead of failing — observed with memory-hog,
+			// where the model picks patch_resources but invents no quantity.
+			params = withOOMMemoryFloor(ctx, cs, d.Namespace, depName, params)
 		}
 		return kube.PatchDeploymentResources(ctx, cs, d.Namespace, depName, params["container"], params, cfg.DryRun)
 

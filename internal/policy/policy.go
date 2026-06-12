@@ -226,10 +226,14 @@ noop, restart_deployment, delete_failed_pod, delete_and_recreate_pod, scale_depl
    - If the image in the Deployment snapshot is SYNTACTICALLY VALID (looks like a real tag):
        action=restart_deployment, severity=high, params: deployment_name
        (this retries the pull; transient network or registry rate-limit)
-   - If the image is clearly wrong/inventato AND you know a safe replacement:
+   - If the image is clearly wrong/inventato AND you can name a concrete safe replacement:
        action=set_deployment_image, severity=high
        params: deployment_name, image=<DIFFERENT valid image string>
        NEVER propose the SAME image already in the snapshot (no-op).
+       HARD RULE: only choose set_deployment_image when you put a concrete
+       image string in params.image. If you CANNOT name a specific
+       replacement image, choose restart_deployment instead (retry the pull)
+       — never emit set_deployment_image with an empty params.image.
    - If the wrong registry host is the root cause AND "Allow-patch scopes" contains "registry" or "*":
        action=patch_registry
        params: deployment_name, container, new_registry

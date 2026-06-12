@@ -788,18 +788,48 @@ func TestExecuteDecision_PatchResources_FailedSchedulingDefaults(t *testing.T) {
 	}
 }
 
-func TestExecuteDecision_PatchResources_NonFailedSchedulingEmptyParamsStillFails(t *testing.T) {
-	// The schedulable defaults are FailedScheduling-specific: an empty
-	// patch_resources on any other reason (and no OOM context) must keep
-	// failing — guessing quantities there would be arbitrary.
+func TestExecuteDecision_PatchResources_EmptyParamsNonOOMAppliesMemoryFloor(t *testing.T) {
+	// Even outside FailedScheduling/explicit-OOM, an empty patch_resources must
+	// not fail: the pod read can time out so `extra` may miss the OOMKilled
+	// marker the model saw (observed with memory-hog). The dominant cause is
+	// memory pressure, so apply the memory floor from the container's current
+	// limit. newPatchableClusterForAgent sets no limit → floor is 512Mi.
 	cs := newPatchableClusterForAgent(t, "resources")
+	ctx := context.Background()
 	d := model.Decision{
 		Action: model.ActionPatchResources, Namespace: "default",
 		ResourceKind: "Deployment", ResourceName: "app", Confidence: 0.95,
 		Parameters: map[string]string{},
 	}
-	if err := executeDecision(context.Background(), cs, d, patchFlagsCfg(), "BackOff", "state=Running"); err == nil {
-		t.Error("expected empty patch_resources to fail outside FailedScheduling/OOM contexts")
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg(), "BackOff", "state=Running"); err != nil {
+		t.Fatalf("expected the memory-floor fallback to apply, got %v", err)
+	}
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "app", metav1.GetOptions{})
+	got := dep.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory]
+	if got.Cmp(resource.MustParse("512Mi")) != 0 {
+		t.Errorf("expected memory_limit floored to 512Mi, got %s", got.String())
+	}
+}
+
+func TestExecuteDecision_PatchResources_EmptyParamsFlooredFromCurrentLimit(t *testing.T) {
+	// With a low current limit (32Mi, the memory-hog scenario) and no OOM
+	// marker in `extra`, the floor is still max(4x current, 512Mi) = 512Mi —
+	// the value the OOM auto-escalation would have produced. This is the exact
+	// memory-hog field case: model emits only the copyable deployment_name.
+	cs := newMemHogCluster(t)
+	ctx := context.Background()
+	d := model.Decision{
+		Action: model.ActionPatchResources, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "memory-hog", Confidence: 0.95,
+		Parameters: map[string]string{"deployment_name": "memory-hog"},
+	}
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg(), "BackOff", ""); err != nil {
+		t.Fatalf("expected the memory-floor fallback to apply, got %v", err)
+	}
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "memory-hog", metav1.GetOptions{})
+	got := dep.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory]
+	if got.Cmp(resource.MustParse("512Mi")) != 0 {
+		t.Errorf("expected memory_limit floored to 512Mi, got %s", got.String())
 	}
 }
 
