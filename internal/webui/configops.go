@@ -335,6 +335,7 @@ var generalKeys = map[string]configKind{
 	"DEDUP_BACKEND":                     kindEnum, // "memory" | "redis"
 	"DEDUPE_TTL_SECONDS":                kindInt,
 	"EVENT_SEEN_TTL_SECONDS":            kindInt,
+	"SIGNAL_MAX_ATTEMPTS":               kindInt,
 	"REDIS_ADDR":                        kindString,
 	"REDIS_DB":                          kindInt,
 	"REDIS_KEY_PREFIX":                  kindString,

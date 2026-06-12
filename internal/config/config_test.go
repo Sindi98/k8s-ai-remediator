@@ -204,6 +204,9 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	if cfg.MaxEventsPerPoll != 10 {
 		t.Errorf("expected maxEventsPerPoll 10, got %d", cfg.MaxEventsPerPoll)
 	}
+	if cfg.SignalMaxAttempts != 5 {
+		t.Errorf("expected signalMaxAttempts 5, got %d", cfg.SignalMaxAttempts)
+	}
 }
 
 func TestGetOptionalBool(t *testing.T) {
@@ -212,11 +215,11 @@ func TestGetOptionalBool(t *testing.T) {
 		def  string
 		want *bool // nil = field omitted
 	}{
-		{"", "false", boolPtr(false)},  // unset → default applies
-		{"", "auto", nil},              // unset → default "auto" omits
-		{"", "", nil},                  // unset, no default → omit
-		{"auto", "false", nil},         // explicit auto wins over default
-		{"omit", "false", nil},         // alias of auto
+		{"", "false", boolPtr(false)}, // unset → default applies
+		{"", "auto", nil},             // unset → default "auto" omits
+		{"", "", nil},                 // unset, no default → omit
+		{"auto", "false", nil},        // explicit auto wins over default
+		{"omit", "false", nil},        // alias of auto
 		{"false", "auto", boolPtr(false)},
 		{"true", "false", boolPtr(true)},
 		{"1", "false", boolPtr(true)},

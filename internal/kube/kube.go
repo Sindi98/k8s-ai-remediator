@@ -6,6 +6,7 @@ package kube
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -50,6 +51,39 @@ func mutateDeployment(
 // in to the patch_* actions. Its value is a comma-separated list of the
 // allowed scopes: "probe", "resources", "registry", or "*" for all.
 const AllowPatchAnnotation = "ai-remediator/allow-patch"
+
+// LastChangeAnnotation holds a compact JSON snapshot of the values the
+// agent's latest mutation overwrote, so an operator can revert it without
+// digging through ReplicaSet history. Single-step undo by design: every new
+// mutation replaces the previous snapshot.
+const LastChangeAnnotation = "ai-remediator/last-change"
+
+// lastChange is the schema stored in LastChangeAnnotation.
+type lastChange struct {
+	Action    string            `json:"action"`
+	Container string            `json:"container,omitempty"`
+	Previous  map[string]string `json:"previous"`
+	At        string            `json:"at"`
+}
+
+// setLastChangeAnnotation records the pre-mutation values on the Deployment
+// metadata. Deliberately NOT on the pod template, so it adds no rollout
+// trigger beyond the mutation itself.
+func setLastChangeAnnotation(dep *appsv1.Deployment, action, container string, previous map[string]string) {
+	payload, err := json.Marshal(lastChange{
+		Action:    action,
+		Container: container,
+		Previous:  previous,
+		At:        time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		return // unreachable with map[string]string values; defensive only
+	}
+	if dep.Annotations == nil {
+		dep.Annotations = map[string]string{}
+	}
+	dep.Annotations[LastChangeAnnotation] = string(payload)
+}
 
 // DeploymentAllowsPatch returns true if the deployment carries the opt-in
 // annotation and lists the requested scope (or "*").
@@ -230,6 +264,11 @@ func ScaleDeployment(ctx context.Context, cs kubernetes.Interface, ns, name stri
 		return nil
 	}
 	return mutateDeployment(ctx, cs, ns, name, func(dep *appsv1.Deployment) error {
+		prev := "1" // Kubernetes default when spec.replicas is unset
+		if dep.Spec.Replicas != nil {
+			prev = strconv.Itoa(int(*dep.Spec.Replicas))
+		}
+		setLastChangeAnnotation(dep, "scale_deployment", "", map[string]string{"replicas": prev})
 		r := replicas
 		dep.Spec.Replicas = &r
 		return nil
@@ -259,7 +298,9 @@ func SetDeploymentImage(ctx context.Context, cs kubernetes.Interface, ns, name, 
 		if err != nil {
 			return err
 		}
-		dep.Spec.Template.Spec.Containers[idx].Image = image
+		c := &dep.Spec.Template.Spec.Containers[idx]
+		setLastChangeAnnotation(dep, "set_deployment_image", c.Name, map[string]string{"image": c.Image})
+		c.Image = image
 		return nil
 	})
 }
@@ -362,6 +403,17 @@ func PatchDeploymentProbe(ctx context.Context, cs kubernetes.Interface, ns, name
 			return fmt.Errorf("container %q has no %s probe to patch", c.Name, probeType)
 		}
 
+		// Snapshot every timing field before touching any: a revert needs the
+		// complete previous shape, not just the fields this patch happened to set.
+		setLastChangeAnnotation(dep, "patch_probe", c.Name, map[string]string{
+			"probe":                 strings.ToLower(strings.TrimSpace(probeType)),
+			"initial_delay_seconds": strconv.Itoa(int((*probe).InitialDelaySeconds)),
+			"period_seconds":        strconv.Itoa(int((*probe).PeriodSeconds)),
+			"failure_threshold":     strconv.Itoa(int((*probe).FailureThreshold)),
+			"success_threshold":     strconv.Itoa(int((*probe).SuccessThreshold)),
+			"timeout_seconds":       strconv.Itoa(int((*probe).TimeoutSeconds)),
+		})
+
 		changed := false
 		for key, raw := range fields {
 			v, err := parseProbeField(key, raw)
@@ -432,6 +484,23 @@ func PatchDeploymentResources(ctx context.Context, cs kubernetes.Interface, ns, 
 			return err
 		}
 		c := &dep.Spec.Template.Spec.Containers[idx]
+
+		// Snapshot the current quantities (only the ones present) before any
+		// mutation, so the previous shape is recoverable as a whole.
+		prev := map[string]string{}
+		if v, ok := c.Resources.Requests[corev1.ResourceCPU]; ok {
+			prev["cpu_request"] = v.String()
+		}
+		if v, ok := c.Resources.Requests[corev1.ResourceMemory]; ok {
+			prev["memory_request"] = v.String()
+		}
+		if v, ok := c.Resources.Limits[corev1.ResourceCPU]; ok {
+			prev["cpu_limit"] = v.String()
+		}
+		if v, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
+			prev["memory_limit"] = v.String()
+		}
+		setLastChangeAnnotation(dep, "patch_resources", c.Name, prev)
 
 		if c.Resources.Requests == nil {
 			c.Resources.Requests = corev1.ResourceList{}
@@ -548,6 +617,7 @@ func PatchDeploymentRegistry(ctx context.Context, cs kubernetes.Interface, ns, n
 		if newImage == c.Image {
 			return fmt.Errorf("new registry produces the same image %q; no change", newImage)
 		}
+		setLastChangeAnnotation(dep, "patch_registry", c.Name, map[string]string{"image": c.Image})
 		dep.Spec.Template.Spec.Containers[idx].Image = newImage
 		return nil
 	}
