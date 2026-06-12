@@ -805,3 +805,32 @@ func TestDeletePod_NotFoundIsSuccess(t *testing.T) {
 		t.Errorf("DeleteAndRecreatePod on missing pod should be a no-op success, got %v", err)
 	}
 }
+
+func TestRetagImage(t *testing.T) {
+	cases := []struct {
+		image, tag, want string
+	}{
+		{"busybox:this-tag-does-not-exist-abcd1234", "latest", "busybox:latest"},
+		{"busybox", "latest", "busybox:latest"}, // no tag → append
+		{"host.docker.internal:5050/busybox:1.36", "latest", "host.docker.internal:5050/busybox:latest"},
+		{"host.docker.internal:5050/busybox", "latest", "host.docker.internal:5050/busybox:latest"},
+		{"docker.io/library/nginx:1.25", "latest", "docker.io/library/nginx:latest"},
+		{"nginx@sha256:0000000000000000000000000000000000000000000000000000000000000000", "latest", "nginx:latest"},
+	}
+	for _, c := range cases {
+		got, err := RetagImage(c.image, c.tag)
+		if err != nil {
+			t.Errorf("RetagImage(%q,%q) err=%v", c.image, c.tag, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("RetagImage(%q,%q)=%q want %q", c.image, c.tag, got, c.want)
+		}
+	}
+	if _, err := RetagImage("", "latest"); err == nil {
+		t.Error("expected error for empty image")
+	}
+	if _, err := RetagImage("nginx:1.25", ""); err == nil {
+		t.Error("expected error for empty tag")
+	}
+}

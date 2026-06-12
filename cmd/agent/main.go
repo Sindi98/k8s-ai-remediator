@@ -79,6 +79,24 @@ func executeDecision(
 	if err := policy.MaybeBlockWrongActionOnFailedScheduling(d, eventReason); err != nil {
 		return err
 	}
+	// Complete a set_deployment_image that names no image BEFORE the policy
+	// guard, per the operator's fallback-tag policy (IMAGE_FALLBACK_TAG):
+	// retag the container's current image. Models reliably emit parameters
+	// they can copy from the context but omit ones they must invent. The
+	// synthesized reference then passes the exact same gates as a
+	// model-provided one: feature flag, confidence threshold, OCI validation
+	// and the no-op rejection (current image already on the fallback tag).
+	if d.Action == model.ActionSetDeploymentImage && cfg.AllowImageUpdates && cfg.ImageFallbackTag != "" &&
+		strings.TrimSpace(d.Parameters["image"]) == "" {
+		if img, ok := deriveFallbackImage(ctx, cs, d, cfg.ImageFallbackTag); ok {
+			slog.Info("set_deployment_image: completing missing image with the fallback tag",
+				"ns", d.Namespace, "image", img, "fallbackTag", cfg.ImageFallbackTag)
+			if d.Parameters == nil {
+				d.Parameters = map[string]string{}
+			}
+			d.Parameters["image"] = img
+		}
+	}
 	if err := policy.MaybeBlockUnsafeImageUpdate(d, cfg.AllowImageUpdates, cfg.ImageUpdateThreshold); err != nil {
 		return err
 	}
@@ -327,6 +345,40 @@ func tryAutoPatchProbeOnUnhealthy(ctx context.Context, cs kubernetes.Interface, 
 	transformed.Parameters["period_seconds"] = "15"
 	transformed.Parameters["timeout_seconds"] = "5"
 	return transformed, true
+}
+
+// deriveFallbackImage resolves the decision's target Deployment, picks the
+// container named in params (or the first one) and retags its current image
+// with fallbackTag. Returns ("", false) when the deployment or container
+// cannot be resolved — the decision then fails downstream with the regular
+// "parameters.image missing" guard.
+func deriveFallbackImage(ctx context.Context, cs kubernetes.Interface, d model.Decision, fallbackTag string) (string, bool) {
+	depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName, d.Parameters)
+	if err != nil {
+		return "", false
+	}
+	dep, err := cs.AppsV1().Deployments(d.Namespace).Get(ctx, depName, metav1.GetOptions{})
+	if err != nil {
+		return "", false
+	}
+	containers := dep.Spec.Template.Spec.Containers
+	if len(containers) == 0 {
+		return "", false
+	}
+	idx := 0
+	if name := strings.TrimSpace(d.Parameters["container"]); name != "" {
+		for i, c := range containers {
+			if c.Name == name {
+				idx = i
+				break
+			}
+		}
+	}
+	img, err := kube.RetagImage(containers[idx].Image, fallbackTag)
+	if err != nil {
+		return "", false
+	}
+	return img, true
 }
 
 // chooseProbeFromDeployment picks the container+probe to relax, preferring

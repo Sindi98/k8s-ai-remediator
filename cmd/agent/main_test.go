@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -852,5 +853,99 @@ func TestExecuteDecision_PatchResources_FailedSchedulingKeepsModelValues(t *test
 	}
 	if _, ok := r.Limits[corev1.ResourceMemory]; ok {
 		t.Error("fallback defaults must not be applied when the model provided params")
+	}
+}
+
+func TestExecuteDecision_SetImage_EmptyImageUsesFallbackTag(t *testing.T) {
+	// The exact broken-image incident: the model picks set_deployment_image
+	// with only the copyable deployment_name; the operator policy says the
+	// valid tag is always <name>:latest. The executor must retag the current
+	// image instead of dying on "parameters.image missing".
+	cs := newPatchableClusterForAgent(t, "*") // image wrong.registry.io/repo/app:v1
+	ctx := context.Background()
+	cfg := patchFlagsCfg()
+	cfg.AllowImageUpdates = true
+	cfg.ImageUpdateThreshold = 0.92
+	cfg.ImageFallbackTag = "latest"
+
+	d := model.Decision{
+		Action: model.ActionSetDeploymentImage, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 1,
+		Parameters: map[string]string{"deployment_name": "app"},
+	}
+	if err := executeDecision(ctx, cs, d, cfg, "Failed", ""); err != nil {
+		t.Fatalf("expected the fallback tag to complete the decision, got %v", err)
+	}
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "app", metav1.GetOptions{})
+	if got := dep.Spec.Template.Spec.Containers[0].Image; got != "wrong.registry.io/repo/app:latest" {
+		t.Errorf("expected image retagged to :latest, got %q", got)
+	}
+}
+
+func TestExecuteDecision_SetImage_FallbackStillGatedByConfidence(t *testing.T) {
+	// The synthesized image passes through the SAME gates as a model-provided
+	// one: below the confidence threshold the decision stays blocked.
+	cs := newPatchableClusterForAgent(t, "*")
+	cfg := patchFlagsCfg()
+	cfg.AllowImageUpdates = true
+	cfg.ImageUpdateThreshold = 0.92
+	cfg.ImageFallbackTag = "latest"
+
+	d := model.Decision{
+		Action: model.ActionSetDeploymentImage, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 0.5,
+		Parameters: map[string]string{},
+	}
+	if err := executeDecision(context.Background(), cs, d, cfg, "Failed", ""); err == nil {
+		t.Error("fallback image must not bypass the confidence threshold")
+	}
+}
+
+func TestExecuteDecision_SetImage_FallbackDisabledKeepsMissingImageError(t *testing.T) {
+	cs := newPatchableClusterForAgent(t, "*")
+	cfg := patchFlagsCfg()
+	cfg.AllowImageUpdates = true
+	cfg.ImageUpdateThreshold = 0.92
+	cfg.ImageFallbackTag = "" // operator opted out
+
+	d := model.Decision{
+		Action: model.ActionSetDeploymentImage, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 1,
+		Parameters: map[string]string{},
+	}
+	err := executeDecision(context.Background(), cs, d, cfg, "Failed", "")
+	if err == nil || !strings.Contains(err.Error(), "parameters.image missing") {
+		t.Errorf("expected the missing-image guard with the fallback disabled, got %v", err)
+	}
+}
+
+func TestExecuteDecision_SetImage_FallbackAlreadyOnTagIsRejectedAsNoop(t *testing.T) {
+	// Current image already carries the fallback tag and still fails to pull:
+	// the retag is a no-op and must be rejected with the informative no-op
+	// error (suggesting restart), not applied as a pointless rollout.
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "app"}},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "main", Image: "busybox:latest"}},
+			}},
+		},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	cfg := defaultCfg()
+	cfg.AllowImageUpdates = true
+	cfg.ImageUpdateThreshold = 0.92
+	cfg.ImageFallbackTag = "latest"
+
+	d := model.Decision{
+		Action: model.ActionSetDeploymentImage, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 1,
+		Parameters: map[string]string{},
+	}
+	err := executeDecision(context.Background(), cs, d, cfg, "Failed", "")
+	if err == nil || !strings.Contains(err.Error(), "no-op") {
+		t.Errorf("expected the informative no-op rejection, got %v", err)
 	}
 }

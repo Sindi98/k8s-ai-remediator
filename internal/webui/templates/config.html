@@ -100,6 +100,9 @@
     <label>Image-update confidence threshold (0–1)
       <input name="IMAGE_UPDATE_CONFIDENCE_THRESHOLD" type="number" step="0.01" min="0" max="1" placeholder="0.92">
     </label>
+    <label>Image fallback tag (used when the LLM names no image; e.g. "latest")
+      <input name="IMAGE_FALLBACK_TAG" placeholder="latest">
+    </label>
     <label class="checkbox">
       <input type="checkbox" name="ALLOW_PATCH_PROBE" value="true"> Allow patch_probe
     </label>

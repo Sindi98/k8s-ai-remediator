@@ -20,10 +20,19 @@ type AgentConfig struct {
 	PollSec              int
 	AllowImageUpdates    bool
 	ImageUpdateThreshold float64
-	PodLogTailLines      int64
-	OllamaRPS            float64
-	OllamaMaxRetries     int
-	OllamaTLSSkipVerify  bool
+	// ImageFallbackTag completes a set_deployment_image decision that names
+	// no image: the executor retags the container's CURRENT image with this
+	// tag (operator policy: "the valid tag is always <name>:latest"). Models
+	// reliably emit parameters they can copy from the context but omit ones
+	// they must invent — without this, every such decision dies on
+	// "parameters.image missing". Only applies when AllowImageUpdates is on;
+	// the synthesized reference passes the same OCI validation, confidence
+	// threshold and no-op rejection as a model-provided one. Empty disables.
+	ImageFallbackTag    string
+	PodLogTailLines     int64
+	OllamaRPS           float64
+	OllamaMaxRetries    int
+	OllamaTLSSkipVerify bool
 	// OllamaHTTPTimeoutSec caps the per-request HTTP timeout toward Ollama.
 	// Local LLMs can take > 90s on the first call, so the default is 180s.
 	OllamaHTTPTimeoutSec int
@@ -165,6 +174,7 @@ func LoadFromEnv() AgentConfig {
 		PollSec:                  Getint("POLL_INTERVAL_SECONDS", 30),
 		AllowImageUpdates:        Getbool("ALLOW_IMAGE_UPDATES", false),
 		ImageUpdateThreshold:     Getfloat("IMAGE_UPDATE_CONFIDENCE_THRESHOLD", 0.92),
+		ImageFallbackTag:         Getenv("IMAGE_FALLBACK_TAG", "latest"),
 		PodLogTailLines:          int64(Getint("POD_LOG_TAIL_LINES", 200)),
 		OllamaRPS:                Getfloat("OLLAMA_RPS", 2.0),
 		OllamaMaxRetries:         Getint("OLLAMA_MAX_RETRIES", 3),

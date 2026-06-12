@@ -455,6 +455,7 @@ All variables are read from environment variables (typically via ConfigMap).
 | `SCALE_MAX` | `5` | Maximum allowed replicas |
 | `ALLOW_IMAGE_UPDATES` | `false` | Enables the `set_deployment_image` action |
 | `IMAGE_UPDATE_CONFIDENCE_THRESHOLD` | `0.92` | Minimum confidence to update an image |
+| `IMAGE_FALLBACK_TAG` | `latest` | Completes a `set_deployment_image` without `params.image`: the executor retags the container's current image with this tag (policy: "the valid tag is always `<name>:latest`"). The synthesized reference passes the same gates as a model-provided one (flag, confidence, OCI validation, no-op rejection). Empty = disabled |
 | `ALLOW_PATCH_PROBE` | `false` | Enables the `patch_probe` action (also requires the `ai-remediator/allow-patch` annotation with scope `probe`) |
 | `ALLOW_PATCH_RESOURCES` | `false` | Enables the `patch_resources` action (scope `resources`) |
 | `ALLOW_PATCH_REGISTRY` | `false` | Enables the `patch_registry` action (scope `registry`) |
@@ -1600,14 +1601,14 @@ kubectl -n ai-remediator logs deploy/ai-remediator-agent --tail=5 \
   | grep -o 'explicit-param-schema' || echo "old binary!"
 ```
 
-> **Residual `set_deployment_image` case**: the agent cannot *invent* the
-> correct image (it does not know which valid tag you want). If the model
-> picks `set_deployment_image` without `params.image`, the prompt redirects it
-> to `restart_deployment` (retry the pull, fixes transient failures); if the
-> tag is permanently non-existent, the circuit breaker (`SIGNAL_MAX_ATTEMPTS`)
-> marks it `mark_for_manual_fix` on the dashboard. Probe, OOM resources and
-> FailedScheduling are instead completed deterministically even with empty
-> `params`.
+> **`set_deployment_image` without an image**: with `IMAGE_FALLBACK_TAG`
+> (default `latest`) the executor completes the missing image by retagging
+> the container's current one (`busybox:broken-tag` → `busybox:latest`),
+> under the same gates as a model-provided reference. With the fallback
+> disabled, the prompt redirects to `restart_deployment` (pull retry) and,
+> if the problem persists, the circuit breaker marks it
+> `mark_for_manual_fix`. Probe, OOM resources and FailedScheduling are also
+> completed deterministically with empty `params`.
 
 ### `Post "...": context deadline exceeded` (without `Client.Timeout`)
 

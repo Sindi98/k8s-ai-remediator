@@ -328,6 +328,7 @@ var generalKeys = map[string]configKind{
 	"SCENARIO_SANDBOX_NAMESPACES":       kindCSV,
 	"ALLOW_IMAGE_UPDATES":               kindBool,
 	"IMAGE_UPDATE_CONFIDENCE_THRESHOLD": kindUnitFloat,
+	"IMAGE_FALLBACK_TAG":                kindString,
 	"ALLOW_PATCH_PROBE":                 kindBool,
 	"ALLOW_PATCH_RESOURCES":             kindBool,
 	"ALLOW_PATCH_REGISTRY":              kindBool,

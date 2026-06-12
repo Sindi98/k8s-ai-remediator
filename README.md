@@ -455,6 +455,7 @@ Tutte le variabili sono lette da environment (tipicamente via ConfigMap).
 | `SCALE_MAX` | `5` | Massimo numero di repliche consentite |
 | `ALLOW_IMAGE_UPDATES` | `false` | Abilita l'azione `set_deployment_image` |
 | `IMAGE_UPDATE_CONFIDENCE_THRESHOLD` | `0.92` | Confidenza minima per aggiornare un'immagine |
+| `IMAGE_FALLBACK_TAG` | `latest` | Completa una `set_deployment_image` senza `params.image`: l'executor ritagga l'immagine corrente del container con questo tag (policy: "il tag valido è sempre `<nome>:latest`"). La reference sintetizzata passa gli stessi gate di una fornita dal modello (flag, confidence, validazione OCI, no-op rejection). Vuoto = disabilitato |
 | `ALLOW_PATCH_PROBE` | `false` | Abilita l'azione `patch_probe` (richiede anche annotation `ai-remediator/allow-patch` con scope `probe`) |
 | `ALLOW_PATCH_RESOURCES` | `false` | Abilita l'azione `patch_resources` (scope `resources`) |
 | `ALLOW_PATCH_REGISTRY` | `false` | Abilita l'azione `patch_registry` (scope `registry`) |
@@ -1601,14 +1602,14 @@ kubectl -n ai-remediator logs deploy/ai-remediator-agent --tail=5 \
   | grep -o 'explicit-param-schema' || echo "binario vecchio!"
 ```
 
-> **Caso residuo `set_deployment_image`**: l'agente non può *inventare*
-> l'immagine corretta (non sa quale tag valido vuoi). Se il modello sceglie
-> `set_deployment_image` senza `params.image`, il prompt lo reindirizza a
-> `restart_deployment` (retry del pull, risolve i fallimenti transitori); se
-> il tag è permanentemente inesistente, il circuit breaker
-> (`SIGNAL_MAX_ATTEMPTS`) lo marca `mark_for_manual_fix` sulla dashboard.
-> Probe, risorse OOM e FailedScheduling vengono invece completati in modo
-> deterministico anche con `params` vuoti.
+> **Caso `set_deployment_image` senza immagine**: con `IMAGE_FALLBACK_TAG`
+> (default `latest`) l'executor completa l'immagine mancante ritaggando
+> quella corrente del container (`busybox:tag-rotto` → `busybox:latest`),
+> sotto gli stessi gate di una fornita dal modello. Con il fallback
+> disabilitato il prompt reindirizza a `restart_deployment` (retry del pull)
+> e, se il problema persiste, il circuit breaker lo marca
+> `mark_for_manual_fix`. Probe, risorse OOM e FailedScheduling vengono
+> anch'essi completati in modo deterministico con `params` vuoti.
 
 ### `Post "...": context deadline exceeded` (senza `Client.Timeout`)
 
