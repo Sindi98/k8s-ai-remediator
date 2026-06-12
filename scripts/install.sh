@@ -24,6 +24,9 @@
 #   --model NAME         Ollama model to pull/use         [MODEL]
 #   --think MODE         Model thinking mode: false|true|auto (default: false;
 #                        required "false" for reasoning models like qwen3.x) [OLLAMA_THINK]
+#   --ollama-storage SZ  PVC size for Ollama models (/root/.ollama), e.g. 20Gi.
+#                        "none" = emptyDir: models re-download on every
+#                        Ollama pod restart                            [OLLAMA_STORAGE]
 #   --build              Build & push the image first (needs Docker)  [BUILD=true]
 #   --skip-ollama        Do not install Ollama / pull the model       [INSTALL_OLLAMA=false]
 #   --no-webui           Install the agent without the admin GUI      [ENABLE_WEBUI=false]
@@ -69,6 +72,11 @@ MODEL="${MODEL:-qwen3.5:9b}"
 # "auto" keeps the Ollama server default; models without the capability are
 # detected and handled automatically by the agent.
 OLLAMA_THINK="${OLLAMA_THINK:-false}"
+# Persistent storage for the Ollama model weights. Without it (value "none",
+# the previous emptyDir behaviour) every Ollama pod restart re-downloads
+# several GB and decisions time out until the pull completes. Requires a
+# default StorageClass, like the Redis PVC already does.
+OLLAMA_STORAGE="${OLLAMA_STORAGE:-20Gi}"
 SANDBOX_NS="${SANDBOX_NS:-incident-lab}"
 
 # Redis is the (mandatory) dedup backend. Leave REDIS_ADDR empty to install the
@@ -134,6 +142,7 @@ while [ "$#" -gt 0 ]; do
         --registry)         REGISTRY="$2"; shift 2 ;;
         --model)            MODEL="$2"; shift 2 ;;
         --think)            OLLAMA_THINK="$2"; shift 2 ;;
+        --ollama-storage)   OLLAMA_STORAGE="$2"; shift 2 ;;
         --build)            BUILD=true; shift ;;
         --skip-ollama)      INSTALL_OLLAMA=false; shift ;;
         --no-webui)         ENABLE_WEBUI=false; shift ;;
@@ -169,7 +178,7 @@ preflight() {
     [ -n "$REDIS_ADDR" ] || [ -f "${DEPLOY_DIR}/redis.yaml" ] || die "deploy/redis.yaml not found (needed for the bundled Redis; or pass --redis-addr for an external one)"
     info "kubectl context: $(kubectl config current-context 2>/dev/null || echo '?')"
     info "agent image:     ${IMAGE}"
-    info "ollama model:    ${MODEL} ($([ "$INSTALL_OLLAMA" = true ] && echo 'will install Ollama' || echo 'Ollama install skipped'), thinking: ${OLLAMA_THINK})"
+    info "ollama model:    ${MODEL} ($([ "$INSTALL_OLLAMA" = true ] && echo 'will install Ollama' || echo 'Ollama install skipped'), thinking: ${OLLAMA_THINK}, storage: ${OLLAMA_STORAGE})"
     info "dedup backend:   Redis ($([ -n "$REDIS_ADDR" ] && echo "external: ${REDIS_ADDR}" || echo 'bundled (deploy/redis.yaml)'))"
     info "admin GUI:       $([ "$ENABLE_WEBUI" = true ] && echo enabled || echo disabled)"
 }
@@ -193,6 +202,27 @@ install_ollama() {
     [ "$INSTALL_OLLAMA" = true ] || { step "Skipping Ollama install (--skip-ollama)"; return 0; }
     step "Installing Ollama in namespace '${OLLAMA_NAMESPACE}'"
     ensure_namespace "$OLLAMA_NAMESPACE"
+
+    # Model storage: a PVC by default so the weights survive pod restarts.
+    # The PVC request is immutable once created (only expansion is allowed),
+    # so re-runs with the same size are a no-op.
+    local ollama_volume_source='emptyDir: {}'
+    if [ "$OLLAMA_STORAGE" != "none" ]; then
+        apply_stdin "ollama models PVC (${OLLAMA_STORAGE})" <<YAML
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-models
+  namespace: ${OLLAMA_NAMESPACE}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: ${OLLAMA_STORAGE}
+YAML
+        ollama_volume_source=$'persistentVolumeClaim:\n            claimName: ollama-models'
+    fi
+
     apply_stdin "ollama Deployment+Service" <<YAML
 apiVersion: apps/v1
 kind: Deployment
@@ -224,7 +254,8 @@ spec:
           volumeMounts:
             - { name: ollama-data, mountPath: /root/.ollama }
       volumes:
-        - { name: ollama-data, emptyDir: {} }
+        - name: ollama-data
+          ${ollama_volume_source}
 ---
 apiVersion: v1
 kind: Service
@@ -238,7 +269,12 @@ spec:
 YAML
 
     step "Waiting for Ollama to be ready, then pulling '${MODEL}'"
-    run kubectl -n "$OLLAMA_NAMESPACE" rollout status deployment/ollama --timeout="$ROLLOUT_TIMEOUT"
+    if ! run kubectl -n "$OLLAMA_NAMESPACE" rollout status deployment/ollama --timeout="$ROLLOUT_TIMEOUT"; then
+        warn "Ollama did not become ready in ${ROLLOUT_TIMEOUT}."
+        kubectl -n "$OLLAMA_NAMESPACE" get pods,pvc 2>/dev/null || true
+        warn "If pvc/ollama-models is Pending, the cluster has no default StorageClass: provide one or re-run with --ollama-storage none (models will re-download on every restart)."
+        die "Ollama is required (or pass --skip-ollama for an external one); aborting."
+    fi
     info "Pulling the model (first run downloads several GB — this can take a while)..."
     run kubectl -n "$OLLAMA_NAMESPACE" exec deploy/ollama -- ollama pull "$MODEL"
     run kubectl -n "$OLLAMA_NAMESPACE" exec deploy/ollama -- ollama list

@@ -2,6 +2,7 @@ package kube
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -696,5 +697,99 @@ func TestDeploymentToText_IncludesResources(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("expected %q in snapshot, got:\n%s", want, got)
 		}
+	}
+}
+
+func lastChangeOf(t *testing.T, cs *fake.Clientset, ns, name string) lastChange {
+	t.Helper()
+	dep, err := cs.AppsV1().Deployments(ns).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get deployment: %v", err)
+	}
+	raw, ok := dep.Annotations[LastChangeAnnotation]
+	if !ok {
+		t.Fatalf("expected %s annotation, got %v", LastChangeAnnotation, dep.Annotations)
+	}
+	var lc lastChange
+	if err := json.Unmarshal([]byte(raw), &lc); err != nil {
+		t.Fatalf("annotation is not valid JSON: %v", err)
+	}
+	return lc
+}
+
+func TestScaleDeployment_RecordsLastChange(t *testing.T) {
+	cs := newFakeCluster(t) // deployment "web" with replicas=2
+	if err := ScaleDeployment(context.Background(), cs, "default", "web", 4, 1, 5, false); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	lc := lastChangeOf(t, cs, "default", "web")
+	if lc.Action != "scale_deployment" || lc.Previous["replicas"] != "2" {
+		t.Errorf("unexpected last-change: %+v", lc)
+	}
+	if lc.At == "" {
+		t.Error("expected timestamp in last-change annotation")
+	}
+}
+
+func TestSetDeploymentImage_RecordsLastChange(t *testing.T) {
+	cs := newFakeCluster(t) // container "app" runs nginx:1.25
+	if err := SetDeploymentImage(context.Background(), cs, "default", "web", "nginx:1.26", "app", false); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	lc := lastChangeOf(t, cs, "default", "web")
+	if lc.Action != "set_deployment_image" || lc.Container != "app" || lc.Previous["image"] != "nginx:1.25" {
+		t.Errorf("unexpected last-change: %+v", lc)
+	}
+}
+
+func TestPatchDeploymentProbe_RecordsLastChange(t *testing.T) {
+	cs := newPatchableCluster("probe") // readiness: delay=0 period=5 failure=1 timeout=1
+	err := PatchDeploymentProbe(context.Background(), cs, "default", "app", "main", "readiness",
+		map[string]string{"period_seconds": "15", "failure_threshold": "5"}, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	lc := lastChangeOf(t, cs, "default", "app")
+	if lc.Action != "patch_probe" || lc.Container != "main" {
+		t.Errorf("unexpected last-change header: %+v", lc)
+	}
+	// The full previous probe shape is recorded, not just the touched fields.
+	for k, want := range map[string]string{
+		"probe": "readiness", "period_seconds": "5", "failure_threshold": "1",
+		"timeout_seconds": "1", "initial_delay_seconds": "0",
+	} {
+		if lc.Previous[k] != want {
+			t.Errorf("previous[%s] = %q, want %q", k, lc.Previous[k], want)
+		}
+	}
+}
+
+func TestPatchDeploymentResources_RecordsLastChange(t *testing.T) {
+	cs := newPatchableCluster("resources")
+	err := PatchDeploymentResources(context.Background(), cs, "default", "app", "main",
+		map[string]string{"memory_limit": "256Mi"}, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	lc := lastChangeOf(t, cs, "default", "app")
+	if lc.Action != "patch_resources" || lc.Container != "main" {
+		t.Errorf("unexpected last-change: %+v", lc)
+	}
+	// newPatchableCluster sets no resources: previous snapshot must be empty,
+	// signalling "fields were unset" rather than inventing zero values.
+	if len(lc.Previous) != 0 {
+		t.Errorf("expected empty previous for unset resources, got %+v", lc.Previous)
+	}
+}
+
+func TestPatchDeploymentRegistry_RecordsLastChange(t *testing.T) {
+	cs := newPatchableCluster("registry") // image wrong.registry.io/myrepo/app:v1.2.3
+	err := PatchDeploymentRegistry(context.Background(), cs, "default", "app", "main", "host.docker.internal:5050", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	lc := lastChangeOf(t, cs, "default", "app")
+	if lc.Action != "patch_registry" || lc.Previous["image"] != "wrong.registry.io/myrepo/app:v1.2.3" {
+		t.Errorf("unexpected last-change: %+v", lc)
 	}
 }

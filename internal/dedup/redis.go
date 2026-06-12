@@ -80,8 +80,9 @@ func NewRedisStore(cfg RedisConfig) (*RedisStore, error) {
 // Close releases the underlying connection pool.
 func (r *RedisStore) Close() error { return r.client.Close() }
 
-func (r *RedisStore) seenKey(k string) string   { return r.prefix + "seen:" + k }
-func (r *RedisStore) signalKey(s string) string { return r.prefix + "signal:" + s }
+func (r *RedisStore) seenKey(k string) string    { return r.prefix + "seen:" + k }
+func (r *RedisStore) signalKey(s string) string  { return r.prefix + "signal:" + s }
+func (r *RedisStore) attemptKey(s string) string { return r.prefix + "attempt:" + s }
 
 // MarkSeen uses SET NX EX which is atomic — concurrent agents never both
 // observe fresh=true for the same key.
@@ -123,6 +124,40 @@ func (r *RedisStore) MarkSignal(signal string, now time.Time, ttl time.Duration)
 	if err := r.client.Set(ctx, r.signalKey(signal), now.Format(time.RFC3339), ttl).Err(); err != nil {
 		slog.Warn("dedup redis MarkSignal failed", "error", err)
 	}
+}
+
+// Attempts reads the remediation attempt counter for signal. Fails open to
+// 0 so a Redis outage never trips the circuit breaker spuriously.
+func (r *RedisStore) Attempts(signal string, _ time.Time) int {
+	ctx, cancel := context.WithTimeout(context.Background(), r.opTimeout)
+	defer cancel()
+
+	n, err := r.client.Get(ctx, r.attemptKey(signal)).Int()
+	if err != nil {
+		if !errors.Is(err, redis.Nil) {
+			slog.Warn("dedup redis Attempts failed, failing open", "error", err)
+		}
+		return 0
+	}
+	return n
+}
+
+// IncrAttempt bumps the attempt counter and slides its expiry window
+// forward, so the counter only resets after the incident has been quiet
+// for the whole window. Fails open to 1 (a first attempt) on Redis errors:
+// remediation proceeds, the backoff just does not escalate.
+func (r *RedisStore) IncrAttempt(signal string, _ time.Time, window time.Duration) int {
+	ctx, cancel := context.WithTimeout(context.Background(), r.opTimeout)
+	defer cancel()
+
+	pipe := r.client.Pipeline()
+	incr := pipe.Incr(ctx, r.attemptKey(signal))
+	pipe.Expire(ctx, r.attemptKey(signal), window)
+	if _, err := pipe.Exec(ctx); err != nil {
+		slog.Warn("dedup redis IncrAttempt failed, failing open", "error", err)
+		return 1
+	}
+	return int(incr.Val())
 }
 
 // Evict is a no-op: Redis expires keys natively once their TTL elapses.

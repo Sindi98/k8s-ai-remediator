@@ -174,6 +174,18 @@ spec:
               port: metrics
             initialDelaySeconds: 5
             periodSeconds: 10
+          # /healthz returns 503 when the leader's poll loop stops completing
+          # cycles (heartbeat older than the poll context timeout plus a few
+          # intervals), so a wedged agent gets restarted instead of silently
+          # doing nothing. Followers always report healthy.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests:
               cpu: "50m"

@@ -115,3 +115,48 @@ func TestNewRedisStore_RejectsEmptyAddr(t *testing.T) {
 		t.Fatal("expected error when Addr is empty")
 	}
 }
+
+func TestRedisStore_Attempts(t *testing.T) {
+	s, mr := newTestRedisStore(t)
+	now := time.Now()
+	window := time.Hour
+
+	if got := s.Attempts("sig", now); got != 0 {
+		t.Fatalf("expected 0 attempts initially, got %d", got)
+	}
+	if got := s.IncrAttempt("sig", now, window); got != 1 {
+		t.Fatalf("expected 1 after first increment, got %d", got)
+	}
+	if got := s.IncrAttempt("sig", now, window); got != 2 {
+		t.Fatalf("expected 2 after second increment, got %d", got)
+	}
+	if got := s.Attempts("sig", now); got != 2 {
+		t.Fatalf("expected Attempts=2, got %d", got)
+	}
+	// Native TTL expiry resets the counter.
+	mr.FastForward(window + time.Second)
+	if got := s.Attempts("sig", now); got != 0 {
+		t.Fatalf("expected counter expired past window, got %d", got)
+	}
+	if got := s.IncrAttempt("sig", now, window); got != 1 {
+		t.Fatalf("expected counter restart from 1, got %d", got)
+	}
+}
+
+func TestRedisStore_SignalKeepsEscalatedWindow(t *testing.T) {
+	// Marked with an escalated TTL, checked with the base one: the native
+	// key TTL must rule, exactly like the in-memory deadline.
+	s, mr := newTestRedisStore(t)
+	now := time.Now()
+	base := 5 * time.Minute
+
+	s.MarkSignal("sig", now, 4*base)
+	mr.FastForward(2 * base)
+	if !s.IsSignalFresh("sig", now, base) {
+		t.Fatal("signal marked with 4x ttl must still be fresh at 2x")
+	}
+	mr.FastForward(2*base + time.Second)
+	if s.IsSignalFresh("sig", now, base) {
+		t.Fatal("signal past its escalated window should not be fresh")
+	}
+}

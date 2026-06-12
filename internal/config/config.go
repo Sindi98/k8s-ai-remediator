@@ -44,12 +44,12 @@ type AgentConfig struct {
 	// Models without the thinking capability are handled transparently: if
 	// the server rejects the parameter the client retries without it and
 	// stops sending it (see internal/ollama).
-	OllamaThink *bool
-	MetricsAddr           string
-	LeaderElection        bool
-	LeaseName             string
-	LeaseNamespace        string
-	MinSeverity           string
+	OllamaThink    *bool
+	MetricsAddr    string
+	LeaderElection bool
+	LeaseName      string
+	LeaseNamespace string
+	MinSeverity    string
 	// DedupeTTLSec suppresses repeated decisions for the same
 	// (namespace, kind, name, reason) signal within the given window.
 	// Prevents event storms (e.g. flaky readiness probes) from saturating Ollama.
@@ -61,6 +61,13 @@ type AgentConfig struct {
 	// keeps entries. Kubernetes GCs events after ~1h, so any value around
 	// that window prevents unbounded memory growth on long-running agents.
 	EventSeenTTLSec int
+	// SignalMaxAttempts is the circuit breaker for repeated remediation of
+	// the same signal (ns, Deployment, reason). Each attempt doubles the
+	// signal's dedup window (1x → 8x DedupeTTLSec); past this count the
+	// agent stops calling the LLM for the signal, records it as needing a
+	// manual fix and notifies. 0 disables both the backoff escalation and
+	// the breaker.
+	SignalMaxAttempts int
 
 	// AllowPatchProbe enables the patch_probe action that tunes probe
 	// timing fields on a Deployment. Opt-in required also via the
@@ -173,6 +180,7 @@ func LoadFromEnv() AgentConfig {
 		DedupeTTLSec:             Getint("DEDUPE_TTL_SECONDS", 300),
 		MaxEventsPerPoll:         Getint("MAX_EVENTS_PER_POLL", 10),
 		EventSeenTTLSec:          Getint("EVENT_SEEN_TTL_SECONDS", 3600),
+		SignalMaxAttempts:        Getint("SIGNAL_MAX_ATTEMPTS", 5),
 		AllowPatchProbe:          Getbool("ALLOW_PATCH_PROBE", false),
 		AllowPatchResources:      Getbool("ALLOW_PATCH_RESOURCES", false),
 		AllowPatchRegistry:       Getbool("ALLOW_PATCH_REGISTRY", false),

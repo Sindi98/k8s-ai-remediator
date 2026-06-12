@@ -67,7 +67,7 @@ Agente AI in Go che osserva eventi Kubernetes di tipo `Warning` e applica remedi
 **Flusso operativo:**
 
 1. Kubernetes genera un evento `Warning` (CrashLoopBackOff, ImagePullBackOff, ecc.)
-2. L'agente elenca gli eventi via API e filtra quelli di tipo Warning non ancora processati
+2. L'agente osserva gli eventi Warning tramite un informer (un WATCH persistente con cache locale; fallback a LIST diretta se la cache non sincronizza) e filtra quelli non ancora processati
 3. Il dedup store (`internal/dedup`, memory o Redis) scarta:
    - eventi gia visti per `resourceVersion` (`seen:`)
    - segnali `(ns, kind, name, reason)` processati entro `DEDUPE_TTL_SECONDS` (`signal:`)
@@ -287,6 +287,7 @@ scripts/install.sh --uninstall
 | `--sandbox-ns` | `incident-lab` | namespace abilitato agli scenari di guasto |
 | `--redis-addr` | *(vuoto)* | usa un Redis esterno (`host:port`) e salta quello bundled |
 | `--redis-password` | generata | password Redis (bundled o esterno); casuale se non impostata |
+| `--ollama-storage` | `20Gi` | dimensione del PVC per i modelli Ollama (`/root/.ollama`), così i pesi sopravvivono ai restart del pod. `none` = emptyDir (i modelli si riscaricano a ogni restart) |
 | `--dry-run` / `--uninstall` | — | anteprima senza modifiche / rimozione di namespace e RBAC creati |
 
 > Se non passi `--webui-password`, lo script ne genera una casuale e la stampa
@@ -442,6 +443,7 @@ Tutte le variabili sono lette da environment (tipicamente via ConfigMap).
 | `POLL_INTERVAL_SECONDS` | `30` | Intervallo di polling degli eventi (secondi) |
 | `DEDUPE_TTL_SECONDS` | `300` | TTL di deduplicazione per `(ns, kind, name, reason)`: eventi identici entro la finestra non generano una nuova chiamata LLM |
 | `MAX_EVENTS_PER_POLL` | `10` | Numero massimo di eventi che attivano una chiamata LLM per ciclo di polling; gli eccessi sono rinviati al polling successivo |
+| `SIGNAL_MAX_ATTEMPTS` | `5` | Circuit breaker per segnale `(ns, Deployment, reason)`: ogni tentativo di remediation raddoppia la finestra di dedup (1x→8x `DEDUPE_TTL_SECONDS`); superata la soglia l'agente smette di chiamare l'LLM, registra il segnale come `mark_for_manual_fix` (dashboard + notifica) e lo riprova solo dopo che l'incidente resta quieto per ~12x TTL. `0` = disabilitato |
 | `INCLUDE_NAMESPACES` | *(vuoto)* | Allowlist di namespace, comma-separated. Se valorizzato, l'agente reagisce **solo** a eventi di quei namespace; popola anche il selettore della pagina **Cluster** della GUI. Vuoto = tutti i namespace tranne quelli esclusi. Impostabile dalla GUI: **Configuration → Namespace filters → Include namespaces** |
 | `EXCLUDE_NAMESPACES` | `kube-system,kube-public,kube-node-lease,local-path-storage` | Denylist di namespace di sistema. Eventi qui non vengono mai inviati al LLM. Vince sempre sull'allowlist (un namespace listato in entrambi viene escluso) |
 
@@ -812,7 +814,7 @@ L'agente espone due endpoint HTTP sulla porta configurata in `METRICS_ADDR` (def
 | Endpoint | Descrizione |
 |----------|-------------|
 | `/metrics` | Metriche in formato Prometheus text exposition |
-| `/healthz` | Health check (ritorna `200 OK`) |
+| `/healthz` | Health check: `200 OK` in condizioni normali, `503` se il poll loop del leader non completa cicli da troppo tempo (heartbeat più vecchio di `POLL_CONTEXT_TIMEOUT_SECONDS` + 3 intervalli). Usato anche dalla livenessProbe per riavviare un agente in stallo; le repliche follower rispondono sempre `200` |
 
 ### Metriche esposte
 
@@ -881,6 +883,9 @@ kubectl -n ai-remediator expose deployment ai-remediator-agent \
 10. **Container distroless + Pod Security "restricted"**: l'immagine non ha shell, file system minimo, utente non-root; `deploy/agent.yaml` impone via `securityContext` `runAsNonRoot`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, `capabilities: drop [ALL]` e seccomp `RuntimeDefault`
 11. **Rate limiting**: previene il sovraccarico di Ollama durante storm di eventi
 12. **Deduplicazione per segnale**: collassa gli eventi `(ns, Deployment, reason)` in un'unica chiamata LLM per `DEDUPE_TTL_SECONDS` (default 300s); cap `MAX_EVENTS_PER_POLL` (default 10)
+13. **Backoff e circuit breaker per segnale**: ogni tentativo di remediation sullo stesso segnale raddoppia la finestra di dedup (fino a 8x); dopo `SIGNAL_MAX_ATTEMPTS` (default 5) tentativi senza risoluzione l'agente si ferma, marca il segnale come da risolvere manualmente e notifica — niente loop infiniti contro lo stesso incidente
+14. **Pinning del target**: la decisione dell'LLM è ancorata all'evento che l'ha generata — namespace, kind/name e (quando risolto) il Deployment owner vengono forzati a quelli dell'evento, così un output allucinato o prompt-injected non può ridirigere l'azione su workload fuori scope
+15. **Annotation di undo**: ogni mutazione (scale, image, patch_*) salva i valori precedenti nell'annotation `ai-remediator/last-change` del Deployment (JSON con action, container, valori e timestamp), per un revert manuale immediato senza scavare nella history dei ReplicaSet
 
 ### Protezione da prompt injection
 

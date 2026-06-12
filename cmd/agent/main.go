@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -19,9 +20,11 @@ import (
 	"k8s.io/client-go/discovery"
 	memcached "k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
+	k8scache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 
@@ -400,6 +403,109 @@ func formatTriBool(b *bool) string {
 	return strconv.FormatBool(*b)
 }
 
+// decider abstracts the LLM client so the poll loop can be exercised in
+// tests with canned decisions. *ollama.Client is the production implementation.
+type decider interface {
+	Decide(ctx context.Context, prompt string) (model.Decision, error)
+}
+
+// eventLister returns the Warning events to evaluate in one poll cycle.
+type eventLister func(ctx context.Context) ([]corev1.Event, error)
+
+// newWarningEventSource returns an eventLister backed by a shared informer:
+// one long-lived WATCH keeps a local cache of Warning events, so every poll
+// reads from memory instead of re-LISTing all events cluster-wide. When the
+// cache cannot sync (RBAC gap, API flakiness) it falls back to direct LISTs
+// so remediation never stalls behind a broken watch. The informer stops with
+// ctx, i.e. when leadership is lost.
+func newWarningEventSource(ctx context.Context, cs kubernetes.Interface) eventLister {
+	directList := func(c context.Context) ([]corev1.Event, error) {
+		list, err := cs.CoreV1().Events("").List(c, metav1.ListOptions{FieldSelector: "type=Warning"})
+		if err != nil {
+			return nil, err
+		}
+		return list.Items, nil
+	}
+
+	factory := informers.NewSharedInformerFactoryWithOptions(cs, 0,
+		informers.WithTweakListOptions(func(o *metav1.ListOptions) {
+			o.FieldSelector = "type=Warning"
+		}))
+	informer := factory.Core().V1().Events().Informer()
+	factory.Start(ctx.Done())
+
+	syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if !k8scache.WaitForCacheSync(syncCtx.Done(), informer.HasSynced) {
+		slog.Warn("event informer did not sync; falling back to a direct LIST per poll")
+		return directList
+	}
+	slog.Info("event informer synced; polling from the local cache")
+	return func(context.Context) ([]corev1.Event, error) {
+		objs := informer.GetStore().List()
+		out := make([]corev1.Event, 0, len(objs))
+		for _, o := range objs {
+			if e, ok := o.(*corev1.Event); ok {
+				out = append(out, *e)
+			}
+		}
+		return out, nil
+	}
+}
+
+// loopHealth tracks the liveness of the polling loop for /healthz. Only the
+// replica holding leadership is expected to poll, so staleness is checked
+// exclusively while leading: followers always report healthy.
+type loopHealth struct {
+	leading  atomic.Bool
+	lastPoll atomic.Int64 // unix seconds of the last completed poll
+}
+
+func (h *loopHealth) markLeading(v bool) {
+	if h == nil {
+		return
+	}
+	if v {
+		h.stamp()
+	}
+	h.leading.Store(v)
+}
+
+func (h *loopHealth) stamp() {
+	if h == nil {
+		return
+	}
+	h.lastPoll.Store(time.Now().Unix())
+}
+
+// healthy reports whether the loop completed a poll recently enough. A loop
+// that has never polled while leading is still healthy: markLeading stamps
+// the clock so slow startups (informer sync, first LLM call) do not flap
+// the liveness probe.
+func (h *loopHealth) healthy(staleAfter time.Duration) bool {
+	if h == nil || !h.leading.Load() {
+		return true
+	}
+	last := h.lastPoll.Load()
+	if last == 0 {
+		return true
+	}
+	return time.Since(time.Unix(last, 0)) <= staleAfter
+}
+
+// signalBackoffTTL escalates the dedup window of a signal that keeps firing:
+// 1x, 2x, 4x, then capped at 8x the base TTL. Repeated remediation attempts
+// against the same incident space out instead of burning an LLM call (and a
+// cluster mutation) every base window.
+func signalBackoffTTL(base time.Duration, attempts int) time.Duration {
+	const maxFactor = 8
+	factor := 1
+	for i := 1; i < attempts && factor < maxFactor; i++ {
+		factor *= 2
+	}
+	return base * time.Duration(factor)
+}
+
 // toSet builds a quick-lookup set from a slice of strings.
 func toSet(in []string) map[string]bool {
 	if len(in) == 0 {
@@ -435,17 +541,25 @@ func canonicalReason(reason, message string) string {
 	return trimmed
 }
 
-// runLoopWithStore runs the event polling loop against an injected dedup
-// Store. The store is owned by the caller (created once in main and reused
-// across leader re-elections) so a flapping lease never leaks a Redis
-// connection pool. Tests pass a custom Store to exercise dedup behaviour.
-func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient *ollama.Client, cfg config.AgentConfig, m *metrics.Recorder, notifier notify.Notifier, cache dedup.Store, recorder *webui.RecentDecisionRecorder) {
+// runLoopWithStore runs the event polling loop against injected
+// collaborators: the dedup Store (created once in main and reused across
+// leader re-elections so a flapping lease never leaks a Redis pool), the
+// LLM decider, and the event lister (informer-backed in production).
+// Tests inject stubs for all three.
+func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, llm decider, cfg config.AgentConfig, m *metrics.Recorder, notifier notify.Notifier, listEvents eventLister, store dedup.Store, health *loopHealth, recorder *webui.RecentDecisionRecorder) {
+	health.markLeading(true)
+	defer health.markLeading(false)
 
 	dedupeTTL := time.Duration(cfg.DedupeTTLSec) * time.Second
 	seenTTL := time.Duration(cfg.EventSeenTTLSec) * time.Second
 	if seenTTL <= 0 {
 		seenTTL = time.Hour
 	}
+	// attemptWindow bounds how long the per-signal attempt counter survives
+	// without new increments: well past the maximum backoff (8x dedupeTTL),
+	// so consecutive failed attempts accumulate, while an incident that has
+	// stayed quiet this long starts again from a clean slate.
+	attemptWindow := 12 * dedupeTTL
 
 	// Build O(1) namespace lookup tables once. include is empty -> "all
 	// allowed except excluded"; non-empty include -> only listed allowed.
@@ -475,14 +589,19 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 		"ollamaHTTPTimeoutSec", cfg.OllamaHTTPTimeoutSec,
 		"pollContextTimeoutSec", cfg.PollContextTimeoutSec,
 		"ollamaThink", formatTriBool(cfg.OllamaThink),
+		"signalMaxAttempts", cfg.SignalMaxAttempts,
 		"metricsAddr", cfg.MetricsAddr,
-		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry,auto-escalate-oom,auto-escalate-unhealthy,severity-exempt-optin,ollama-think-toggle",
+		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry,auto-escalate-oom,auto-escalate-unhealthy,severity-exempt-optin,ollama-think-toggle,target-pinning,signal-circuit-breaker,event-informer",
 	)
 
 	ticker := time.NewTicker(time.Duration(cfg.PollSec) * time.Second)
 	defer ticker.Stop()
 
 	poll := func() {
+		// Stamp completion even on early returns: a poll that ran (and, say,
+		// failed to list) still proves the loop is alive for /healthz.
+		defer health.stamp()
+
 		pollTimeout := time.Duration(cfg.PollContextTimeoutSec) * time.Second
 		if pollTimeout <= 0 {
 			pollTimeout = 5 * time.Minute
@@ -490,19 +609,19 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 		pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
 		defer cancel()
 
-		// Ask the API server for Warning events only: on a busy cluster this
-		// avoids transferring (and dedup-marking) every Normal event each poll.
-		list, err := cs.CoreV1().Events("").List(pollCtx, metav1.ListOptions{FieldSelector: "type=Warning"})
+		// Warning events only; in production this reads from the informer's
+		// local cache (one background WATCH) instead of a cluster-wide LIST.
+		list, err := listEvents(pollCtx)
 		if err != nil {
 			slog.Error("list events failed", "error", err)
 			return
 		}
 
 		now := time.Now()
-		cache.Evict(now, dedupeTTL, seenTTL)
+		store.Evict(now, dedupeTTL, seenTTL)
 
 		processed := 0
-		for _, e := range list.Items {
+		for _, e := range list {
 			// Cheap in-memory filters first, before any dedup-store round trip:
 			// non-Warning events (defence in depth — the List already
 			// field-selects type=Warning) and namespaces outside the configured
@@ -524,7 +643,7 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 			}
 
 			key := e.Namespace + "/" + e.Name + "/" + e.ResourceVersion
-			if !cache.MarkSeen(key, now, seenTTL) {
+			if !store.MarkSeen(key, now, seenTTL) {
 				m.EventsSkipped.Add(1)
 				continue
 			}
@@ -563,9 +682,46 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 			}
 
 			signal := e.Namespace + "|" + dedupKind + "|" + dedupName + "|" + canonicalReason(e.Reason, e.Message)
-			if cache.IsSignalFresh(signal, now, dedupeTTL) {
+			if store.IsSignalFresh(signal, now, dedupeTTL) {
 				m.EventsSkipped.Add(1)
 				continue
+			}
+
+			// Circuit breaker: a signal that already consumed SignalMaxAttempts
+			// remediation attempts without resolving stops burning LLM calls
+			// and cluster mutations. It is parked for the maximum backoff
+			// window and surfaced (dashboard + notification) as needing a
+			// human. The counter expires after attemptWindow of silence, so a
+			// later regression of the same workload starts fresh.
+			if cfg.SignalMaxAttempts > 0 {
+				if attempts := store.Attempts(signal, now); attempts >= cfg.SignalMaxAttempts {
+					parkTTL := signalBackoffTTL(dedupeTTL, attempts+1)
+					store.MarkSignal(signal, now, parkTTL)
+					m.EventsSkipped.Add(1)
+					giveUp := model.Decision{
+						Action:        model.ActionMarkForManualFix,
+						Severity:      string(model.SeverityHigh),
+						Summary:       fmt.Sprintf("circuit breaker: %d remediation attempts on %s/%s (%s) without resolution", attempts, e.Namespace, dedupName, e.Reason),
+						ProbableCause: "automatic remediation is not resolving this incident",
+						Namespace:     e.Namespace,
+						ResourceKind:  e.InvolvedObject.Kind,
+						ResourceName:  e.InvolvedObject.Name,
+						Parameters:    map[string]string{},
+					}
+					slog.Warn("signal exceeded max remediation attempts; manual fix required",
+						"signal", signal, "attempts", attempts, "parkedFor", parkTTL)
+					recorder.Record(e.Namespace, e.InvolvedObject.Kind, e.InvolvedObject.Name, e.Reason, giveUp, "blocked", "max remediation attempts reached")
+					notifier.NotifyDecision(pollCtx, notify.DecisionResult{
+						Namespace:    e.Namespace,
+						Kind:         e.InvolvedObject.Kind,
+						Name:         e.InvolvedObject.Name,
+						EventReason:  e.Reason,
+						EventMessage: e.Message,
+						Decision:     giveUp,
+						ExecutionErr: fmt.Errorf("max remediation attempts (%d) reached; manual intervention required", attempts),
+					})
+					continue
+				}
 			}
 
 			if cfg.MaxEventsPerPoll > 0 && processed >= cfg.MaxEventsPerPoll {
@@ -575,7 +731,6 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 				continue
 			}
 
-			cache.MarkSignal(signal, now, dedupeTTL)
 			processed++
 			m.EventsProcessed.Add(1)
 
@@ -589,11 +744,17 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 				extra,
 			)
 
-			d, err := ollamaClient.Decide(pollCtx, prompt)
+			d, err := llm.Decide(pollCtx, prompt)
 			if err != nil {
 				m.DecisionErrors.Add(1)
 				slog.Error("ollama decision failed",
 					"ns", e.Namespace, "event", e.Name, "error", err)
+				// Deliberately NOT marked: a transient LLM failure (timeout,
+				// 5xx, Ollama down) must not burn the dedup window and silence
+				// the incident for DEDUPE_TTL_SECONDS. The signal is retried
+				// as soon as the incident emits its next event update (kubelet
+				// bumps count/resourceVersion on recurring events); the rate
+				// limiter and MaxEventsPerPoll bound the cost.
 				continue
 			}
 
@@ -601,17 +762,31 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 			// Ollama client via the onRequest metric hook (wired in main).
 			m.RecordDecision(string(d.Action))
 
-			if d.Namespace == "" {
-				d.Namespace = e.Namespace
+			// The LLM proposes, the event anchors: a decision may only target
+			// the object (and namespace) of the event that produced it. The
+			// namespace filters above ran against the EVENT namespace; without
+			// this pinning a hallucinated — or prompt-injected — namespace or
+			// deployment_name in the model output could retarget the action
+			// onto workloads outside the configured scope.
+			if d.Namespace != "" && d.Namespace != e.Namespace {
+				slog.Warn("decision namespace differs from event namespace; overriding",
+					"decision", d.Namespace, "event", e.Namespace)
 			}
-			if d.ResourceKind == "" {
-				d.ResourceKind = e.InvolvedObject.Kind
-			}
-			if d.ResourceName == "" {
-				d.ResourceName = e.InvolvedObject.Name
-			}
+			d.Namespace = e.Namespace
+			d.ResourceKind = e.InvolvedObject.Kind
+			d.ResourceName = e.InvolvedObject.Name
 			if d.Parameters == nil {
 				d.Parameters = map[string]string{}
+			}
+			if strings.EqualFold(dedupKind, "Deployment") && dedupName != "" {
+				// Owner resolution already identified the target Deployment;
+				// never let a divergent deployment_name retarget the action.
+				if v := strings.TrimSpace(d.Parameters["deployment_name"]); v != "" && v != dedupName {
+					slog.Warn("decision deployment_name differs from resolved owner; overriding",
+						"decision", v, "resolved", dedupName)
+				}
+				d.Parameters["deployment_name"] = dedupName
+				delete(d.Parameters, "deployment")
 			}
 
 			severity := model.ParseSeverity(d.Severity)
@@ -642,9 +817,23 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, ollamaClient
 					"action", d.Action,
 				)
 				m.EventsSkipped.Add(1)
+				// A decision WAS reached (just noise-filtered): mark the base
+				// dedup window, but do not count a remediation attempt.
+				store.MarkSignal(signal, now, dedupeTTL)
 				recorder.Record(e.Namespace, e.InvolvedObject.Kind, e.InvolvedObject.Name, e.Reason, d, "skipped", "below minSeverity")
 				continue
 			}
+
+			// Count this remediation attempt and escalate the signal's dedup
+			// window accordingly (1x → 8x the base TTL). The counter lives in
+			// the dedup store — with the Redis backend it survives restarts —
+			// and resets after attemptWindow of silence. With the breaker
+			// disabled (SignalMaxAttempts=0) the window stays at the base TTL.
+			attempts := 1
+			if cfg.SignalMaxAttempts > 0 {
+				attempts = store.IncrAttempt(signal, now, attemptWindow)
+			}
+			store.MarkSignal(signal, now, signalBackoffTTL(dedupeTTL, attempts))
 
 			execErr := executeDecision(pollCtx, cs, d, cfg, e.Reason, extra)
 			if execErr != nil {
@@ -746,16 +935,33 @@ func main() {
 		MinSeverity: model.ParseSeverity(cfg.NotifyMinSeverity),
 	})
 
+	// Loop heartbeat: /healthz turns 503 when the leader's poll loop stops
+	// completing cycles, so a liveness probe can restart a wedged agent.
+	// The threshold tolerates one full poll running to its context timeout
+	// plus a few idle intervals before declaring the loop stalled.
+	health := &loopHealth{}
+	staleAfter := time.Duration(cfg.PollContextTimeoutSec)*time.Second +
+		3*time.Duration(cfg.PollSec)*time.Second
+
 	// Start metrics server in background
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", m.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		if !health.healthy(staleAfter) {
+			http.Error(w, "poll loop stalled", http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	metricsSrv := &http.Server{
+		Addr:              cfg.MetricsAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	go func() {
 		slog.Info("metrics server starting", "addr", cfg.MetricsAddr)
-		if err := http.ListenAndServe(cfg.MetricsAddr, mux); err != nil {
+		if err := metricsSrv.ListenAndServe(); err != nil {
 			slog.Error("metrics server failed", "error", err)
 		}
 	}()
@@ -766,8 +972,21 @@ func main() {
 
 	// Ring buffer of recent decisions, surfaced by the GUI dashboard.
 	// Allocated unconditionally so runLoop can call Record() without nil
-	// checks; size is small (20 entries ~few KB).
-	decisionRecorder := webui.NewRecentDecisionRecorder(20)
+	// checks; size is small (20 entries ~few KB). With the Redis dedup
+	// backend the buffer is also mirrored into Redis, so the dashboard
+	// history survives pod restarts and leader failovers.
+	var decisionRecorder *webui.RecentDecisionRecorder
+	if strings.EqualFold(cfg.DedupBackend, "redis") {
+		decisionRecorder = webui.NewRecentDecisionRecorderRedis(20, webui.RedisDecisionOptions{
+			Addr:      cfg.RedisAddr,
+			Password:  cfg.RedisPassword,
+			DB:        cfg.RedisDB,
+			KeyPrefix: cfg.RedisKeyPrefix,
+		})
+	} else {
+		decisionRecorder = webui.NewRecentDecisionRecorder(20)
+	}
+	defer func() { _ = decisionRecorder.Close() }()
 
 	// Optional admin GUI. Runs alongside the polling loop and is independent
 	// of leader election: every replica serves the GUI so the dashboard stays
@@ -834,7 +1053,7 @@ func main() {
 	}
 
 	run := func(ctx context.Context) {
-		runLoopWithStore(ctx, cs, ollamaClient, cfg, m, notifier, store, decisionRecorder)
+		runLoopWithStore(ctx, cs, ollamaClient, cfg, m, notifier, newWarningEventSource(ctx, cs), store, health, decisionRecorder)
 	}
 
 	if cfg.LeaderElection {

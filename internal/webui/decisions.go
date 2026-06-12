@@ -1,8 +1,13 @@
 package webui
 
 import (
+	"context"
+	"encoding/json"
+	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/sindi98/k8s-ai-remediator/internal/model"
 )
@@ -38,7 +43,17 @@ type RecentDecisionRecorder struct {
 	buf      []DecisionRecord
 	next     int  // next slot to write
 	full     bool // buffer has wrapped at least once
+
+	// rdb, when non-nil, mirrors every record into a capped Redis list so
+	// the dashboard history survives pod restarts and leader failovers.
+	// All Redis I/O is fail-open: a Redis hiccup degrades to memory-only.
+	rdb      *redis.Client
+	redisKey string
 }
+
+// redisOpTimeout caps each Redis call so a slow or dead Redis can never
+// stall the poll loop or an HTTP handler.
+const redisOpTimeout = 500 * time.Millisecond
 
 // NewRecentDecisionRecorder allocates a recorder with the given capacity.
 // A capacity of 0 disables recording (Record/Snapshot become no-ops),
@@ -51,6 +66,52 @@ func NewRecentDecisionRecorder(capacity int) *RecentDecisionRecorder {
 		capacity: capacity,
 		buf:      make([]DecisionRecord, capacity),
 	}
+}
+
+// RedisDecisionOptions configures the optional Redis persistence of the
+// recent-decisions buffer. Mirrors the dedup backend connection knobs.
+type RedisDecisionOptions struct {
+	Addr      string
+	Password  string
+	DB        int
+	KeyPrefix string
+}
+
+// NewRecentDecisionRecorderRedis returns a recorder that, in addition to the
+// in-memory ring, mirrors every record into a capped Redis list. When Redis
+// is unreachable at startup it degrades to memory-only with a warning —
+// fail-open, exactly like the dedup store.
+func NewRecentDecisionRecorderRedis(capacity int, opts RedisDecisionOptions) *RecentDecisionRecorder {
+	r := NewRecentDecisionRecorder(capacity)
+	if opts.Addr == "" || capacity == 0 {
+		return r
+	}
+	client := redis.NewClient(&redis.Options{
+		Addr:         opts.Addr,
+		Password:     opts.Password,
+		DB:           opts.DB,
+		DialTimeout:  3 * time.Second,
+		ReadTimeout:  redisOpTimeout,
+		WriteTimeout: redisOpTimeout,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		slog.Warn("decisions: redis unreachable, history will not survive restarts", "error", err)
+		_ = client.Close()
+		return r
+	}
+	r.rdb = client
+	r.redisKey = opts.KeyPrefix + "decisions:recent"
+	return r
+}
+
+// Close releases the Redis connection pool, when one was attached.
+func (r *RecentDecisionRecorder) Close() error {
+	if r == nil || r.rdb == nil {
+		return nil
+	}
+	return r.rdb.Close()
 }
 
 // Record appends a single decision. Outcome must be one of
@@ -80,14 +141,52 @@ func (r *RecentDecisionRecorder) Record(ns, kind, name, eventReason string, d mo
 		r.full = true
 	}
 	r.mu.Unlock()
+
+	// Mirror into Redis outside the mutex: network I/O must never block
+	// concurrent Snapshot readers. LPUSH+LTRIM keeps the list capped.
+	if r.rdb != nil {
+		b, err := json.Marshal(rec)
+		if err != nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), redisOpTimeout)
+		defer cancel()
+		pipe := r.rdb.Pipeline()
+		pipe.LPush(ctx, r.redisKey, b)
+		pipe.LTrim(ctx, r.redisKey, 0, int64(r.capacity-1))
+		if _, err := pipe.Exec(ctx); err != nil {
+			slog.Warn("decisions: redis persist failed", "error", err)
+		}
+	}
 }
 
 // Snapshot returns a copy of the records, newest first. Safe to call
-// concurrently with Record.
+// concurrently with Record. When Redis persistence is attached, the list is
+// read from Redis (so it includes decisions recorded before the last pod
+// restart) and the in-memory ring is the fallback on any Redis error.
 func (r *RecentDecisionRecorder) Snapshot() []DecisionRecord {
 	if r == nil || r.capacity == 0 {
 		return nil
 	}
+
+	if r.rdb != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), redisOpTimeout)
+		vals, err := r.rdb.LRange(ctx, r.redisKey, 0, int64(r.capacity-1)).Result()
+		cancel()
+		if err == nil && len(vals) > 0 {
+			out := make([]DecisionRecord, 0, len(vals))
+			for _, v := range vals {
+				var rec DecisionRecord
+				if json.Unmarshal([]byte(v), &rec) == nil {
+					out = append(out, rec)
+				}
+			}
+			if len(out) > 0 {
+				return out // LPUSH order: index 0 is the newest
+			}
+		}
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
