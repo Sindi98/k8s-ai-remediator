@@ -455,7 +455,8 @@ Tutte le variabili sono lette da environment (tipicamente via ConfigMap).
 | `SCALE_MAX` | `5` | Massimo numero di repliche consentite |
 | `ALLOW_IMAGE_UPDATES` | `false` | Abilita l'azione `set_deployment_image` |
 | `IMAGE_UPDATE_CONFIDENCE_THRESHOLD` | `0.92` | Confidenza minima per aggiornare un'immagine |
-| `IMAGE_FALLBACK_TAG` | `latest` | Completa una `set_deployment_image` senza `params.image`: l'executor ritagga l'immagine corrente del container con questo tag (policy: "il tag valido è sempre `<nome>:latest`"). La reference sintetizzata passa gli stessi gate di una fornita dal modello (flag, confidence, validazione OCI, no-op rejection). Vuoto = disabilitato |
+| `IMAGE_TAG_DISCOVERY` | `true` | Completa una `set_deployment_image` senza `params.image` chiedendo al registry dell'immagine il suo tag più recente (OCI `tags/list`, auth anonima, budget 8s, HTTPS poi HTTP per i registry locali). "Più recente" = il tag-versione più alto (l'API non espone timestamp); `latest` solo se non esistono tag-versione. Su qualsiasi errore ripiega su `IMAGE_FALLBACK_TAG`. Disattivalo su cluster air-gapped |
+| `IMAGE_FALLBACK_TAG` | `latest` | Ripiego quando la discovery è disattivata o fallisce: l'executor ritagga l'immagine corrente del container con questo tag (policy: "il tag valido è sempre `<nome>:latest`"). La reference sintetizzata passa gli stessi gate di una fornita dal modello (flag, confidence, validazione OCI, no-op rejection). Vuoto = disabilitato |
 | `ALLOW_PATCH_PROBE` | `false` | Abilita l'azione `patch_probe` (richiede anche annotation `ai-remediator/allow-patch` con scope `probe`) |
 | `ALLOW_PATCH_RESOURCES` | `false` | Abilita l'azione `patch_resources` (scope `resources`) |
 | `ALLOW_PATCH_REGISTRY` | `false` | Abilita l'azione `patch_registry` (scope `registry`) |
@@ -1602,12 +1603,13 @@ kubectl -n ai-remediator logs deploy/ai-remediator-agent --tail=5 \
   | grep -o 'explicit-param-schema' || echo "binario vecchio!"
 ```
 
-> **Caso `set_deployment_image` senza immagine**: con `IMAGE_FALLBACK_TAG`
-> (default `latest`) l'executor completa l'immagine mancante ritaggando
-> quella corrente del container (`busybox:tag-rotto` → `busybox:latest`),
-> sotto gli stessi gate di una fornita dal modello. Con il fallback
-> disabilitato il prompt reindirizza a `restart_deployment` (retry del pull)
-> e, se il problema persiste, il circuit breaker lo marca
+> **Caso `set_deployment_image` senza immagine**: con `IMAGE_TAG_DISCOVERY`
+> (default on) l'executor chiede al registry dell'immagine il tag più
+> recente e ritagga quella corrente (`busybox:tag-rotto` → `busybox:1.36`);
+> se il registry non risponde ripiega su `IMAGE_FALLBACK_TAG` (default
+> `latest`). Tutto sotto gli stessi gate di un'immagine fornita dal modello.
+> Con entrambi disabilitati il prompt reindirizza a `restart_deployment`
+> (retry del pull) e, se il problema persiste, il circuit breaker lo marca
 > `mark_for_manual_fix`. Probe, risorse OOM e FailedScheduling vengono
 > anch'essi completati in modo deterministico con `params` vuoti.
 

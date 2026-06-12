@@ -20,14 +20,22 @@ type AgentConfig struct {
 	PollSec              int
 	AllowImageUpdates    bool
 	ImageUpdateThreshold float64
+	// ImageTagDiscovery, when on, completes a set_deployment_image decision
+	// that names no image by asking the image's own registry for its newest
+	// tag (OCI tags/list; anonymous auth only, 8s budget, HTTPS then HTTP for
+	// local registries). "Newest" is the highest version-like tag, since the
+	// API exposes no timestamps. On any failure the executor falls back to
+	// ImageFallbackTag. Disable on air-gapped clusters to skip the lookup.
+	ImageTagDiscovery bool
 	// ImageFallbackTag completes a set_deployment_image decision that names
-	// no image: the executor retags the container's CURRENT image with this
-	// tag (operator policy: "the valid tag is always <name>:latest"). Models
-	// reliably emit parameters they can copy from the context but omit ones
-	// they must invent — without this, every such decision dies on
-	// "parameters.image missing". Only applies when AllowImageUpdates is on;
-	// the synthesized reference passes the same OCI validation, confidence
-	// threshold and no-op rejection as a model-provided one. Empty disables.
+	// no image when tag discovery is off or failed: the executor retags the
+	// container's CURRENT image with this tag (operator policy: "the valid
+	// tag is always <name>:latest"). Models reliably emit parameters they can
+	// copy from the context but omit ones they must invent — without this,
+	// every such decision dies on "parameters.image missing". Only applies
+	// when AllowImageUpdates is on; the synthesized reference passes the same
+	// OCI validation, confidence threshold and no-op rejection as a
+	// model-provided one. Empty disables.
 	ImageFallbackTag    string
 	PodLogTailLines     int64
 	OllamaRPS           float64
@@ -174,6 +182,7 @@ func LoadFromEnv() AgentConfig {
 		PollSec:                  Getint("POLL_INTERVAL_SECONDS", 30),
 		AllowImageUpdates:        Getbool("ALLOW_IMAGE_UPDATES", false),
 		ImageUpdateThreshold:     Getfloat("IMAGE_UPDATE_CONFIDENCE_THRESHOLD", 0.92),
+		ImageTagDiscovery:        Getbool("IMAGE_TAG_DISCOVERY", true),
 		ImageFallbackTag:         Getenv("IMAGE_FALLBACK_TAG", "latest"),
 		PodLogTailLines:          int64(Getint("POD_LOG_TAIL_LINES", 200)),
 		OllamaRPS:                Getfloat("OLLAMA_RPS", 2.0),

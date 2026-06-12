@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -947,5 +950,90 @@ func TestExecuteDecision_SetImage_FallbackAlreadyOnTagIsRejectedAsNoop(t *testin
 	err := executeDecision(context.Background(), cs, d, cfg, "Failed", "")
 	if err == nil || !strings.Contains(err.Error(), "no-op") {
 		t.Errorf("expected the informative no-op rejection, got %v", err)
+	}
+}
+
+func TestExecuteDecision_SetImage_DiscoversNewestTagFromRegistry(t *testing.T) {
+	// Operator request: the replacement image must carry the newest tag the
+	// image's own registry advertises, not blindly :latest. Discovery hits
+	// /v2/<repo>/tags/list and picks the highest version-like tag.
+	regSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/busybox/tags/list" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"tags": []string{"1.35", "1.36", "latest"}})
+	}))
+	defer regSrv.Close()
+	regHost := strings.TrimPrefix(regSrv.URL, "http://")
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "broken-image", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "broken-image"}},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:  "app",
+					Image: regHost + "/busybox:this-tag-does-not-exist-abcd1234",
+				}},
+			}},
+		},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	cfg := defaultCfg()
+	cfg.AllowImageUpdates = true
+	cfg.ImageUpdateThreshold = 0.92
+	cfg.ImageTagDiscovery = true
+	cfg.ImageFallbackTag = "latest" // must NOT be used: discovery wins
+
+	d := model.Decision{
+		Action: model.ActionSetDeploymentImage, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "broken-image", Confidence: 1,
+		Parameters: map[string]string{"deployment_name": "broken-image"},
+	}
+	if err := executeDecision(context.Background(), cs, d, cfg, "Failed", ""); err != nil {
+		t.Fatalf("expected tag discovery to complete the decision, got %v", err)
+	}
+	got, _ := cs.AppsV1().Deployments("default").Get(context.Background(), "broken-image", metav1.GetOptions{})
+	if img := got.Spec.Template.Spec.Containers[0].Image; img != regHost+"/busybox:1.36" {
+		t.Errorf("expected the discovered newest tag 1.36, got %q", img)
+	}
+}
+
+func TestExecuteDecision_SetImage_DiscoveryFailureFallsBackToTag(t *testing.T) {
+	// Unreachable registry (air-gapped or down): discovery must degrade to
+	// the configured fallback tag instead of failing the decision.
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "broken-image", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "broken-image"}},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:  "app",
+					Image: "127.0.0.1:1/busybox:this-tag-does-not-exist", // nothing listens
+				}},
+			}},
+		},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	cfg := defaultCfg()
+	cfg.AllowImageUpdates = true
+	cfg.ImageUpdateThreshold = 0.92
+	cfg.ImageTagDiscovery = true
+	cfg.ImageFallbackTag = "latest"
+
+	d := model.Decision{
+		Action: model.ActionSetDeploymentImage, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "broken-image", Confidence: 1,
+		Parameters: map[string]string{},
+	}
+	if err := executeDecision(context.Background(), cs, d, cfg, "Failed", ""); err != nil {
+		t.Fatalf("expected the fallback tag after a failed discovery, got %v", err)
+	}
+	got, _ := cs.AppsV1().Deployments("default").Get(context.Background(), "broken-image", metav1.GetOptions{})
+	if img := got.Spec.Template.Spec.Containers[0].Image; img != "127.0.0.1:1/busybox:latest" {
+		t.Errorf("expected the fallback :latest retag, got %q", img)
 	}
 }

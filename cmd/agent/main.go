@@ -37,6 +37,7 @@ import (
 	"github.com/sindi98/k8s-ai-remediator/internal/notify"
 	"github.com/sindi98/k8s-ai-remediator/internal/ollama"
 	"github.com/sindi98/k8s-ai-remediator/internal/policy"
+	"github.com/sindi98/k8s-ai-remediator/internal/registry"
 	"github.com/sindi98/k8s-ai-remediator/internal/webui"
 )
 
@@ -80,17 +81,19 @@ func executeDecision(
 		return err
 	}
 	// Complete a set_deployment_image that names no image BEFORE the policy
-	// guard, per the operator's fallback-tag policy (IMAGE_FALLBACK_TAG):
-	// retag the container's current image. Models reliably emit parameters
-	// they can copy from the context but omit ones they must invent. The
+	// guard. Models reliably emit parameters they can copy from the context
+	// but omit ones they must invent, so the image is derived: preferably the
+	// newest tag advertised by the image's own registry (IMAGE_TAG_DISCOVERY),
+	// otherwise the operator's fallback tag (IMAGE_FALLBACK_TAG). The
 	// synthesized reference then passes the exact same gates as a
 	// model-provided one: feature flag, confidence threshold, OCI validation
-	// and the no-op rejection (current image already on the fallback tag).
-	if d.Action == model.ActionSetDeploymentImage && cfg.AllowImageUpdates && cfg.ImageFallbackTag != "" &&
+	// and the no-op rejection (current image already on the derived tag).
+	if d.Action == model.ActionSetDeploymentImage && cfg.AllowImageUpdates &&
+		(cfg.ImageTagDiscovery || cfg.ImageFallbackTag != "") &&
 		strings.TrimSpace(d.Parameters["image"]) == "" {
-		if img, ok := deriveFallbackImage(ctx, cs, d, cfg.ImageFallbackTag); ok {
-			slog.Info("set_deployment_image: completing missing image with the fallback tag",
-				"ns", d.Namespace, "image", img, "fallbackTag", cfg.ImageFallbackTag)
+		if img, ok := deriveFallbackImage(ctx, cs, d, cfg); ok {
+			slog.Info("set_deployment_image: completing missing image",
+				"ns", d.Namespace, "image", img)
 			if d.Parameters == nil {
 				d.Parameters = map[string]string{}
 			}
@@ -348,11 +351,13 @@ func tryAutoPatchProbeOnUnhealthy(ctx context.Context, cs kubernetes.Interface, 
 }
 
 // deriveFallbackImage resolves the decision's target Deployment, picks the
-// container named in params (or the first one) and retags its current image
-// with fallbackTag. Returns ("", false) when the deployment or container
-// cannot be resolved — the decision then fails downstream with the regular
-// "parameters.image missing" guard.
-func deriveFallbackImage(ctx context.Context, cs kubernetes.Interface, d model.Decision, fallbackTag string) (string, bool) {
+// container named in params (or the first one) and derives a replacement
+// image for it: the newest tag its registry advertises when tag discovery is
+// on (falling back gracefully on any registry failure), else the configured
+// fallback tag. Returns ("", false) when nothing can be derived — the
+// decision then fails downstream with the regular "parameters.image missing"
+// guard.
+func deriveFallbackImage(ctx context.Context, cs kubernetes.Interface, d model.Decision, cfg config.AgentConfig) (string, bool) {
 	depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName, d.Parameters)
 	if err != nil {
 		return "", false
@@ -374,7 +379,27 @@ func deriveFallbackImage(ctx context.Context, cs kubernetes.Interface, d model.D
 			}
 		}
 	}
-	img, err := kube.RetagImage(containers[idx].Image, fallbackTag)
+	current := containers[idx].Image
+
+	// Preferred: the newest tag advertised by the image's own registry
+	// (excludes the broken tag the image currently carries).
+	if cfg.ImageTagDiscovery {
+		if tag, err := registry.NewestTag(ctx, current); err == nil {
+			if img, rerr := kube.RetagImage(current, tag); rerr == nil {
+				slog.Info("set_deployment_image: newest tag discovered from the registry",
+					"current", current, "tag", tag)
+				return img, true
+			}
+		} else {
+			slog.Info("image tag discovery failed; using the fallback tag",
+				"image", current, "error", err)
+		}
+	}
+
+	if cfg.ImageFallbackTag == "" {
+		return "", false
+	}
+	img, err := kube.RetagImage(current, cfg.ImageFallbackTag)
 	if err != nil {
 		return "", false
 	}
@@ -724,7 +749,7 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, llm decider,
 		"ollamaThink", formatTriBool(cfg.OllamaThink),
 		"signalMaxAttempts", cfg.SignalMaxAttempts,
 		"metricsAddr", cfg.MetricsAddr,
-		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry,auto-escalate-oom,auto-escalate-unhealthy,severity-exempt-optin,ollama-think-toggle,target-pinning,signal-circuit-breaker,event-informer,explicit-param-schema,exec-param-fallbacks,poll-time-budget",
+		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry,auto-escalate-oom,auto-escalate-unhealthy,severity-exempt-optin,ollama-think-toggle,target-pinning,signal-circuit-breaker,event-informer,explicit-param-schema,exec-param-fallbacks,poll-time-budget,image-tag-discovery",
 	)
 
 	ticker := time.NewTicker(time.Duration(cfg.PollSec) * time.Second)
