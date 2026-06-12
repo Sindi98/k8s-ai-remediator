@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -153,7 +154,34 @@ func executeDecision(
 				fields[k] = v
 			}
 		}
-		return kube.PatchDeploymentProbe(ctx, cs, d.Namespace, depName, d.Parameters["container"], d.Parameters["probe"], fields, cfg.DryRun)
+		container := strings.TrimSpace(d.Parameters["container"])
+		probeType := strings.ToLower(strings.TrimSpace(d.Parameters["probe"]))
+		// Deterministic completion for a model that picked the right action
+		// but emitted empty parameters (seen with constrained decoding
+		// dropping map-typed params): derive the target probe from the
+		// Deployment spec and fall back to the same tolerant timing defaults
+		// the Unhealthy auto-escalation uses. The real gates (global flag,
+		// per-Deployment annotation, confidence threshold) still apply.
+		if probeType != "readiness" && probeType != "liveness" {
+			dep, derr := cs.AppsV1().Deployments(d.Namespace).Get(ctx, depName, metav1.GetOptions{})
+			if derr != nil {
+				return fmt.Errorf("probe must be one of: readiness, liveness (deriving a default failed: %v)", derr)
+			}
+			c, p, ok := chooseProbeFromDeployment(dep)
+			if !ok {
+				return fmt.Errorf("probe must be one of: readiness, liveness (and deployment %s has no probe to derive a default from)", depName)
+			}
+			probeType = p
+			if container == "" {
+				container = c
+			}
+		}
+		if len(fields) == 0 {
+			fields["failure_threshold"] = "6"
+			fields["period_seconds"] = "15"
+			fields["timeout_seconds"] = "5"
+		}
+		return kube.PatchDeploymentProbe(ctx, cs, d.Namespace, depName, container, probeType, fields, cfg.DryRun)
 
 	case model.ActionPatchResources:
 		depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName, d.Parameters)
@@ -167,6 +195,14 @@ func executeDecision(
 			// the current one (or omits it), which passes validation but OOMs
 			// again. Raise it to the same floor the OOM auto-escalation uses.
 			params = withOOMMemoryFloor(ctx, cs, d.Namespace, depName, params)
+		}
+		if strings.EqualFold(strings.TrimSpace(eventReason), "FailedScheduling") && !hasResourceParams(params) {
+			// Same class of completion as the OOM floor: the prompt's rule 2
+			// tells the model to lower requests to schedulable-anywhere values
+			// on FailedScheduling, but a model that emits empty parameters
+			// would otherwise leave the workload Pending forever. Mirror those
+			// exact values; the opt-in annotation still gates the patch.
+			params = withSchedulableResourceDefaults(params)
 		}
 		return kube.PatchDeploymentResources(ctx, cs, d.Namespace, depName, params["container"], params, cfg.DryRun)
 
@@ -261,24 +297,8 @@ func tryAutoPatchProbeOnUnhealthy(ctx context.Context, cs kubernetes.Interface, 
 		return d, false
 	}
 
-	// Find a container with a probe to relax, preferring readiness since it
-	// governs Service membership and is the usual source of Unhealthy noise.
-	container, probe := "", ""
-	for _, c := range dep.Spec.Template.Spec.Containers {
-		if c.ReadinessProbe != nil {
-			container, probe = c.Name, "readiness"
-			break
-		}
-	}
-	if probe == "" {
-		for _, c := range dep.Spec.Template.Spec.Containers {
-			if c.LivenessProbe != nil {
-				container, probe = c.Name, "liveness"
-				break
-			}
-		}
-	}
-	if probe == "" {
+	container, probe, ok := chooseProbeFromDeployment(dep)
+	if !ok {
 		return d, false
 	}
 
@@ -300,6 +320,51 @@ func tryAutoPatchProbeOnUnhealthy(ctx context.Context, cs kubernetes.Interface, 
 	transformed.Parameters["period_seconds"] = "15"
 	transformed.Parameters["timeout_seconds"] = "5"
 	return transformed, true
+}
+
+// chooseProbeFromDeployment picks the container+probe to relax, preferring
+// readiness (it governs Service membership and is the usual source of
+// Unhealthy noise) and falling back to liveness. Shared by the Unhealthy
+// auto-escalation and the patch_probe executor fallback.
+func chooseProbeFromDeployment(dep *appsv1.Deployment) (container, probe string, ok bool) {
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		if c.ReadinessProbe != nil {
+			return c.Name, "readiness", true
+		}
+	}
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		if c.LivenessProbe != nil {
+			return c.Name, "liveness", true
+		}
+	}
+	return "", "", false
+}
+
+// hasResourceParams reports whether params carries at least one of the four
+// quantities PatchDeploymentResources accepts.
+func hasResourceParams(params map[string]string) bool {
+	for _, k := range []string{"cpu_request", "memory_request", "cpu_limit", "memory_limit"} {
+		if strings.TrimSpace(params[k]) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// withSchedulableResourceDefaults returns a copy of params filled with the
+// conservative, schedulable-anywhere values that prompt rule 2 instructs the
+// model to use on FailedScheduling. The map is copied before mutation so the
+// recorded decision stays intact.
+func withSchedulableResourceDefaults(params map[string]string) map[string]string {
+	out := make(map[string]string, len(params)+4)
+	for k, v := range params {
+		out[k] = v
+	}
+	out["cpu_request"] = "100m"
+	out["memory_request"] = "64Mi"
+	out["cpu_limit"] = "500m"
+	out["memory_limit"] = "256Mi"
+	return out
 }
 
 // computeBumpedMemoryLimit returns a safe "next step" memory limit: 4x the
@@ -561,6 +626,15 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, llm decider,
 	// stayed quiet this long starts again from a clean slate.
 	attemptWindow := 12 * dedupeTTL
 
+	// llmCallBudget is the minimum poll-context headroom required to launch
+	// one more LLM call: the HTTP timeout of a single attempt plus a margin
+	// for the rate limiter and the Kubernetes lookups around it. Below this,
+	// a call is guaranteed to die mid-flight on the poll deadline.
+	llmCallBudget := time.Duration(cfg.OllamaHTTPTimeoutSec)*time.Second + 15*time.Second
+	if cfg.OllamaHTTPTimeoutSec <= 0 {
+		llmCallBudget = 180*time.Second + 15*time.Second // mirrors the client default
+	}
+
 	// Build O(1) namespace lookup tables once. include is empty -> "all
 	// allowed except excluded"; non-empty include -> only listed allowed.
 	include := toSet(cfg.IncludeNamespaces)
@@ -591,7 +665,7 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, llm decider,
 		"ollamaThink", formatTriBool(cfg.OllamaThink),
 		"signalMaxAttempts", cfg.SignalMaxAttempts,
 		"metricsAddr", cfg.MetricsAddr,
-		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry,auto-escalate-oom,auto-escalate-unhealthy,severity-exempt-optin,ollama-think-toggle,target-pinning,signal-circuit-breaker,event-informer",
+		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry,auto-escalate-oom,auto-escalate-unhealthy,severity-exempt-optin,ollama-think-toggle,target-pinning,signal-circuit-breaker,event-informer,explicit-param-schema,exec-param-fallbacks,poll-time-budget",
 	)
 
 	ticker := time.NewTicker(time.Duration(cfg.PollSec) * time.Second)
@@ -640,6 +714,27 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, llm decider,
 			if len(include) > 0 && !include[e.Namespace] {
 				m.EventsSkipped.Add(1)
 				continue
+			}
+
+			// Per-poll work budget, enforced BEFORE the event is marked seen
+			// so the deferral is honest: an event skipped here is genuinely
+			// retried on the next poll instead of being silently dropped
+			// behind its resourceVersion. Two limits apply: the configured
+			// event cap, and the remaining time in the poll context — once a
+			// single LLM round-trip no longer fits, launching it would only
+			// die mid-flight ("rate limiter: context deadline exceeded").
+			if cfg.MaxEventsPerPoll > 0 && processed >= cfg.MaxEventsPerPoll {
+				slog.Info("max events per poll reached; remaining events deferred to the next poll",
+					"cap", cfg.MaxEventsPerPoll)
+				m.EventsSkipped.Add(1)
+				break
+			}
+			if deadline, ok := pollCtx.Deadline(); ok && time.Until(deadline) < llmCallBudget {
+				slog.Info("poll time budget exhausted; remaining events deferred to the next poll",
+					"remaining", time.Until(deadline).Round(time.Second),
+					"requiredPerCall", llmCallBudget)
+				m.EventsSkipped.Add(1)
+				break
 			}
 
 			key := e.Namespace + "/" + e.Name + "/" + e.ResourceVersion
@@ -722,13 +817,6 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, llm decider,
 					})
 					continue
 				}
-			}
-
-			if cfg.MaxEventsPerPoll > 0 && processed >= cfg.MaxEventsPerPoll {
-				slog.Info("max events per poll reached; remaining events deferred",
-					"cap", cfg.MaxEventsPerPoll)
-				m.EventsSkipped.Add(1)
-				continue
 			}
 
 			processed++

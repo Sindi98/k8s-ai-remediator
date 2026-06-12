@@ -240,6 +240,11 @@ noop, restart_deployment, delete_failed_pod, delete_and_recreate_pod, scale_depl
 === OUTPUT FORMAT CONSTRAINTS ===
 - severity ∈ {critical, high, medium, low, info}
 - confidence: float 0.0-1.0 (>=0.85 unlocks set_deployment_image and patch_*)
+- parameters MUST contain the concrete keys the chosen action needs:
+  set_deployment_image → image; patch_probe → probe + timing fields;
+  patch_resources → at least one of cpu_request/memory_request/cpu_limit/memory_limit;
+  patch_registry → new_registry; scale_deployment → replicas.
+  A decision with an EMPTY parameters object cannot be executed.
 - Whenever the action targets a Deployment, ALWAYS set params.deployment_name
 - Numeric params for patch_probe: decimal integer strings only
   OK: "5", "15"

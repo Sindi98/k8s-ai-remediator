@@ -373,3 +373,58 @@ func TestNewWarningEventSource_ServesEventsFromInformer(t *testing.T) {
 		t.Errorf("expected the informer-backed source to return the event, got %d events", len(events))
 	}
 }
+
+func TestRunLoop_TimeBudgetDefersDoomedCalls(t *testing.T) {
+	// With a poll window smaller than one LLM round-trip, launching the call
+	// would only die mid-flight on the poll deadline ("rate limiter: context
+	// deadline exceeded" bursts): the loop must defer instead.
+	cs := newFakeCluster(t)
+	llm := &stubDecider{decision: model.Decision{Action: model.ActionNoop, Severity: "high"}}
+	m := metrics.New()
+	cfg := loopCfg()
+	cfg.PollContextTimeoutSec = 30 // 30s window...
+	cfg.OllamaHTTPTimeoutSec = 180 // ...cannot fit a 180s call
+
+	store := dedup.NewMemoryStore()
+	ev := warningEvent("default", "ev1", "1", "Pod", "web-abc-123", "BackOff", "x")
+	runSinglePoll(t, cs, llm, cfg, m, store, webui.NewRecentDecisionRecorder(10), ev)
+
+	if got := llm.callCount(); got != 0 {
+		t.Fatalf("expected the doomed call to be deferred, got %d LLM calls", got)
+	}
+	// The deferral is honest: the event was NOT marked seen, so a poll with
+	// an adequate window processes it.
+	cfg.PollContextTimeoutSec = 300
+	cfg.OllamaHTTPTimeoutSec = 60
+	runSinglePoll(t, cs, llm, cfg, m, store, webui.NewRecentDecisionRecorder(10), ev)
+	if got := llm.callCount(); got != 1 {
+		t.Fatalf("expected the deferred event to be processed next poll, got %d calls", got)
+	}
+}
+
+func TestRunLoop_CapDeferralRetriesSameEventNextPoll(t *testing.T) {
+	// MaxEventsPerPoll deferral happens BEFORE the seen-mark: the very same
+	// event (same resourceVersion) must be picked up on the following poll,
+	// not silently dropped behind its seen-key.
+	cs := newFakeCluster(t)
+	llm := &stubDecider{decision: model.Decision{Action: model.ActionNoop, Severity: "high"}}
+	m := metrics.New()
+	cfg := loopCfg()
+	cfg.MaxEventsPerPoll = 1
+	store := dedup.NewMemoryStore()
+	rec := webui.NewRecentDecisionRecorder(10)
+
+	ev1 := warningEvent("default", "ev1", "1", "Pod", "web-abc-123", "BackOff", "x")
+	ev2 := warningEvent("default", "ev2", "2", "Pod", "web-abc-123", "Unhealthy", "y")
+	runSinglePoll(t, cs, llm, cfg, m, store, rec, ev1, ev2)
+	if got := llm.callCount(); got != 1 {
+		t.Fatalf("first poll: expected 1 call under the cap, got %d", got)
+	}
+
+	// Second poll, identical events: ev1 is seen+signal-marked, ev2 (deferred,
+	// never marked) must now be processed.
+	runSinglePoll(t, cs, llm, cfg, m, store, rec, ev1, ev2)
+	if got := llm.callCount(); got != 2 {
+		t.Fatalf("second poll: expected the deferred event to be processed, got %d total calls", got)
+	}
+}
