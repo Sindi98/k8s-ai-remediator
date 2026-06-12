@@ -336,9 +336,52 @@ func TestSetDeploymentImage_NoopRejected(t *testing.T) {
 }
 
 func TestSetDeploymentImage_ContainerNotFound(t *testing.T) {
-	cs := newFakeCluster(t)
-	if err := SetDeploymentImage(context.Background(), cs, "default", "web", "nginx:1.26", "nonexistent", false); err == nil {
-		t.Error("expected error for nonexistent container")
+	// Multi-container deployment: an unknown container ref must keep failing
+	// loudly — guessing among several containers could mis-target the change.
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "multi", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "app", Image: "nginx:1.25"},
+					{Name: "sidecar", Image: "envoy:1.30"},
+				},
+			}},
+		},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	if err := SetDeploymentImage(context.Background(), cs, "default", "multi", "nginx:1.26", "nonexistent", false); err == nil {
+		t.Error("expected error for nonexistent container on a multi-container deployment")
+	}
+	// Single-container deployment: an unknown ref resolves to the only
+	// container instead of failing the remediation.
+	csSingle := newFakeCluster(t)
+	if err := SetDeploymentImage(context.Background(), csSingle, "default", "web", "nginx:1.26", "nonexistent", false); err != nil {
+		t.Errorf("single-container deployment should tolerate an unknown container ref, got %v", err)
+	}
+}
+
+func TestFindContainerIndex_TolerantResolution(t *testing.T) {
+	multi := []corev1.Container{
+		{Name: "app", Image: "busybox:1.36"},
+		{Name: "sidecar", Image: "envoy:1.30"},
+	}
+	// Exact name match has priority.
+	if idx, err := findContainerIndex(multi, "sidecar"); err != nil || idx != 1 {
+		t.Errorf("name match: idx=%d err=%v", idx, err)
+	}
+	// The model put the image in the container field: match by image.
+	if idx, err := findContainerIndex(multi, "busybox:1.36"); err != nil || idx != 0 {
+		t.Errorf("image match: idx=%d err=%v", idx, err)
+	}
+	// Unknown ref on multi-container: loud failure.
+	if _, err := findContainerIndex(multi, "whatever"); err == nil {
+		t.Error("expected error for unknown ref on multi-container")
+	}
+	// Unknown ref on single-container: default to the only one.
+	single := multi[:1]
+	if idx, err := findContainerIndex(single, "whatever"); err != nil || idx != 0 {
+		t.Errorf("single-container default: idx=%d err=%v", idx, err)
 	}
 }
 

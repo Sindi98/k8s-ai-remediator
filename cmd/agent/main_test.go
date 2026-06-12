@@ -1037,3 +1037,43 @@ func TestExecuteDecision_SetImage_DiscoveryFailureFallsBackToTag(t *testing.T) {
 		t.Errorf("expected the fallback :latest retag, got %q", img)
 	}
 }
+
+func TestExecuteDecision_PatchResources_ContainerGivenAsImage(t *testing.T) {
+	// Exact production failure: the model fills params correctly but puts the
+	// IMAGE in the container field ("container":"busybox:1.36"). The executor
+	// must resolve it to the right container instead of failing with
+	// `container "busybox:1.36" not found`.
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "unschedulable", Namespace: "default",
+			Annotations: map[string]string{kube.AllowPatchAnnotation: "*"},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "unschedulable"}},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app", Image: "busybox:1.36"}},
+			}},
+		},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	d := model.Decision{
+		Action: model.ActionPatchResources, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "unschedulable", Confidence: 1,
+		Parameters: map[string]string{
+			"deployment_name": "unschedulable",
+			"container":       "busybox:1.36", // the image, not the name
+			"cpu_request":     "100m", "memory_request": "64Mi",
+			"cpu_limit": "500m", "memory_limit": "256Mi",
+		},
+	}
+	if err := executeDecision(context.Background(), cs, d, patchFlagsCfg(), "FailedScheduling", ""); err != nil {
+		t.Fatalf("expected the image-as-container ref to resolve, got %v", err)
+	}
+	got, _ := cs.AppsV1().Deployments("default").Get(context.Background(), "unschedulable", metav1.GetOptions{})
+	r := got.Spec.Template.Spec.Containers[0].Resources
+	if r.Requests[corev1.ResourceCPU] != resource.MustParse("100m") ||
+		r.Limits[corev1.ResourceMemory] != resource.MustParse("256Mi") {
+		t.Errorf("resources not applied: %+v", r)
+	}
+}

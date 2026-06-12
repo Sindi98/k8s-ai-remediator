@@ -318,26 +318,13 @@ func SetDeploymentImage(ctx context.Context, cs kubernetes.Interface, ns, name, 
 	})
 }
 
-// pickContainerForImage resolves the target container index and rejects
-// no-op image changes. Shared between the dry-run and write paths so both
-// surface the same validation errors.
+// pickContainerForImage resolves the target container (same tolerant rules
+// as findContainerIndex) and rejects no-op image changes. Shared between the
+// dry-run and write paths so both surface the same validation errors.
 func pickContainerForImage(dep *appsv1.Deployment, image, container string) (int, error) {
-	idx := -1
-	if container != "" {
-		for i, c := range dep.Spec.Template.Spec.Containers {
-			if c.Name == container {
-				idx = i
-				break
-			}
-		}
-		if idx == -1 {
-			return -1, fmt.Errorf("container %s not found", container)
-		}
-	} else {
-		if len(dep.Spec.Template.Spec.Containers) == 0 {
-			return -1, fmt.Errorf("deployment has no containers")
-		}
-		idx = 0
+	idx, err := findContainerIndex(dep.Spec.Template.Spec.Containers, container)
+	if err != nil {
+		return -1, err
 	}
 	if dep.Spec.Template.Spec.Containers[idx].Image == image {
 		return -1, fmt.Errorf("set_deployment_image is a no-op: container %q already runs %q; for transient pull failures use delete_failed_pod or restart_deployment", dep.Spec.Template.Spec.Containers[idx].Name, image)
@@ -372,19 +359,39 @@ func parseProbeField(key, raw string) (int32, error) {
 	return int32(n), nil
 }
 
-func findContainerIndex(containers []corev1.Container, name string) (int, error) {
-	if name == "" {
-		if len(containers) == 0 {
-			return -1, fmt.Errorf("deployment has no containers")
-		}
+// findContainerIndex resolves the container a decision targets. The ref is
+// matched in order: by container NAME (the contract), then by IMAGE — local
+// models routinely put the image ("busybox:1.36") in the container field —
+// and finally, on single-container workloads, by defaulting to the only
+// container there is. Multi-container deployments with no match keep
+// failing loudly: guessing among several containers could mis-target the
+// mutation.
+func findContainerIndex(containers []corev1.Container, ref string) (int, error) {
+	if len(containers) == 0 {
+		return -1, fmt.Errorf("deployment has no containers")
+	}
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
 		return 0, nil
 	}
 	for i, c := range containers {
-		if c.Name == name {
+		if c.Name == ref {
 			return i, nil
 		}
 	}
-	return -1, fmt.Errorf("container %q not found", name)
+	for i, c := range containers {
+		if c.Image == ref {
+			slog.Info("container parameter matched by image, not by name",
+				"ref", ref, "container", c.Name)
+			return i, nil
+		}
+	}
+	if len(containers) == 1 {
+		slog.Info("container parameter unknown; defaulting to the only container",
+			"ref", ref, "container", containers[0].Name)
+		return 0, nil
+	}
+	return -1, fmt.Errorf("container %q not found", ref)
 }
 
 // PatchDeploymentProbe updates the timing fields (initialDelaySeconds,
