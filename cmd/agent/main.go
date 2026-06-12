@@ -749,7 +749,7 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, llm decider,
 		"ollamaThink", formatTriBool(cfg.OllamaThink),
 		"signalMaxAttempts", cfg.SignalMaxAttempts,
 		"metricsAddr", cfg.MetricsAddr,
-		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry,auto-escalate-oom,auto-escalate-unhealthy,severity-exempt-optin,ollama-think-toggle,target-pinning,signal-circuit-breaker,event-informer,explicit-param-schema,exec-param-fallbacks,poll-time-budget,image-tag-discovery",
+		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry,auto-escalate-oom,auto-escalate-unhealthy,severity-exempt-optin,ollama-think-toggle,target-pinning,signal-circuit-breaker,event-informer,explicit-param-schema,exec-param-fallbacks,poll-time-budget,image-tag-discovery,container-by-image",
 	)
 
 	ticker := time.NewTicker(time.Duration(cfg.PollSec) * time.Second)
