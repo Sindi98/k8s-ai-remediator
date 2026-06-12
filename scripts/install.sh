@@ -159,7 +159,12 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+# Remember whether the user pinned an image explicitly (flag or env): only
+# auto-generated references get the unique per-build tag below.
+IMAGE_EXPLICIT=false
+[ -n "$IMAGE" ] && IMAGE_EXPLICIT=true
 IMAGE="${IMAGE:-${REGISTRY}/k8s-ai-remediator:latest}"
+BUILD_VERSION=""
 
 case "$OLLAMA_THINK" in
     false|true|auto) ;;
@@ -193,8 +198,34 @@ build_image() {
     [ "$BUILD" = true ] || return 0
     step "Building and pushing the agent image"
     have docker || die "--build requires Docker in PATH"
-    run docker build -t "$IMAGE" "$REPO_ROOT"
+
+    # A fixed tag (:latest) + imagePullPolicy IfNotPresent lets the kubelet
+    # silently reuse a STALE cached image after a push: containerd-backed
+    # runtimes (kind, minikube, recent Docker Desktop) keep their own image
+    # store, so `rollout restart` brings up new pods with the old binary.
+    # Tag every build uniquely with the git commit (plus a timestamp when the
+    # tree is dirty), so `set image` really changes the pod spec and forces a
+    # genuine pull. The same build is also pushed as :latest for manual flows.
+    if [ "$IMAGE_EXPLICIT" != true ]; then
+        if have git && git -C "$REPO_ROOT" rev-parse --short HEAD >/dev/null 2>&1; then
+            BUILD_VERSION="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+            if ! git -C "$REPO_ROOT" diff --quiet HEAD -- 2>/dev/null; then
+                BUILD_VERSION="${BUILD_VERSION}-dirty-$(date +%s)"
+            fi
+            info "building from commit ${BUILD_VERSION}: $(git -C "$REPO_ROOT" log -1 --format=%s 2>/dev/null || true)"
+            info "(make sure this checkout is up to date: git pull origin master)"
+        else
+            BUILD_VERSION="build-$(date +%s)"
+        fi
+        IMAGE="${REGISTRY}/k8s-ai-remediator:${BUILD_VERSION}"
+    fi
+
+    run docker build --build-arg BUILD_VERSION="${BUILD_VERSION:-dev}" -t "$IMAGE" "$REPO_ROOT"
     run docker push "$IMAGE"
+    if [ "$IMAGE_EXPLICIT" != true ]; then
+        run docker tag "$IMAGE" "${REGISTRY}/k8s-ai-remediator:latest"
+        run docker push "${REGISTRY}/k8s-ai-remediator:latest"
+    fi
 }
 
 # --- optional: install Ollama and pull the model ---------------------------
@@ -420,6 +451,19 @@ rollout_and_verify() {
     kubectl -n "$NAMESPACE" get pods -l app=ai-remediator-agent
     info "Recent agent logs:"
     kubectl -n "$NAMESPACE" logs deploy/ai-remediator-agent --tail=12 2>/dev/null | sed 's/^/      /' || true
+
+    # When we just built an image, prove the running pod executes THAT build:
+    # the binary logs its stamped version ("agent binary" line) at startup.
+    if [ "$BUILD" = true ] && [ -n "$BUILD_VERSION" ]; then
+        sleep 3
+        if kubectl -n "$NAMESPACE" logs deploy/ai-remediator-agent --tail=50 2>/dev/null \
+            | grep -q "\"version\":\"${BUILD_VERSION}\""; then
+            info "${GREEN}image verified: the pod runs build ${BUILD_VERSION}${RESET}"
+        else
+            warn "the running pod does NOT report build ${BUILD_VERSION} — it may still run a cached image."
+            warn "Check with: kubectl -n ${NAMESPACE} logs deploy/ai-remediator-agent | grep '\"agent binary\"'"
+        fi
+    fi
 }
 
 gen_password() {

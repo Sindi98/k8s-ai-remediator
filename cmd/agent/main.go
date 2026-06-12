@@ -1060,11 +1060,21 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, llm decider,
 	}
 }
 
+// buildVersion is stamped at Docker build time (-ldflags -X
+// main.buildVersion=<git commit>, see Dockerfile and scripts/install.sh) so
+// operators can verify WHICH build a running pod executes. "dev" for plain
+// `go build` binaries. Logged unconditionally at startup — followers too —
+// because install.sh greps it to prove the rollout picked the fresh image
+// rather than a kubelet-cached one.
+var buildVersion = "dev"
+
 func main() {
 	// Structured JSON logging for Kubernetes
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
+
+	slog.Info("agent binary", "version", buildVersion)
 
 	cfg := config.LoadFromEnv()
 
