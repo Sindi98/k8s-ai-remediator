@@ -11,10 +11,13 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Build.
+# Build. BUILD_VERSION (the git commit, stamped by scripts/install.sh) ends
+# up in the "agent binary" startup log line, so operators can verify which
+# build a running pod actually executes.
+ARG BUILD_VERSION=dev
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -trimpath -ldflags="-s -w" -o /out/agent ./cmd/agent
+    go build -trimpath -ldflags="-s -w -X main.buildVersion=${BUILD_VERSION}" -o /out/agent ./cmd/agent
 
 # Stage 2: distroless runtime (no shell, minimal FS, non-root user).
 FROM gcr.io/distroless/static:nonroot

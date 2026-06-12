@@ -1581,6 +1581,29 @@ kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
 ```
 Invariante: `POLL_CONTEXT_TIMEOUT_SECONDS > OLLAMA_HTTP_TIMEOUT_SECONDS`.
 
+### Il binario nel cluster resta vecchio dopo `install.sh --build`
+
+Sintomo: dopo build+rollout, `buildFeatures` (o la riga `"agent binary"`) nel
+log di startup non riflette le ultime modifiche.
+
+Due cause tipiche:
+1. **Checkout locale indietro**: `--build` compila dal working tree — esegui
+   `git pull origin master` prima del build. Lo script ora stampa il commit
+   che sta buildando.
+2. **Cache del tag fisso**: con `imagePullPolicy: IfNotPresent` e tag `:latest`
+   immutato, i runtime containerd-based (kind, minikube, Docker Desktop
+   recente) riusano l'immagine cachata anche dopo il push. Lo script ora
+   tagga ogni build con il commit git (`k8s-ai-remediator:<sha>`), fa
+   `set image` con quel tag (la spec cambia → pull garantito) e a fine
+   rollout **verifica** che il pod riporti proprio quella build
+   (`"agent binary" version=<sha>`), avvisando in caso contrario.
+
+Verifica manuale:
+```bash
+kubectl -n ai-remediator logs deploy/ai-remediator-agent --tail=50 \
+  | grep '"agent binary"'
+```
+
 ### Decisioni corrette ma con `params:{}` (`parameters.image missing`, `probe must be one of`, ...)
 
 Sintomo: l'LLM sceglie l'azione giusta con una `probable_cause` sensata, ma
