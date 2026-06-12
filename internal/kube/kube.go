@@ -580,6 +580,34 @@ func PatchDeploymentResources(ctx context.Context, cs kubernetes.Interface, ns, 
 	return mutateDeployment(ctx, cs, ns, name, apply)
 }
 
+// RetagImage replaces the tag (or digest) of an image reference with newTag,
+// preserving registry host and repository path. A ":" inside the registry
+// segment (host:port) is not mistaken for a tag separator: the tag is the
+// ":" after the last "/".
+func RetagImage(image, newTag string) (string, error) {
+	image = strings.TrimSpace(image)
+	newTag = strings.TrimSpace(newTag)
+	if image == "" {
+		return "", fmt.Errorf("image is empty")
+	}
+	if newTag == "" {
+		return "", fmt.Errorf("new tag is empty")
+	}
+	// Digest-pinned references lose the digest: retagging is an explicit
+	// request to track the tag instead.
+	if i := strings.Index(image, "@"); i >= 0 {
+		image = image[:i]
+	}
+	slash := strings.LastIndex(image, "/")
+	if colon := strings.LastIndex(image, ":"); colon > slash {
+		image = image[:colon]
+	}
+	if image == "" {
+		return "", fmt.Errorf("image reference has no name")
+	}
+	return image + ":" + newTag, nil
+}
+
 // SwapRegistry replaces the registry host prefix in an image reference,
 // preserving the path and tag/digest. If the image has no explicit registry,
 // the new registry is prepended.

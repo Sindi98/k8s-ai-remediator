@@ -37,6 +37,7 @@ import (
 	"github.com/sindi98/k8s-ai-remediator/internal/notify"
 	"github.com/sindi98/k8s-ai-remediator/internal/ollama"
 	"github.com/sindi98/k8s-ai-remediator/internal/policy"
+	"github.com/sindi98/k8s-ai-remediator/internal/registry"
 	"github.com/sindi98/k8s-ai-remediator/internal/webui"
 )
 
@@ -78,6 +79,26 @@ func executeDecision(
 	}
 	if err := policy.MaybeBlockWrongActionOnFailedScheduling(d, eventReason); err != nil {
 		return err
+	}
+	// Complete a set_deployment_image that names no image BEFORE the policy
+	// guard. Models reliably emit parameters they can copy from the context
+	// but omit ones they must invent, so the image is derived: preferably the
+	// newest tag advertised by the image's own registry (IMAGE_TAG_DISCOVERY),
+	// otherwise the operator's fallback tag (IMAGE_FALLBACK_TAG). The
+	// synthesized reference then passes the exact same gates as a
+	// model-provided one: feature flag, confidence threshold, OCI validation
+	// and the no-op rejection (current image already on the derived tag).
+	if d.Action == model.ActionSetDeploymentImage && cfg.AllowImageUpdates &&
+		(cfg.ImageTagDiscovery || cfg.ImageFallbackTag != "") &&
+		strings.TrimSpace(d.Parameters["image"]) == "" {
+		if img, ok := deriveFallbackImage(ctx, cs, d, cfg); ok {
+			slog.Info("set_deployment_image: completing missing image",
+				"ns", d.Namespace, "image", img)
+			if d.Parameters == nil {
+				d.Parameters = map[string]string{}
+			}
+			d.Parameters["image"] = img
+		}
 	}
 	if err := policy.MaybeBlockUnsafeImageUpdate(d, cfg.AllowImageUpdates, cfg.ImageUpdateThreshold); err != nil {
 		return err
@@ -189,20 +210,27 @@ func executeDecision(
 			return err
 		}
 		params := d.Parameters
-		if isOOMContext(extra) {
+		switch {
+		case isOOMContext(extra):
 			// Deterministic safety net for a directly-chosen patch_resources:
 			// a weak model often proposes a memory_limit only marginally above
 			// the current one (or omits it), which passes validation but OOMs
 			// again. Raise it to the same floor the OOM auto-escalation uses.
 			params = withOOMMemoryFloor(ctx, cs, d.Namespace, depName, params)
-		}
-		if strings.EqualFold(strings.TrimSpace(eventReason), "FailedScheduling") && !hasResourceParams(params) {
-			// Same class of completion as the OOM floor: the prompt's rule 2
-			// tells the model to lower requests to schedulable-anywhere values
-			// on FailedScheduling, but a model that emits empty parameters
-			// would otherwise leave the workload Pending forever. Mirror those
-			// exact values; the opt-in annotation still gates the patch.
+		case strings.EqualFold(strings.TrimSpace(eventReason), "FailedScheduling") && !hasResourceParams(params):
+			// The prompt's rule 2 tells the model to lower requests to
+			// schedulable-anywhere values on FailedScheduling, but a model that
+			// emits empty parameters would otherwise leave the workload Pending
+			// forever. Mirror those exact values; the opt-in annotation gates it.
 			params = withSchedulableResourceDefaults(params)
+		case !hasResourceParams(params):
+			// patch_resources with no quantities and no OOM marker in our
+			// snapshot (the pod read can time out, so `extra` may miss the
+			// OOMKilled/exit=137 the model saw): the dominant cause is memory
+			// pressure. Apply the same memory floor from the container's
+			// current limit instead of failing — observed with memory-hog,
+			// where the model picks patch_resources but invents no quantity.
+			params = withOOMMemoryFloor(ctx, cs, d.Namespace, depName, params)
 		}
 		return kube.PatchDeploymentResources(ctx, cs, d.Namespace, depName, params["container"], params, cfg.DryRun)
 
@@ -320,6 +348,62 @@ func tryAutoPatchProbeOnUnhealthy(ctx context.Context, cs kubernetes.Interface, 
 	transformed.Parameters["period_seconds"] = "15"
 	transformed.Parameters["timeout_seconds"] = "5"
 	return transformed, true
+}
+
+// deriveFallbackImage resolves the decision's target Deployment, picks the
+// container named in params (or the first one) and derives a replacement
+// image for it: the newest tag its registry advertises when tag discovery is
+// on (falling back gracefully on any registry failure), else the configured
+// fallback tag. Returns ("", false) when nothing can be derived — the
+// decision then fails downstream with the regular "parameters.image missing"
+// guard.
+func deriveFallbackImage(ctx context.Context, cs kubernetes.Interface, d model.Decision, cfg config.AgentConfig) (string, bool) {
+	depName, err := kube.ResolveDeploymentTarget(ctx, cs, d.Namespace, d.ResourceKind, d.ResourceName, d.Parameters)
+	if err != nil {
+		return "", false
+	}
+	dep, err := cs.AppsV1().Deployments(d.Namespace).Get(ctx, depName, metav1.GetOptions{})
+	if err != nil {
+		return "", false
+	}
+	containers := dep.Spec.Template.Spec.Containers
+	if len(containers) == 0 {
+		return "", false
+	}
+	idx := 0
+	if name := strings.TrimSpace(d.Parameters["container"]); name != "" {
+		for i, c := range containers {
+			if c.Name == name {
+				idx = i
+				break
+			}
+		}
+	}
+	current := containers[idx].Image
+
+	// Preferred: the newest tag advertised by the image's own registry
+	// (excludes the broken tag the image currently carries).
+	if cfg.ImageTagDiscovery {
+		if tag, err := registry.NewestTag(ctx, current); err == nil {
+			if img, rerr := kube.RetagImage(current, tag); rerr == nil {
+				slog.Info("set_deployment_image: newest tag discovered from the registry",
+					"current", current, "tag", tag)
+				return img, true
+			}
+		} else {
+			slog.Info("image tag discovery failed; using the fallback tag",
+				"image", current, "error", err)
+		}
+	}
+
+	if cfg.ImageFallbackTag == "" {
+		return "", false
+	}
+	img, err := kube.RetagImage(current, cfg.ImageFallbackTag)
+	if err != nil {
+		return "", false
+	}
+	return img, true
 }
 
 // chooseProbeFromDeployment picks the container+probe to relax, preferring
@@ -665,7 +749,7 @@ func runLoopWithStore(ctx context.Context, cs kubernetes.Interface, llm decider,
 		"ollamaThink", formatTriBool(cfg.OllamaThink),
 		"signalMaxAttempts", cfg.SignalMaxAttempts,
 		"metricsAddr", cfg.MetricsAddr,
-		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry,auto-escalate-oom,auto-escalate-unhealthy,severity-exempt-optin,ollama-think-toggle,target-pinning,signal-circuit-breaker,event-informer,explicit-param-schema,exec-param-fallbacks,poll-time-budget",
+		"buildFeatures", "dedup,infer-dep-from-podname,block-restart-on-unhealthy,patch_probe,patch_resources,patch_registry,auto-escalate-oom,auto-escalate-unhealthy,severity-exempt-optin,ollama-think-toggle,target-pinning,signal-circuit-breaker,event-informer,explicit-param-schema,exec-param-fallbacks,poll-time-budget,image-tag-discovery",
 	)
 
 	ticker := time.NewTicker(time.Duration(cfg.PollSec) * time.Second)

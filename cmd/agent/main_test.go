@@ -2,6 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -788,18 +792,48 @@ func TestExecuteDecision_PatchResources_FailedSchedulingDefaults(t *testing.T) {
 	}
 }
 
-func TestExecuteDecision_PatchResources_NonFailedSchedulingEmptyParamsStillFails(t *testing.T) {
-	// The schedulable defaults are FailedScheduling-specific: an empty
-	// patch_resources on any other reason (and no OOM context) must keep
-	// failing — guessing quantities there would be arbitrary.
+func TestExecuteDecision_PatchResources_EmptyParamsNonOOMAppliesMemoryFloor(t *testing.T) {
+	// Even outside FailedScheduling/explicit-OOM, an empty patch_resources must
+	// not fail: the pod read can time out so `extra` may miss the OOMKilled
+	// marker the model saw (observed with memory-hog). The dominant cause is
+	// memory pressure, so apply the memory floor from the container's current
+	// limit. newPatchableClusterForAgent sets no limit → floor is 512Mi.
 	cs := newPatchableClusterForAgent(t, "resources")
+	ctx := context.Background()
 	d := model.Decision{
 		Action: model.ActionPatchResources, Namespace: "default",
 		ResourceKind: "Deployment", ResourceName: "app", Confidence: 0.95,
 		Parameters: map[string]string{},
 	}
-	if err := executeDecision(context.Background(), cs, d, patchFlagsCfg(), "BackOff", "state=Running"); err == nil {
-		t.Error("expected empty patch_resources to fail outside FailedScheduling/OOM contexts")
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg(), "BackOff", "state=Running"); err != nil {
+		t.Fatalf("expected the memory-floor fallback to apply, got %v", err)
+	}
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "app", metav1.GetOptions{})
+	got := dep.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory]
+	if got.Cmp(resource.MustParse("512Mi")) != 0 {
+		t.Errorf("expected memory_limit floored to 512Mi, got %s", got.String())
+	}
+}
+
+func TestExecuteDecision_PatchResources_EmptyParamsFlooredFromCurrentLimit(t *testing.T) {
+	// With a low current limit (32Mi, the memory-hog scenario) and no OOM
+	// marker in `extra`, the floor is still max(4x current, 512Mi) = 512Mi —
+	// the value the OOM auto-escalation would have produced. This is the exact
+	// memory-hog field case: model emits only the copyable deployment_name.
+	cs := newMemHogCluster(t)
+	ctx := context.Background()
+	d := model.Decision{
+		Action: model.ActionPatchResources, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "memory-hog", Confidence: 0.95,
+		Parameters: map[string]string{"deployment_name": "memory-hog"},
+	}
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg(), "BackOff", ""); err != nil {
+		t.Fatalf("expected the memory-floor fallback to apply, got %v", err)
+	}
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "memory-hog", metav1.GetOptions{})
+	got := dep.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory]
+	if got.Cmp(resource.MustParse("512Mi")) != 0 {
+		t.Errorf("expected memory_limit floored to 512Mi, got %s", got.String())
 	}
 }
 
@@ -822,5 +856,184 @@ func TestExecuteDecision_PatchResources_FailedSchedulingKeepsModelValues(t *test
 	}
 	if _, ok := r.Limits[corev1.ResourceMemory]; ok {
 		t.Error("fallback defaults must not be applied when the model provided params")
+	}
+}
+
+func TestExecuteDecision_SetImage_EmptyImageUsesFallbackTag(t *testing.T) {
+	// The exact broken-image incident: the model picks set_deployment_image
+	// with only the copyable deployment_name; the operator policy says the
+	// valid tag is always <name>:latest. The executor must retag the current
+	// image instead of dying on "parameters.image missing".
+	cs := newPatchableClusterForAgent(t, "*") // image wrong.registry.io/repo/app:v1
+	ctx := context.Background()
+	cfg := patchFlagsCfg()
+	cfg.AllowImageUpdates = true
+	cfg.ImageUpdateThreshold = 0.92
+	cfg.ImageFallbackTag = "latest"
+
+	d := model.Decision{
+		Action: model.ActionSetDeploymentImage, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 1,
+		Parameters: map[string]string{"deployment_name": "app"},
+	}
+	if err := executeDecision(ctx, cs, d, cfg, "Failed", ""); err != nil {
+		t.Fatalf("expected the fallback tag to complete the decision, got %v", err)
+	}
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "app", metav1.GetOptions{})
+	if got := dep.Spec.Template.Spec.Containers[0].Image; got != "wrong.registry.io/repo/app:latest" {
+		t.Errorf("expected image retagged to :latest, got %q", got)
+	}
+}
+
+func TestExecuteDecision_SetImage_FallbackStillGatedByConfidence(t *testing.T) {
+	// The synthesized image passes through the SAME gates as a model-provided
+	// one: below the confidence threshold the decision stays blocked.
+	cs := newPatchableClusterForAgent(t, "*")
+	cfg := patchFlagsCfg()
+	cfg.AllowImageUpdates = true
+	cfg.ImageUpdateThreshold = 0.92
+	cfg.ImageFallbackTag = "latest"
+
+	d := model.Decision{
+		Action: model.ActionSetDeploymentImage, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 0.5,
+		Parameters: map[string]string{},
+	}
+	if err := executeDecision(context.Background(), cs, d, cfg, "Failed", ""); err == nil {
+		t.Error("fallback image must not bypass the confidence threshold")
+	}
+}
+
+func TestExecuteDecision_SetImage_FallbackDisabledKeepsMissingImageError(t *testing.T) {
+	cs := newPatchableClusterForAgent(t, "*")
+	cfg := patchFlagsCfg()
+	cfg.AllowImageUpdates = true
+	cfg.ImageUpdateThreshold = 0.92
+	cfg.ImageFallbackTag = "" // operator opted out
+
+	d := model.Decision{
+		Action: model.ActionSetDeploymentImage, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 1,
+		Parameters: map[string]string{},
+	}
+	err := executeDecision(context.Background(), cs, d, cfg, "Failed", "")
+	if err == nil || !strings.Contains(err.Error(), "parameters.image missing") {
+		t.Errorf("expected the missing-image guard with the fallback disabled, got %v", err)
+	}
+}
+
+func TestExecuteDecision_SetImage_FallbackAlreadyOnTagIsRejectedAsNoop(t *testing.T) {
+	// Current image already carries the fallback tag and still fails to pull:
+	// the retag is a no-op and must be rejected with the informative no-op
+	// error (suggesting restart), not applied as a pointless rollout.
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "app"}},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "main", Image: "busybox:latest"}},
+			}},
+		},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	cfg := defaultCfg()
+	cfg.AllowImageUpdates = true
+	cfg.ImageUpdateThreshold = 0.92
+	cfg.ImageFallbackTag = "latest"
+
+	d := model.Decision{
+		Action: model.ActionSetDeploymentImage, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 1,
+		Parameters: map[string]string{},
+	}
+	err := executeDecision(context.Background(), cs, d, cfg, "Failed", "")
+	if err == nil || !strings.Contains(err.Error(), "no-op") {
+		t.Errorf("expected the informative no-op rejection, got %v", err)
+	}
+}
+
+func TestExecuteDecision_SetImage_DiscoversNewestTagFromRegistry(t *testing.T) {
+	// Operator request: the replacement image must carry the newest tag the
+	// image's own registry advertises, not blindly :latest. Discovery hits
+	// /v2/<repo>/tags/list and picks the highest version-like tag.
+	regSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/busybox/tags/list" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"tags": []string{"1.35", "1.36", "latest"}})
+	}))
+	defer regSrv.Close()
+	regHost := strings.TrimPrefix(regSrv.URL, "http://")
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "broken-image", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "broken-image"}},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:  "app",
+					Image: regHost + "/busybox:this-tag-does-not-exist-abcd1234",
+				}},
+			}},
+		},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	cfg := defaultCfg()
+	cfg.AllowImageUpdates = true
+	cfg.ImageUpdateThreshold = 0.92
+	cfg.ImageTagDiscovery = true
+	cfg.ImageFallbackTag = "latest" // must NOT be used: discovery wins
+
+	d := model.Decision{
+		Action: model.ActionSetDeploymentImage, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "broken-image", Confidence: 1,
+		Parameters: map[string]string{"deployment_name": "broken-image"},
+	}
+	if err := executeDecision(context.Background(), cs, d, cfg, "Failed", ""); err != nil {
+		t.Fatalf("expected tag discovery to complete the decision, got %v", err)
+	}
+	got, _ := cs.AppsV1().Deployments("default").Get(context.Background(), "broken-image", metav1.GetOptions{})
+	if img := got.Spec.Template.Spec.Containers[0].Image; img != regHost+"/busybox:1.36" {
+		t.Errorf("expected the discovered newest tag 1.36, got %q", img)
+	}
+}
+
+func TestExecuteDecision_SetImage_DiscoveryFailureFallsBackToTag(t *testing.T) {
+	// Unreachable registry (air-gapped or down): discovery must degrade to
+	// the configured fallback tag instead of failing the decision.
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "broken-image", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "broken-image"}},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:  "app",
+					Image: "127.0.0.1:1/busybox:this-tag-does-not-exist", // nothing listens
+				}},
+			}},
+		},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	cfg := defaultCfg()
+	cfg.AllowImageUpdates = true
+	cfg.ImageUpdateThreshold = 0.92
+	cfg.ImageTagDiscovery = true
+	cfg.ImageFallbackTag = "latest"
+
+	d := model.Decision{
+		Action: model.ActionSetDeploymentImage, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "broken-image", Confidence: 1,
+		Parameters: map[string]string{},
+	}
+	if err := executeDecision(context.Background(), cs, d, cfg, "Failed", ""); err != nil {
+		t.Fatalf("expected the fallback tag after a failed discovery, got %v", err)
+	}
+	got, _ := cs.AppsV1().Deployments("default").Get(context.Background(), "broken-image", metav1.GetOptions{})
+	if img := got.Spec.Template.Spec.Containers[0].Image; img != "127.0.0.1:1/busybox:latest" {
+		t.Errorf("expected the fallback :latest retag, got %q", img)
 	}
 }
