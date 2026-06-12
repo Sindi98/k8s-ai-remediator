@@ -494,3 +494,42 @@ func TestDecide_OnlyThinkBlockIsEmptyResponse(t *testing.T) {
 		t.Errorf("expected empty-response error, got %v", err)
 	}
 }
+
+func TestDecide_SchemaDeclaresExplicitParameterProperties(t *testing.T) {
+	// Regression for the "params always {}" incident: Ollama's constrained
+	// decoding reduces an object described only by additionalProperties to a
+	// literal {} on engines without free-form key support. The schema must
+	// enumerate every parameter key the executor understands.
+	srv, bodies := newBodyCaptureServer(t)
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-model", 100, 0, false, 0)
+	if _, err := client.Decide(context.Background(), "test"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var req struct {
+		Format struct {
+			Properties struct {
+				Parameters struct {
+					Properties map[string]any `json:"properties"`
+				} `json:"parameters"`
+			} `json:"properties"`
+		} `json:"format"`
+	}
+	if err := json.Unmarshal([]byte(bodies()[0]), &req); err != nil {
+		t.Fatalf("request body not JSON: %v", err)
+	}
+	props := req.Format.Properties.Parameters.Properties
+	for _, key := range []string{
+		"deployment_name", "container", "image", "replicas", "probe",
+		"initial_delay_seconds", "period_seconds", "failure_threshold",
+		"success_threshold", "timeout_seconds",
+		"cpu_request", "memory_request", "cpu_limit", "memory_limit",
+		"new_registry",
+	} {
+		if _, ok := props[key]; !ok {
+			t.Errorf("parameters schema missing explicit property %q", key)
+		}
+	}
+}

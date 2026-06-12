@@ -793,3 +793,15 @@ func TestPatchDeploymentRegistry_RecordsLastChange(t *testing.T) {
 		t.Errorf("unexpected last-change: %+v", lc)
 	}
 }
+
+func TestDeletePod_NotFoundIsSuccess(t *testing.T) {
+	// The pod being already gone IS the desired outcome (controller rolled
+	// it over first), not a failed remediation.
+	cs := fake.NewSimpleClientset()
+	if err := DeletePod(context.Background(), cs, "default", "ghost", false); err != nil {
+		t.Errorf("DeletePod on missing pod should be a no-op success, got %v", err)
+	}
+	if err := DeleteAndRecreatePod(context.Background(), cs, "default", "ghost", false); err != nil {
+		t.Errorf("DeleteAndRecreatePod on missing pod should be a no-op success, got %v", err)
+	}
+}

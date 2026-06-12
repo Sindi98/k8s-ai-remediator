@@ -715,3 +715,112 @@ func TestExecuteDecision_PatchResources_NonOOMNotFloored(t *testing.T) {
 		t.Errorf("expected memory_limit kept at 128Mi for non-OOM, got %s", got.String())
 	}
 }
+
+func TestExecuteDecision_PatchProbe_EmptyParamsDerivesTarget(t *testing.T) {
+	// Regression for the "params always {}" incident: the model picks
+	// patch_probe with an empty parameters object. The executor must derive
+	// container+probe from the Deployment and apply the tolerant defaults
+	// instead of failing with "probe must be one of: readiness, liveness".
+	cs := newPatchableClusterForAgent(t, "probe") // "main" has a readiness probe
+	ctx := context.Background()
+	d := model.Decision{
+		Action: model.ActionPatchProbe, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 0.95,
+		Parameters: map[string]string{},
+	}
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg(), "Unhealthy", ""); err != nil {
+		t.Fatalf("expected the fallback to complete the decision, got %v", err)
+	}
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "app", metav1.GetOptions{})
+	p := dep.Spec.Template.Spec.Containers[0].ReadinessProbe
+	if p.FailureThreshold != 6 || p.PeriodSeconds != 15 || p.TimeoutSeconds != 5 {
+		t.Errorf("expected tolerant defaults applied, got failureThreshold=%d period=%d timeout=%d",
+			p.FailureThreshold, p.PeriodSeconds, p.TimeoutSeconds)
+	}
+}
+
+func TestExecuteDecision_PatchProbe_NoProbeOnDeploymentStillFails(t *testing.T) {
+	// No probe anywhere on the Deployment: nothing to derive, the decision
+	// must keep failing loudly instead of inventing a probe.
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "bare", Namespace: "default",
+			Annotations: map[string]string{kube.AllowPatchAnnotation: "probe"},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "main"}},
+			}},
+		},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	d := model.Decision{
+		Action: model.ActionPatchProbe, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "bare", Confidence: 0.95,
+		Parameters: map[string]string{},
+	}
+	if err := executeDecision(context.Background(), cs, d, patchFlagsCfg(), "Unhealthy", ""); err == nil {
+		t.Error("expected an error when the deployment has no probe to derive")
+	}
+}
+
+func TestExecuteDecision_PatchResources_FailedSchedulingDefaults(t *testing.T) {
+	// Same incident, FailedScheduling flavour: patch_resources with empty
+	// params on a FailedScheduling event must fall back to the schedulable
+	// defaults the prompt's rule 2 prescribes, not error out.
+	cs := newPatchableClusterForAgent(t, "resources")
+	ctx := context.Background()
+	d := model.Decision{
+		Action: model.ActionPatchResources, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 0.95,
+		Parameters: map[string]string{},
+	}
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg(), "FailedScheduling", "0/1 nodes are available: Insufficient cpu"); err != nil {
+		t.Fatalf("expected schedulable defaults to apply, got %v", err)
+	}
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "app", metav1.GetOptions{})
+	r := dep.Spec.Template.Spec.Containers[0].Resources
+	if r.Requests[corev1.ResourceCPU] != resource.MustParse("100m") ||
+		r.Requests[corev1.ResourceMemory] != resource.MustParse("64Mi") ||
+		r.Limits[corev1.ResourceCPU] != resource.MustParse("500m") ||
+		r.Limits[corev1.ResourceMemory] != resource.MustParse("256Mi") {
+		t.Errorf("unexpected resources after fallback: %+v", r)
+	}
+}
+
+func TestExecuteDecision_PatchResources_NonFailedSchedulingEmptyParamsStillFails(t *testing.T) {
+	// The schedulable defaults are FailedScheduling-specific: an empty
+	// patch_resources on any other reason (and no OOM context) must keep
+	// failing — guessing quantities there would be arbitrary.
+	cs := newPatchableClusterForAgent(t, "resources")
+	d := model.Decision{
+		Action: model.ActionPatchResources, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 0.95,
+		Parameters: map[string]string{},
+	}
+	if err := executeDecision(context.Background(), cs, d, patchFlagsCfg(), "BackOff", "state=Running"); err == nil {
+		t.Error("expected empty patch_resources to fail outside FailedScheduling/OOM contexts")
+	}
+}
+
+func TestExecuteDecision_PatchResources_FailedSchedulingKeepsModelValues(t *testing.T) {
+	// When the model DOES provide a quantity, the fallback must not clobber it.
+	cs := newPatchableClusterForAgent(t, "resources")
+	ctx := context.Background()
+	d := model.Decision{
+		Action: model.ActionPatchResources, Namespace: "default",
+		ResourceKind: "Deployment", ResourceName: "app", Confidence: 0.95,
+		Parameters: map[string]string{"cpu_request": "250m"},
+	}
+	if err := executeDecision(ctx, cs, d, patchFlagsCfg(), "FailedScheduling", ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	dep, _ := cs.AppsV1().Deployments("default").Get(ctx, "app", metav1.GetOptions{})
+	r := dep.Spec.Template.Spec.Containers[0].Resources
+	if r.Requests[corev1.ResourceCPU] != resource.MustParse("250m") {
+		t.Errorf("model-provided cpu_request must be preserved, got %s", r.Requests.Cpu())
+	}
+	if _, ok := r.Limits[corev1.ResourceMemory]; ok {
+		t.Error("fallback defaults must not be applied when the model provided params")
+	}
+}

@@ -332,6 +332,32 @@ func buildSchema() map[string]any {
 	for _, a := range model.AllActions() {
 		actions = append(actions, string(a))
 	}
+	// parameters MUST enumerate its properties explicitly. Ollama's
+	// constrained decoding compiles this schema into a grammar, and an object
+	// described only by additionalProperties is reduced to "{}" on engines
+	// that do not support free-form keys — observed with qwen3.5 picking the
+	// right action with a perfect probable_cause and an empty parameters
+	// object every single time. Listing every key the executor understands
+	// lets the grammar admit them; additionalProperties stays for engines
+	// that do support extra keys.
+	paramProps := map[string]any{
+		"deployment_name":       map[string]any{"type": "string"},
+		"deployment":            map[string]any{"type": "string"},
+		"container":             map[string]any{"type": "string"},
+		"image":                 map[string]any{"type": "string"},
+		"replicas":              map[string]any{"type": "string"},
+		"probe":                 map[string]any{"type": "string", "enum": []string{"readiness", "liveness"}},
+		"initial_delay_seconds": map[string]any{"type": "string"},
+		"period_seconds":        map[string]any{"type": "string"},
+		"failure_threshold":     map[string]any{"type": "string"},
+		"success_threshold":     map[string]any{"type": "string"},
+		"timeout_seconds":       map[string]any{"type": "string"},
+		"cpu_request":           map[string]any{"type": "string"},
+		"memory_request":        map[string]any{"type": "string"},
+		"cpu_limit":             map[string]any{"type": "string"},
+		"memory_limit":          map[string]any{"type": "string"},
+		"new_registry":          map[string]any{"type": "string"},
+	}
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
@@ -345,6 +371,7 @@ func buildSchema() map[string]any {
 			"resource_name":  map[string]any{"type": "string"},
 			"parameters": map[string]any{
 				"type":                 "object",
+				"properties":           paramProps,
 				"additionalProperties": map[string]any{"type": "string"},
 			},
 			"reason": map[string]any{"type": "string"},

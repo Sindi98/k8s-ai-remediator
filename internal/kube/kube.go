@@ -232,12 +232,19 @@ func RestartDeployment(ctx context.Context, cs kubernetes.Interface, ns, name st
 }
 
 // DeletePod removes a pod gracefully (default termination grace period),
-// relying on the controller to recreate it.
+// relying on the controller to recreate it. A pod that is already gone
+// (rolled over by its controller, or deleted by another actor) is treated
+// as success: the desired outcome — that pod no longer running — holds.
 func DeletePod(ctx context.Context, cs kubernetes.Interface, ns, name string, dryRun bool) error {
 	if dryRun {
 		return nil
 	}
-	return cs.CoreV1().Pods(ns).Delete(ctx, name, metav1.DeleteOptions{})
+	err := cs.CoreV1().Pods(ns).Delete(ctx, name, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		slog.Info("delete pod: already gone", "ns", ns, "pod", name)
+		return nil
+	}
+	return err
 }
 
 // DeleteAndRecreatePod force-deletes a pod with a zero grace period so the
@@ -252,7 +259,13 @@ func DeleteAndRecreatePod(ctx context.Context, cs kubernetes.Interface, ns, name
 		return nil
 	}
 	grace := int64(0)
-	return cs.CoreV1().Pods(ns).Delete(ctx, name, metav1.DeleteOptions{GracePeriodSeconds: &grace})
+	err := cs.CoreV1().Pods(ns).Delete(ctx, name, metav1.DeleteOptions{GracePeriodSeconds: &grace})
+	if apierrors.IsNotFound(err) {
+		// Already gone: the controller rolled it over first. Goal achieved.
+		slog.Info("delete pod: already gone", "ns", ns, "pod", name)
+		return nil
+	}
+	return err
 }
 
 // ScaleDeployment adjusts replica count within the given policy bounds.

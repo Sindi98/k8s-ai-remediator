@@ -1579,6 +1579,28 @@ kubectl -n ai-remediator rollout restart deployment/ai-remediator-agent
 ```
 Invariante: `POLL_CONTEXT_TIMEOUT_SECONDS > OLLAMA_HTTP_TIMEOUT_SECONDS`.
 
+### Decisioni corrette ma con `params:{}` (`parameters.image missing`, `probe must be one of`, ...)
+
+Sintomo: l'LLM sceglie l'azione giusta con una `probable_cause` sensata, ma
+`params` è sempre vuoto e l'esecuzione fallisce con errori tipo
+`set_deployment_image blocked: parameters.image missing`.
+
+Causa: il constrained decoding di alcune versioni di Ollama riduce a `{}` un
+oggetto JSON descritto solo da `additionalProperties`. Lo schema dell'agente
+ora dichiara esplicitamente tutte le chiavi di `parameters` (fix lato codice)
+e l'executor completa in modo deterministico i casi noti (probe derivata dal
+Deployment, valori schedulabili su FailedScheduling).
+
+Rimedio: rebuild + rollout dell'immagine. Verifica che `"buildFeatures"` nel
+log di startup contenga `explicit-param-schema,exec-param-fallbacks`; se non
+c'è, il pod sta eseguendo un binario vecchio:
+
+```bash
+scripts/install.sh --build          # oppure: docker build/push + rollout restart
+kubectl -n ai-remediator logs deploy/ai-remediator-agent --tail=5 \
+  | grep -o 'explicit-param-schema' || echo "binario vecchio!"
+```
+
 ### `Post "...": context deadline exceeded` (senza `Client.Timeout`)
 
 Qui sta scadendo il `pollCtx`, non il client HTTP. Alza
